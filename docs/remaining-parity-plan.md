@@ -78,15 +78,14 @@ Named, per-site and rule-selected presets change live transfer settings.
 
 **Area:** Transfers · **Status:** partial
 
-curl-backed downloads and uploads stream curl's progress meter into the byte-progress callback and render live PTY progress percentages while staging downloads through .filepart.
+The HTTP-backed downloads and uploads report the bytes as they move: the byte-progress callback is told what has been transferred and how much there is, while the transfer runs, and a download that stages its bytes writes them to the `.filepart` file first. Upstream reads the same numbers out of curl's progress meter and renders them live in the terminal; this build has no curl meter and no live percentage line, so that half of the upstream claim is not implemented here.
 
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The upstream half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: proto-dav-s3, which reports the byte progress of an upload and of a download while they run. The live percentage line is not implemented in this build.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Render the transfer progress as a live percentage line in the terminal, the way upstream does.
 
 ## sync.one-way
 
@@ -433,14 +432,14 @@ An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
 
 **Area:** Packaging/platforms · **Status:** partial
 
-The Linux platform layer supplies temporary directories, home/config lookup and concurrent child stdout/stderr capture.
+Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from the upstream POSIX runtime services; the host tests cover only filesystem and configuration behavior.
 
-**Next:** No runnable suite evidences this: unit has no build target and cannot be compiled.
+**Next:** The upstream unit suite has no build target. Host-side platform-linux tests cover private directories and files and configuration lookup, but do not exercise signal handling, concurrent child output capture, or Android runtime behavior.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Capture a child's stdout and stderr at the same time, the way the curl progress meter needs it.
 
 ## platform.terminal-and-console
 

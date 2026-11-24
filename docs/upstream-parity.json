@@ -75,7 +75,8 @@
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
-          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases."
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "platform-linux": "Linux host tests cover private filesystem helpers and configuration directory lookup."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -124,7 +125,8 @@
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
-          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases."
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -138,7 +140,8 @@
           "script": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
           "translation-tests": "locale-catalog check; no Windows step runs it",
           "unit": "no build target: CMakeLists.txt declares LANGUAGES NONE, and neither libssh nor PathUtil headers are vendored, so it cannot be compiled",
-          "wayland-compatibility": "Linux display-server guard; no Windows step runs it"
+          "wayland-compatibility": "Linux display-server guard; no Windows step runs it",
+          "platform-linux": "the file is #[cfg(target_os = \"linux\")], so a Windows cargo test run compiles none of these cases"
         }
       },
       "android": {
@@ -177,7 +180,8 @@
           "ui-transport": "ui/tests/TransportAndPlatform.test.mjs under node against the built bundle (ui/dist/linscp-core.mjs): the dual transport selection and error mapping, the host capability matrix and the difference reasons, the touch shell (pane order, the extra-key row and its latched Ctrl, long-press selection, the floating action bar and destroy), the local root switcher, and the operating-system path drop - the request shape one drop produces, the approvals a retry repeats, and what an unusable payload is refused for.",
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
-          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases."
+          "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
+          "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -2558,7 +2562,7 @@
       "id": "transfer.curl-progress",
       "area": "Transfers",
       "status": "partial",
-      "notes": "curl-backed downloads and uploads stream curl's progress meter into the byte-progress callback and render live PTY progress percentages while staging downloads through .filepart.",
+      "notes": "The HTTP-backed downloads and uploads report the bytes as they move: the byte-progress callback is told what has been transferred and how much there is, while the transfer runs, and a download that stages its bytes writes them to the `.filepart` file first. Upstream reads the same numbers out of curl's progress meter and renders them live in the terminal; this build has no curl meter and no live percentage line, so that half of the upstream claim is not implemented here.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
         "crates/linscp-proto/src/webdav.rs"
@@ -2569,27 +2573,32 @@
         ],
         "live-curl": [
           "test_pty_curl_progress_and_filepart_staging"
+        ],
+        "proto-dav-s3": [
+          "dav_reports_the_byte_progress_while_the_transfer_runs"
         ]
       },
       "verified_on": {
         "linux": [
           "live-curl",
-          "unit"
+          "unit",
+          "proto-dav-s3"
         ],
         "windows": [
           "live-curl",
-          "unit"
+          "unit",
+          "proto-dav-s3"
         ],
         "android": [
           "live-curl",
-          "unit"
+          "unit",
+          "proto-dav-s3"
         ]
       },
-      "gap": "No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
+      "gap": "The upstream half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: proto-dav-s3, which reports the byte progress of an upload and of a download while they run. The live percentage line is not implemented in this build.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+        "Render the transfer progress as a live percentage line in the terminal, the way upstream does."
       ]
     },
     {
@@ -4375,30 +4384,36 @@
       "id": "platform.posix-runtime-services",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "The Linux platform layer supplies temporary directories, home/config lookup and concurrent child stdout/stderr capture.",
+      "notes": "Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from the upstream POSIX runtime services; the host tests cover only filesystem and configuration behavior.",
       "source": [
         "crates/linscp-platform/src/linux.rs"
       ],
       "checks": {
         "unit": [
           "TestPlatformServices"
+        ],
+        "platform-linux": [
+          "the_private_directory_and_file_belong_to_the_user_alone",
+          "the_configuration_directory_is_the_one_the_desktop_expects"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit"
+          "unit",
+          "platform-linux"
         ],
         "windows": [
           "unit"
         ],
         "android": [
-          "unit"
+          "unit",
+          "platform-linux"
         ]
       },
-      "gap": "No runnable suite evidences this: unit has no build target and cannot be compiled.",
+      "gap": "The upstream unit suite has no build target. Host-side platform-linux tests cover private directories and files and configuration lookup, but do not exercise signal handling, concurrent child output capture, or Android runtime behavior.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+        "Capture a child's stdout and stderr at the same time, the way the curl progress meter needs it."
       ]
     },
     {

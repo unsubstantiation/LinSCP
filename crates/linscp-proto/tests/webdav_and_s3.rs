@@ -24,7 +24,9 @@ use linscp_crypto::digests::{compute_digest_hex, DigestAlgorithm};
 use linscp_proto::s3::{MultipartResumeStore, S3ConnectConfig, S3Session};
 use linscp_proto::tls::{TlsSettings, TlsVersion};
 use linscp_proto::webdav::{DavEtagPrecondition, WebDavConnectConfig, WebDavSession};
-use linscp_proto::{download_bytes, upload_bytes, RemoteSession, TransferRequest};
+use linscp_proto::{
+    download_bytes, upload_bytes, ProgressCallback, RemoteSession, TransferRequest,
+};
 use linscp_types::ProtocolScheme;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
@@ -1463,6 +1465,113 @@ async fn s3_object_write_headers_are_signed_and_sent_on_uploads_and_copies() {
     }
 
     s3.close().await.unwrap();
+}
+
+/// The byte progress is told while the transfer runs: the callback is
+/// told what has arrived and how much there is, before the transfer ends.
+/// The upload and the download both report it.
+#[tokio::test]
+async fn dav_reports_the_byte_progress_while_the_transfer_runs() {
+    let pki = common::generate_test_tls_pki(9);
+    let store = Arc::new(Mutex::new(MockDavStore::new()));
+    let router = Router::new()
+        .fallback(handle_mock_dav)
+        .with_state(Arc::clone(&store));
+    let port = spawn_https_router(router, &pki).await;
+
+    let dav = WebDavSession::connect(
+        WebDavConnectConfig {
+            scheme: ProtocolScheme::Webdavs,
+            host: "localhost".to_string(),
+            port,
+            base_path: "/dav".to_string(),
+            tls: TlsSettings {
+                pinned_public_key: Some(pki.server_spki_pin.clone()),
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    let body = vec![b'p'; 256 * 1024];
+
+    // The upload reports what it sent and how much there was to send.
+    let up_calls = Arc::new(AtomicUsize::new(0));
+    let up_last = Arc::new(AtomicUsize::new(0));
+    let up_total = Arc::new(AtomicUsize::new(0));
+    let up_calls_for_cb = Arc::clone(&up_calls);
+    let up_last_for_cb = Arc::clone(&up_last);
+    let up_total_for_cb = Arc::clone(&up_total);
+    let up_callback: &ProgressCallback = &move |done: u64, total: u64| {
+        up_calls_for_cb.fetch_add(1, Ordering::SeqCst);
+        up_last_for_cb.store(done as usize, Ordering::SeqCst);
+        up_total_for_cb.store(total as usize, Ordering::SeqCst);
+    };
+    let mut cursor = std::io::Cursor::new(body.clone());
+    dav.upload(
+        "metered.bin",
+        TransferRequest::default(),
+        &mut cursor,
+        Some(body.len() as u64),
+        Some(up_callback),
+    )
+    .await
+    .unwrap();
+    assert!(up_calls.load(Ordering::SeqCst) > 0, "the upload reported progress");
+    assert_eq!(
+        up_last.load(Ordering::SeqCst),
+        body.len(),
+        "the upload reported every byte"
+    );
+    assert_eq!(
+        up_total.load(Ordering::SeqCst),
+        body.len(),
+        "the upload was told the whole size"
+    );
+
+    // The download reports what it received and how much there was.
+    let down_calls = Arc::new(AtomicUsize::new(0));
+    let down_last = Arc::new(AtomicUsize::new(0));
+    let down_total = Arc::new(AtomicUsize::new(0));
+    let down_calls_for_cb = Arc::clone(&down_calls);
+    let down_last_for_cb = Arc::clone(&down_last);
+    let down_total_for_cb = Arc::clone(&down_total);
+    let down_callback: &ProgressCallback = &move |done: u64, total: u64| {
+        down_calls_for_cb.fetch_add(1, Ordering::SeqCst);
+        down_last_for_cb.store(done as usize, Ordering::SeqCst);
+        down_total_for_cb.store(total as usize, Ordering::SeqCst);
+    };
+    let mut sink: Vec<u8> = Vec::new();
+    dav.download(
+        "metered.bin",
+        TransferRequest::default(),
+        &mut sink,
+        Some(down_callback),
+    )
+    .await
+    .unwrap();
+    assert_eq!(sink, body, "the download carried the original bytes");
+    assert!(
+        down_calls.load(Ordering::SeqCst) > 0,
+        "the download reported progress"
+    );
+    assert_eq!(
+        down_last.load(Ordering::SeqCst),
+        body.len(),
+        "the download reported every byte"
+    );
+    assert_eq!(
+        down_total.load(Ordering::SeqCst),
+        body.len(),
+        "the download was told the whole size"
+    );
+
+    dav.close().await.unwrap();
 }
 
 /// A name may hold spaces and the characters a URL treats as structure. The

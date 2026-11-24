@@ -91,6 +91,10 @@ CASE_SOURCES = {
     # than trusting the call that set it, so they fail on an inherited DACL even
     # where only one user exists. Windows-only; the other platforms flag it.
     "platform-windows-acl": "crates/linscp-platform/src/windows.rs",
+    # The POSIX platform layer: the private temporary directory and file, the
+    # configuration directory the desktop expects. The file is Linux-only, so a Windows build
+    # carries none of these cases.
+    "platform-linux": "crates/linscp-platform/src/linux.rs",
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
@@ -393,7 +397,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "proto-ssh", "proto-ftp",
+                               "platform-windows-acl", "platform-linux", "proto-ssh", "proto-ftp",
                                "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
                                "engine-sftp", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):
