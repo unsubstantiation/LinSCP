@@ -4903,7 +4903,15 @@
       : names;
     const payload = target === 'remote' ? { tab: tabId(), names: items } : { tab: tabId(), names: items };
     const result = await apiPost(endpoint, payload);
-    if (!result.success) toast(errorMessage(result.error, t("Cannot delete.")), true);
+    if (!result.success) {
+      toast(errorMessage(result.error, t("Cannot delete.")), true);
+    } else if (Array.isArray(result.failed) && result.failed.length) {
+      // A mixed response may have deleted some names but left another tree
+      // partially intact. Do not silently treat the whole request as success.
+      const details = result.failed.map(item => String(item.name || '') + ': ' +
+        errorMessage(item.error, t("Cannot delete."))).join('\n');
+      toast(details, true);
+    }
     await refreshPanes(target);
   }
 

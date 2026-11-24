@@ -630,6 +630,42 @@ pub async fn download_single_file(
         return Err("Safe no-overwrite downloads require a fresh staging file.".to_string());
     }
     let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
+    // Ordinary SFTP resumes previously trusted a local prefix solely because
+    // its length fit. Compare it with the remote bytes before moving or
+    // opening either local path for writing. The size/mtime identity is a
+    // best-effort guard, not a server-side atomic snapshot.
+    let mut sftp_resume_identity = None;
+    if flags.resume && session.scheme() == ProtocolScheme::Sftp {
+        let candidate = if let Some(stage) = stage_opt.as_ref() {
+            let stage_info = stat_local_path(stage);
+            if stage_info.exists {
+                if stage_info.is_symlink || !stage_info.is_regular || stage_info.size >= info.size {
+                    return Err(format!("Cannot safely resume from existing staging file '{}'.", stage.display()));
+                }
+                Some((stage.as_path(), stage_info.size))
+            } else if local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
+                Some((local_dest, local_stat.size))
+            } else {
+                None
+            }
+        } else if local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
+            Some((local_dest, local_stat.size))
+        } else {
+            None
+        };
+        if let Some((partial, size)) = candidate {
+            let input = linscp_platform::open_private_file_no_follow(partial)
+                .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
+            let token = format!("\"sftp:{}:{}\"", info.size, info.mtime);
+            if size > 0 {
+                let input = tokio::fs::File::from_std(input);
+                let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader).await
+                    .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
+                sftp_resume_identity = Some(token);
+            }
+        }
+    }
     let (write_path, resume_offset) = if flags.no_clobber {
         (stage_opt.as_ref().expect("checked above").clone(), 0u64)
     } else if let Some(ref sp) = stage_opt {
@@ -700,7 +736,7 @@ pub async fn download_single_file(
     };
     let dl_res = {
         let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-        if let Some(etag) = flags.source_etag.as_deref() {
+        if let Some(etag) = flags.source_etag.as_deref().or(sftp_resume_identity.as_deref()) {
             session.download_if_match(remote_path, etag, req, &mut writer, progress).await
         } else {
             session.download(remote_path, req, &mut writer, progress).await
@@ -723,7 +759,7 @@ pub async fn download_single_file(
         logger.record_transfer(false, remote_path, &dest_label, None, Err(&msg));
         return Err(msg);
     }
-    if flags.source_etag.is_some() && bytes != info.size {
+    if (flags.source_etag.is_some() || sftp_resume_identity.is_some()) && bytes != info.size {
         return Err("Conditional download length does not match the source metadata; the source was not deleted.".to_string());
     }
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
@@ -770,6 +806,27 @@ fn apply_downloaded_attrs(local_dest: &Path, info: &FileEntry, flags: &TransferF
     }
     if flags.preserve_time && info.mtime > 0 {
         let _ = set_local_file_times(local_dest, info.mtime, info.mtime);
+    }
+}
+
+// Staged publication needs the transmitted length, which can differ from the
+// source length after EOL conversion. Convert before creating a remote stage.
+async fn staged_upload_source(
+    local_src: &Path,
+    source_size: u64,
+    ascii: bool,
+    eol: Option<EolStyle>,
+) -> Result<(Box<dyn AsyncRead + Unpin + Send>, u64), String> {
+    if ascii {
+        let raw = std::fs::read(local_src)
+            .map_err(|e| format!("Cannot read local file '{}': {e}", local_src.display()))?;
+        let converted = convert_eol_bytes(&raw, eol.unwrap_or(EolStyle::Crlf));
+        let len = converted.len() as u64;
+        Ok((Box::new(std::io::Cursor::new(converted)), len))
+    } else {
+        let file = tokio::fs::File::open(local_src).await
+            .map_err(|e| format!("Cannot open local file '{}': {e}", local_src.display()))?;
+        Ok((Box::new(file), source_size))
     }
 }
 
@@ -889,10 +946,12 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if (flags.no_clobber || flags.overwrite_etag.is_some() || flags.ftp_risky_publish || flags.sftp_risky_publish) && effective_ascii {
-        return Err("Guarded or staged uploads require binary transfer mode.".to_string());
+    if effective_ascii && (flags.no_clobber || flags.overwrite_etag.is_some())
+        && (flags.resume || flags.append || (flags.no_clobber && flags.overwrite_etag.is_some()))
+    {
+        return Err("Exclusive uploads require a fresh transfer and one destination precondition.".to_string());
     }
-    if effective_ascii {
+    if effective_ascii && !flags.ftp_risky_publish && !flags.sftp_risky_publish {
         let raw = std::fs::read(local_src)
             .map_err(|e| format!("Cannot read local file '{src_label}': {e}"))?;
         // Default server newline target on upload: CRLF unless overridden (`-eol=lf`)
@@ -910,13 +969,28 @@ pub async fn upload_single_file(
             speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec),
             version_id: None,
         };
-        if let Err(e) = session
-            .upload(remote_dest, req, &mut reader, Some(total), progress)
-            .await
-        {
-            let msg = e.to_string();
-            logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
-            return Err(msg);
+        // Convert before applying the server-side precondition: the known
+        // length and progress must describe the bytes actually sent, not the
+        // source file. Never fall back to an unguarded upload if unsupported.
+        let result = if let Some(etag) = flags.overwrite_etag.as_deref() {
+            session.upload_if_match(remote_dest, etag, req, &mut reader, Some(total), progress).await
+        } else if flags.no_clobber {
+            session.upload_exclusive(remote_dest, req, &mut reader, Some(total), progress).await
+        } else {
+            session.upload(remote_dest, req, &mut reader, Some(total), progress).await
+        };
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
+                return Err(msg);
+            }
+            Ok(bytes) if bytes != total => {
+                let msg = format!("Upload did not transfer all converted bytes; remote destination '{remote_dest}' may be incomplete.");
+                logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
+                return Err(msg);
+            }
+            Ok(_) => {}
         }
         logger.record_transfer(true, &src_label, remote_dest, Some(total), Ok(()));
         if let Some(mt) = desired_mtime.filter(|_| session.scheme() != ProtocolScheme::S3) {
@@ -930,18 +1004,21 @@ pub async fn upload_single_file(
     }
 
     if flags.ftp_risky_publish {
-        if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || effective_ascii || flags.delete_source {
-            return Err("FTP staged upload requires a fresh binary copy.".to_string());
+        if flags.overwrite_etag.is_some() {
+            return Err("ETag-conditional overwrite cannot be combined with FTP staged publication.".to_string());
+        }
+        if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || flags.delete_source {
+            return Err("FTP staged upload requires a fresh copy without source deletion.".to_string());
         }
         let directory = remote_dest.rsplit_once('/').map(|(dir, _)| if dir.is_empty() { "/" } else { dir }).unwrap_or(".");
-        let input = tokio::fs::File::open(local_src).await.map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let (input, upload_size) = staged_upload_source(local_src, local_info.size, effective_ascii, flags.eol_override).await?;
         let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest { resume_offset: 0, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None };
-        let (bytes, stage) = session.upload_ftp_unique(directory, req, &mut reader, Some(local_info.size), progress).await.map_err(|e| e.to_string())?;
+        let (bytes, stage) = session.upload_ftp_unique(directory, req, &mut reader, Some(upload_size), progress).await.map_err(|e| e.to_string())?;
         if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
             return Err(format!("Cancelled before publication; temporary FTP file '{stage}' remains."));
         }
-        if bytes != local_info.size { return Err(format!("Source size changed; temporary FTP file '{stage}' remains.")); }
+        if bytes != upload_size { return Err(format!("Source size changed; temporary FTP file '{stage}' remains.")); }
         let current = session.stat(remote_dest).await.map_err(|e| format!("Cannot check FTP destination; temporary file '{stage}' remains: {e}"))?;
         if current.as_ref().is_some_and(|e| e.is_dir || e.is_symlink || flags.no_clobber) {
             return Err(format!("FTP destination changed; temporary file '{stage}' remains."));
@@ -957,11 +1034,11 @@ pub async fn upload_single_file(
         if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh) {
             return Err("The acknowledged staged publish is for SFTP/SCP sessions; FTP(S) uploads have their own staged mode, and WebDAV and S3 have their own approved overwrite preconditions.".to_string());
         }
-        if flags.resume || flags.append || effective_ascii || flags.delete_source {
-            return Err("SFTP staged upload requires a fresh binary copy.".to_string());
+        if flags.resume || flags.append || flags.delete_source {
+            return Err("SFTP staged upload requires a fresh copy without source deletion.".to_string());
         }
-        if flags.no_clobber {
-            return Err("Exclusive creation and the acknowledged staged SFTP publish are separate modes; give only one of them.".to_string());
+        if flags.no_clobber || flags.overwrite_etag.is_some() {
+            return Err("Exclusive or ETag-conditional creation and staged SFTP publication are separate modes; give only one of them.".to_string());
         }
         let directory = remote_dest
             .rsplit_once('/')
@@ -973,9 +1050,7 @@ pub async fn upload_single_file(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let stage = format!("{directory}/.{leaf}.linscp-sftp-stage-{nanos}");
-        let input = tokio::fs::File::open(local_src)
-            .await
-            .map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let (input, upload_size) = staged_upload_source(local_src, local_info.size, effective_ascii, flags.eol_override).await?;
         let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest {
             resume_offset: 0,
@@ -990,13 +1065,13 @@ pub async fn upload_single_file(
         // is ours to rename onto the destination. The destination itself is
         // never unlinked; the server replaces it atomically on publish.
         let bytes = session
-            .upload_exclusive(&stage, req, &mut reader, Some(local_info.size), progress)
+            .upload_exclusive(&stage, req, &mut reader, Some(upload_size), progress)
             .await
             .map_err(|e| format!("Cannot stage the upload as '{stage}': {e}"))?;
         if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
             return Err(format!("Cancelled before publication; temporary SFTP file '{stage}' remains."));
         }
-        if bytes != local_info.size {
+        if bytes != upload_size {
             return Err(format!("Source size changed; temporary SFTP file '{stage}' remains."));
         }
         let current = session

@@ -10,7 +10,7 @@
 //! Unguarded SFTP uploads stay refused by design ("Unguarded SFTP/FTP
 //! uploads are disabled; ..."). Scripts that must overwrite on the server
 //! opt into the explicitly acknowledged staged publish
-//! (`option sftpriskypublish on`): a fresh binary copy is staged under a
+//! (`option sftpriskypublish on`): a fresh copy is staged under a
 //! name this client created exclusively and published onto the destination
 //! by rename (atomic where the server has `posix-rename`). The destination
 //! is never unlinked first. The acknowledged mode covers `put`,
@@ -432,7 +432,7 @@ async fn test_transfer_speed_append_and_preservetime_all() {
     )
     .await;
     assert!(!ok, "put -append is refused even with the acknowledgment: {out}");
-    assert!(out.contains("fresh binary copy"), "the refusal says why: {out}");
+    assert!(out.contains("fresh copy"), "the refusal says why: {out}");
     let remote_log = download_bytes(&*sftp, "/remote-log.txt", TransferRequest::default())
         .await
         .unwrap();
@@ -1131,3 +1131,237 @@ async fn test_synchronize_preserves_masked_files_in_deleted_dirs_and_skips_symli
     sftp.close().await.unwrap();
 }
 
+
+/// A no-overwrite upload can convert text without weakening the server-side
+/// exclusive-create guarantee. Automatic mode must leave non-text files alone.
+#[tokio::test]
+async fn test_exclusive_ascii_and_automatic_uploads() {
+    use linscp_engine::transfer::{upload_single_file, TransferFlags};
+    use linscp_types::TransferMode;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x79, 0x7a).await;
+    let text = tmp.path().join("lines.txt");
+    let binary = tmp.path().join("payload.dat");
+    fs::write(&text, b"one\ntwo\rthree\r\n").unwrap();
+    fs::write(&binary, b"one\r\ntwo\r\n").unwrap();
+    let mut logger = in_memory_logger();
+    let mut flags = TransferFlags { no_clobber: true, transfer_mode: TransferMode::Ascii, ..Default::default() };
+    upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+
+    // A second creation must fail without changing the existing file or
+    // deleting the source, even when delete-after-transfer was requested.
+    flags.delete_source = true;
+    assert!(upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.is_err());
+    assert!(text.exists());
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+
+    flags.delete_source = false;
+    flags.transfer_mode = TransferMode::Automatic;
+    flags.eol_override = Some(EolStyle::Lf);
+    upload_single_file(&*sftp, &text, "/auto-upload.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/auto-upload.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
+    upload_single_file(&*sftp, &binary, "/auto-upload.dat", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/auto-upload.dat", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\n");
+
+    flags.resume = true;
+    assert!(upload_single_file(&*sftp, &text, "/resume-refused.txt", &flags, &mut logger, None).await.is_err());
+    assert!(sftp.stat("/resume-refused.txt").await.unwrap().is_none());
+
+    // SFTP cannot enforce an ETag condition. It must fail closed rather than
+    // silently retrying an unconditional upload.
+    flags.resume = false;
+    flags.no_clobber = false;
+    flags.overwrite_etag = Some("\"approved\"".to_string());
+    assert!(upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.is_err());
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+    sftp.close().await.unwrap();
+}
+
+/// An acknowledged staged text upload must publish the converted bytes while
+/// keeping the same destination guards as a staged binary upload.
+#[tokio::test]
+async fn test_staged_ascii_upload_converts_before_publish() {
+    use linscp_engine::transfer::{upload_single_file, TransferFlags};
+    use linscp_types::TransferMode;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7b, 0x7c).await;
+    let source = tmp.path().join("source.txt");
+    fs::write(&source, b"one\ntwo\rthree\r\n").unwrap();
+    seed_remote(&sftp, "/publish.txt", b"old", None).await;
+    let mut flags = TransferFlags {
+        transfer_mode: TransferMode::Ascii,
+        sftp_risky_publish: true,
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    let progress = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let progress_for_callback = Arc::clone(&progress);
+    let total_for_callback = Arc::clone(&total);
+    let callback = move |done: u64, size: u64| {
+        progress_for_callback.store(done, Ordering::SeqCst);
+        total_for_callback.store(size, Ordering::SeqCst);
+    };
+    upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, Some(&callback)).await.unwrap();
+    let expected = b"one\r\ntwo\r\nthree\r\n";
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), expected);
+    assert_eq!(progress.load(Ordering::SeqCst), expected.len() as u64);
+    assert_eq!(total.load(Ordering::SeqCst), expected.len() as u64);
+    assert_eq!(fs::read(&source).unwrap(), b"one\ntwo\rthree\r\n");
+
+    flags.eol_override = Some(EolStyle::Lf);
+    upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
+
+    // Neither a conflicting destination guard nor an append can be silently
+    // weakened by the conversion path.
+    flags.overwrite_etag = Some("\"v1\"".into());
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    flags.overwrite_etag = None;
+    flags.no_clobber = true;
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    flags.no_clobber = false;
+    flags.append = true;
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
+    sftp.close().await.unwrap();
+}
+
+/// Interrupt a running download after a real SFTP chunk has arrived, then
+/// continue the exact staging file. The old destination must not be published
+/// over until the resumed download completes.
+#[tokio::test]
+async fn test_interrupted_staged_download_resumes_its_partial() {
+    use linscp_engine::presets::ResumeSupportMode;
+    use linscp_engine::transfer::{download_single_file, TransferFlags};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7d, 0x7e).await;
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    seed_remote(&sftp, "/interrupt.bin", &payload, None).await;
+    let destination = tmp.path().join("interrupt.bin");
+    let stage = tmp.path().join("interrupt.bin.filepart");
+    fs::write(&destination, b"old destination").unwrap();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_on_progress = Arc::clone(&cancelled);
+    let callback = move |done: u64, _total: u64| {
+        if done > 0 { cancel_on_progress.store(true, Ordering::SeqCst); }
+    };
+    let mut flags = TransferFlags {
+        resume_support: ResumeSupportMode::On,
+        cancel_flag: Some(Arc::clone(&cancelled)),
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    let result = download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, Some(&callback)).await;
+    assert!(result.is_err(), "the in-flight cancellation must fail the download");
+    assert_eq!(fs::read(&destination).unwrap(), b"old destination");
+    let partial = fs::read(&stage).expect("interruption retains the staging file");
+    assert!(!partial.is_empty() && partial.len() < payload.len());
+    assert_eq!(partial, payload[..partial.len()]);
+
+    cancelled.store(false, Ordering::SeqCst);
+    flags.resume = true;
+    assert!(download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, None).await.unwrap());
+    assert_eq!(fs::read(&destination).unwrap(), payload);
+    assert!(!stage.exists(), "the completed stage was published");
+    sftp.close().await.unwrap();
+}
+
+/// The GUI's verified-resume path compares every saved byte with the remote
+/// file before publishing. A stale checkpoint must never become a mixed file,
+/// even when the replacement has the same length and timestamp.
+#[tokio::test]
+async fn test_verified_resume_refuses_a_changed_sftp_prefix() {
+    use linscp_engine::transfer::{download_verified_resume, TransferFlags};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7f, 0x80).await;
+    let original = b"0123456789abcdef";
+    seed_remote(&sftp, "/verified.bin", original, Some(1_700_000_000)).await;
+    let destination = tmp.path().join("verified.bin");
+    let checkpoint = tmp.path().join("verified.bin.filepart");
+    fs::write(&checkpoint, &original[..8]).unwrap();
+    let info = sftp.stat("/verified.bin").await.unwrap().unwrap();
+    let flags = TransferFlags {
+        no_clobber: true,
+        resume: true,
+        source_etag: Some(format!("\"sftp:{}:{}\"", info.size, info.mtime)),
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &flags, &mut logger, None).await.unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), original);
+    assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8], "the checkpoint is never changed");
+
+    // The same-length replacement deliberately has the same SFTP timestamp;
+    // metadata alone would not distinguish it from the original.
+    let changed = b"XXXXXXXX89abcdef";
+    seed_remote(&sftp, "/verified.bin", changed, Some(info.mtime)).await;
+    let changed_destination = tmp.path().join("changed.bin");
+    let changed_checkpoint = tmp.path().join("changed.bin.filepart");
+    fs::write(&changed_checkpoint, &original[..8]).unwrap();
+    let result = download_verified_resume(&*sftp, "/verified.bin", &info, &changed_destination, &flags, &mut logger, None).await;
+    assert!(result.is_err(), "a mismatched prefix must fail");
+    assert!(!changed_destination.exists(), "a mixed destination was not published");
+    assert_eq!(fs::read(&changed_checkpoint).unwrap(), &original[..8]);
+
+    // The no-replace publication guard must also leave a concurrently
+    // existing destination and the original checkpoint intact.
+    let existing = tmp.path().join("existing.bin");
+    let existing_checkpoint = tmp.path().join("existing.bin.filepart");
+    fs::write(&existing, b"local data").unwrap();
+    fs::write(&existing_checkpoint, &changed[..8]).unwrap();
+    assert!(download_verified_resume(&*sftp, "/verified.bin", &info, &existing, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&existing).unwrap(), b"local data");
+    assert_eq!(fs::read(&existing_checkpoint).unwrap(), &changed[..8]);
+    sftp.close().await.unwrap();
+}
+
+/// Legacy SFTP resume must compare a local prefix before modifying a stage
+/// or adopting a partial destination, even when remote metadata matches.
+#[tokio::test]
+async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
+    use linscp_engine::presets::ResumeSupportMode;
+    use linscp_engine::transfer::{download_single_file, TransferFlags};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x81, 0x82).await;
+    seed_remote(&sftp, "/changed.bin", b"new-data-1234567", Some(1_700_000_000)).await;
+    let mut logger = in_memory_logger();
+    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+
+    let dest = tmp.path().join("staged.bin");
+    let stage = tmp.path().join("staged.bin.filepart");
+    fs::write(&dest, b"old final").unwrap();
+    fs::write(&stage, b"old-data").unwrap();
+    let error = download_single_file(&*sftp, "/changed.bin", None, &dest, &flags, &mut logger, None).await.unwrap_err();
+    assert!(error.contains("do not match"), "{error}");
+    assert_eq!(fs::read(&dest).unwrap(), b"old final");
+    assert_eq!(fs::read(&stage).unwrap(), b"old-data");
+
+    // When no stage exists, the legacy path may adopt the destination as a
+    // partial. A mismatch must be detected before it is renamed or changed.
+    let adopted = tmp.path().join("adopted.bin");
+    let adopted_stage = tmp.path().join("adopted.bin.filepart");
+    fs::write(&adopted, b"old-data").unwrap();
+    assert!(download_single_file(&*sftp, "/changed.bin", None, &adopted, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&adopted).unwrap(), b"old-data");
+    assert!(!adopted_stage.exists());
+
+    // A complete or oversized pre-existing stage is not ours to delete.
+    fs::write(&stage, b"a staging file larger than the remote").unwrap();
+    assert!(download_single_file(&*sftp, "/changed.bin", None, &dest, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&stage).unwrap(), b"a staging file larger than the remote");
+    assert_eq!(fs::read(&dest).unwrap(), b"old final");
+    sftp.close().await.unwrap();
+}

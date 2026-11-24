@@ -1271,6 +1271,18 @@ function options(id) {
       (remoteDeleteBody.names || []).length === 1 &&
       remoteDeleteBody.names[0].name === 'testdir' && remoteDeleteBody.names[0].is_dir === true,
     remoteDelete ? remoteDelete.options.body : 'no delete request');
+  // A successful batch response may still report a failed, partially removed
+  // tree. Its diagnostic must reach the persistent error log.
+  const previousDeleteResponse = responses['/api/remote/delete'];
+  responses['/api/remote/delete'] = { success: true, deleted: ['another.txt'],
+    failed: [{ name: 'testdir', error: 'tree may be partially deleted' }] };
+  doc.getElementById('remoteFileList').children[1]
+    .dispatchEvent(new window.MouseEvent('click', { bubbles: true }));
+  doc.dispatchEvent(new window.KeyboardEvent('keydown', { key: 'F8', bubbles: true }));
+  await new Promise(resolve => setTimeout(resolve, 120));
+  check('partial remote deletion is reported in the error log',
+    lastLogLine().includes('testdir:') && lastLogLine().includes('tree may be partially deleted'), lastLogLine());
+  responses['/api/remote/delete'] = previousDeleteResponse;
   // Declining the question sends nothing at all.
   const declinedBefore = calls.filter(c =>
     c.path === '/api/remote/delete' || c.path === '/api/local/delete').length;

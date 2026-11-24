@@ -24,29 +24,29 @@ The id is the row's history: an scp:// transfer is not curl's any more. The byte
 
 **Area:** Transfers · **Status:** partial
 
-The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise.
+The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; acknowledged SFTP and FTP staged publication convert before staging; the FTP rename remains explicitly acknowledged as non-atomic and racy.
 
-**Next:** The upload direction is still unevidenced: live-dav needs a `linscp` binary this repo does not build, and every protocol this build guards refuses an ASCII upload (a guarded or staged upload has to be binary), so only the curl-backed protocols could show it. Runnable residue: engine-sftp, which checks the download direction.
+**Next:** Linux and Windows CI exercise exclusive and staged SFTP, staged FTP and ETag-conditional WebDAV ASCII uploads using loopback fixtures, including guard refusals. Android-device behavior and live third-party server behavior remain unverified. The upstream live WebDAV suite requires a CLI binary this GUI-only build does not ship.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Cover the upload direction over a protocol that accepts an ASCII upload.
+- [ ] Exercise Android-device behavior where applicable.
+- [ ] Cover remaining desired live-server behavior without depending on the removed CLI.
 
 ## transfer.filepart-resume
 
 **Area:** Transfers · **Status:** partial
 
-Interrupted uploads and downloads stage in a `.filepart` file beside the destination and continue there rather than splicing the final destination: the bytes that arrived are kept, the resumed transfer continues them, and the file is published onto the destination only when the whole file has arrived.
+Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them.
 
-**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which stages the bytes in the `.filepart` file, resumes that staging file rather than the old destination, and publishes the whole file onto the destination only when it has arrived.
+**Next:** Linux and Windows CI exercise interrupted and resumed SFTP downloads, including mismatched prefixes and preservation on refusal. The SFTP size/mtime guard is not an atomic snapshot: a remote or local file can still change concurrently, including with unchanged metadata. Other ordinary protocol resume paths do not yet verify prefixes. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Interrupt a transfer mid-flight and check that the staging file is what survives.
+- [ ] Protect ordinary resume on the other protocols against stale prefixes and explicitly handle protocols without a strong remote version.
+- [ ] Address concurrent local and remote modification during SFTP resume without claiming size/mtime is an atomic snapshot.
+- [ ] Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.
+- [ ] Exercise Android-device and relevant live-server behavior without the removed CLI.
 
 ## transfer.resume-modes
 
@@ -561,13 +561,14 @@ Symbolic links can be created in a local pane, not just over SFTP: the other pan
 
 **Area:** GUI · **Status:** partial
 
-The panes' delete runs on the session: each selected name is validated as a leaf, joined to the panel directory and removed with the queue's own tree walk, which empties a directory before removing it and unlinks a symbolic link instead of following it. A name the server no longer has counts as deleted; a refusal is reported per name, and the valid names of the same request still run. A local tab keeps its contained path resolution. It is not transactional: an interruption can leave part of a tree, which the row states as its gap. The service-side evidence is a helper called from live_webdav_gui_upload_download, which the Debian job runs with LSCP_LIVE_WEBDAV=1; the helper is named for what it exercises, not as a separate case.
+Remote deletes walk the selected tree, unlink symlinks without following them, reject unsafe server-provided child names, and report errors per selected name. A missing top-level entry is treated as already deleted. Partial failures are included in the service response and shown in the GUI error log; a failed child operation never counts the whole tree as deleted.
 
-**Next:** Remote deletion is not transactional: a directory is emptied before it is removed, so an interruption can leave part of a tree.
+**Next:** Recursive remote deletion is not transactional and may leave a partially deleted tree after an error. Linux and Windows mock-session tests inject a child deletion failure and verify the partial result is reported; the GUI test verifies the message reaches the error log. Live-server interruption and Android-device behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Prove an interruption leaves the partial tree reported rather than presented as a completed delete.
+- [ ] Exercise actual connection interruption and resulting partial deletion against a live server.
+- [ ] Exercise the partial-failure report on Android and retain the non-transactional warning.
 
 ## backup.full-export-import
 
