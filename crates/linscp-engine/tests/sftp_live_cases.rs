@@ -529,15 +529,13 @@ async fn test_staged_resume_continues_the_staging_file_not_the_old_final() {
     // not splice that one in.
     fs::write(&dest, b"old").expect("write the old destination");
 
-    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
-    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
-
-    let (ok, out) = run_script(
-        &mut interp,
-        &format!("get -resume -resumesupport=on /staged.bin {}", dest.display()),
-    )
-    .await;
-    assert!(ok, "the resumed download runs: {out}");
+    let flags = linscp_engine::transfer::TransferFlags {
+        resume: true, allow_best_effort_resume: true,
+        resume_support: linscp_engine::presets::ResumeSupportMode::On,
+        ..Default::default()
+    };
+    let result = linscp_engine::transfer::download_single_file(&*sftp, "/staged.bin", None, &dest, &flags, &mut in_memory_logger(), None).await;
+    assert!(result.unwrap(), "the acknowledged resumed download runs");
 
     assert_eq!(
         fs::read(&dest).unwrap(),
@@ -1270,6 +1268,7 @@ async fn test_interrupted_staged_download_resumes_its_partial() {
 
     cancelled.store(false, Ordering::SeqCst);
     flags.resume = true;
+    flags.allow_best_effort_resume = true;
     assert!(download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, None).await.unwrap());
     assert_eq!(fs::read(&destination).unwrap(), payload);
     assert!(!stage.exists(), "the completed stage was published");
@@ -1294,11 +1293,18 @@ async fn test_verified_resume_refuses_a_changed_sftp_prefix() {
     let flags = TransferFlags {
         no_clobber: true,
         resume: true,
+        allow_best_effort_resume: true,
         source_etag: Some(format!("\"sftp:{}:{}\"", info.size, info.mtime)),
         preserve_time: false,
         ..Default::default()
     };
     let mut logger = in_memory_logger();
+    let mut refused_flags = flags.clone();
+    refused_flags.allow_best_effort_resume = false;
+    let error = download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &refused_flags, &mut logger, None).await.unwrap_err();
+    assert!(error.contains("explicit best-effort"), "{error}");
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8]);
     download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &flags, &mut logger, None).await.unwrap();
     assert_eq!(fs::read(&destination).unwrap(), original);
     assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8], "the checkpoint is never changed");
@@ -1338,7 +1344,7 @@ async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
     let (sftp, _) = connect_mock(0x81, 0x82).await;
     seed_remote(&sftp, "/changed.bin", b"new-data-1234567", Some(1_700_000_000)).await;
     let mut logger = in_memory_logger();
-    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+    let flags = TransferFlags { resume: true, allow_best_effort_resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
 
     let dest = tmp.path().join("staged.bin");
     let stage = tmp.path().join("staged.bin.filepart");

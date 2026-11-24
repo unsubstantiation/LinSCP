@@ -133,8 +133,13 @@ async fn ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable()
     let stage = tmp.path().join("download.bin.filepart");
     std::fs::write(&destination, b"old destination").unwrap();
     std::fs::write(&stage, b"wrong prefix").unwrap();
-    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+    let mut flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
     let mut logger = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+    let refused = download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap_err();
+    assert!(refused.contains("explicit best-effort"), "{refused}");
+    assert_eq!(std::fs::read(&stage).unwrap(), b"wrong prefix");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old destination");
+    flags.allow_best_effort_resume = true;
     let error = download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap_err();
     assert!(error.contains("do not match"), "{error}");
     assert_eq!(std::fs::read(&destination).unwrap(), b"old destination");

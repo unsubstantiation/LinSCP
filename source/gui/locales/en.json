@@ -574,6 +574,7 @@
   "FTP account (ACCT):": "FTP account (ACCT):",
   "FTP with explicit TLS (FTPS)": "FTP with explicit TLS (FTPS)",
   "FTP/FTPS cannot guarantee that the destination stays unchanged. Another client's file could be overwritten when the temporary upload is renamed, even if no overwrite was approved. Interruptions may leave a temporary file and require reconnecting. Continue?": "FTP/FTPS cannot guarantee that the destination stays unchanged. Another client's file could be overwritten when the temporary upload is renamed, even if no overwrite was approved. Interruptions may leave a temporary file and require reconnecting. Continue?",
+  "FTP/SFTP cannot lock the source while resuming. Concurrent changes to the remote file or local partial can produce a corrupt download even if size and modification time match. Resume on a best-effort basis?": "FTP/SFTP cannot lock the source while resuming. Concurrent changes to the remote file or local partial can produce a corrupt download even if size and modification time match. Resume on a best-effort basis?",
   "FTPS": "FTPS",
   "FTPS mode:": "FTPS mode:",
   "FTPS with implicit TLS": "FTPS with implicit TLS",

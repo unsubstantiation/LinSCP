@@ -30,6 +30,8 @@ pub struct TransferFlags {
     pub latest_only: bool,
     pub delete_source: bool,
     pub resume: bool,
+    /// Explicit acknowledgement that FTP/SFTP cannot pin a remote snapshot.
+    pub allow_best_effort_resume: bool,
     pub append: bool,
     pub recursive: bool,
     /// Do not replace an existing destination; fail if the protocol cannot enforce this.
@@ -70,6 +72,7 @@ impl Default for TransferFlags {
             latest_only: false,
             delete_source: false,
             resume: false,
+            allow_best_effort_resume: false,
             append: false,
             recursive: false,
             no_clobber: false,
@@ -339,6 +342,9 @@ pub async fn download_verified_resume(
         if offset > info.size { return Err("Resume partial is larger than the remote file.".to_string()); }
         file.flush().await.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
         if offset > 0 {
+            if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && !flags.allow_best_effort_resume {
+                return Err("FTP/SFTP resume cannot pin the source; explicit best-effort resume approval is required.".to_string());
+            }
             file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| e.to_string())?;
             let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
             session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader).await.map_err(|e| e.to_string())?;
@@ -657,6 +663,9 @@ pub async fn download_single_file(
             let input = linscp_platform::open_private_file_no_follow(partial)
                 .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
             if size > 0 {
+                if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && !flags.allow_best_effort_resume {
+                    return Err("FTP/SFTP resume cannot pin the source; explicit best-effort resume approval is required.".to_string());
+                }
                 let token = if is_webdav_scheme(session.scheme()) {
                     let (current, etag) = session.dav_stat_with_etag(remote_path).await.map_err(|e| e.to_string())?;
                     if current.as_ref().map_or(true, |entry| entry.is_dir || entry.size != info.size) {

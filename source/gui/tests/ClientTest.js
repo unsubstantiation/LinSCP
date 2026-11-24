@@ -491,6 +491,25 @@ function options(id) {
 (async () => {
   await new Promise(resolve => setTimeout(resolve, 400));
 
+  // An FTP/SFTP resume risk requires an affirmative, one-request approval.
+  {
+    const originalConfirm = window.confirm;
+    let prompts = [];
+    let requests = [];
+    const send = async approval => {
+      requests.push(Object.assign({}, approval));
+      return {result: approval.accept_best_effort_resume_risk ? {success: true} : {best_effort_resume_risk: true}};
+    };
+    window.confirm = message => { prompts.push(message); return false; };
+    const declined = await window.applyDropApprovals(send);
+    check('best-effort resume refusal does not retry', declined.cancelled && requests.length === 1 && prompts[0].includes('corrupt'));
+    requests = []; prompts = [];
+    window.confirm = message => { prompts.push(message); return true; };
+    const accepted = await window.applyDropApprovals(send);
+    check('best-effort resume approval is explicit', accepted.result.success && requests.length === 2 && requests[1].accept_best_effort_resume_risk === true);
+    window.confirm = originalConfirm;
+  }
+
   // Boot fetched what it needs.
   const doc = window.document;
   const paths = calls.map(call => call.path);
