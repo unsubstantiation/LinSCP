@@ -506,6 +506,88 @@ async fn test_ascii_and_automatic_downloads_convert_line_endings() {
     sftp.close().await.unwrap();
 }
 
+/// An interrupted transfer leaves its bytes in a `.filepart` staging file
+/// beside the destination, and the resumed transfer continues that staging
+/// file rather than the old destination: the destination that was there
+/// before is never spliced into the result.
+///
+/// The state an interruption leaves behind is the state the test builds:
+/// the bytes received so far in `<name>.filepart`, the destination not yet
+/// written. The resumed transfer has to finish the file from there.
+#[tokio::test]
+async fn test_staged_resume_continues_the_staging_file_not_the_old_final() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6d, 0x6e).await;
+    let payload = b"0123456789".to_vec();
+    seed_remote(&sftp, "/staged.bin", &payload, None).await;
+
+    let dest = tmp.path().join("staged.bin");
+    let stage = tmp.path().join("staged.bin.filepart");
+    // The staging file holds the bytes received before the interruption.
+    fs::write(&stage, b"01234").expect("write the staged bytes");
+    // The destination still holds an older, shorter file. The resume must
+    // not splice that one in.
+    fs::write(&dest, b"old").expect("write the old destination");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let (ok, out) = run_script(
+        &mut interp,
+        &format!("get -resume -resumesupport=on /staged.bin {}", dest.display()),
+    )
+    .await;
+    assert!(ok, "the resumed download runs: {out}");
+
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        payload,
+        "the download continues the staging file and replaces the old destination"
+    );
+    assert!(
+        !stage.exists(),
+        "the staging file is gone once the download is published"
+    );
+
+    sftp.close().await.unwrap();
+}
+
+/// A fresh download that stages its bytes writes them to the `.filepart`
+/// file first and publishes them onto the destination only when the whole
+/// file has arrived, so a failed transfer never leaves a half-written
+/// destination behind.
+#[tokio::test]
+async fn test_a_staged_download_publishes_only_the_whole_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6f, 0x70).await;
+    let payload = b"the whole payload".to_vec();
+    seed_remote(&sftp, "/whole.bin", &payload, None).await;
+
+    let dest = tmp.path().join("whole.bin");
+    let stage = tmp.path().join("whole.bin.filepart");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let (ok, out) = run_script(
+        &mut interp,
+        &format!("get -resumesupport=on /whole.bin {}", dest.display()),
+    )
+    .await;
+    assert!(ok, "the download runs: {out}");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        payload,
+        "the destination holds the whole file"
+    );
+    assert!(
+        !stage.exists(),
+        "the staging file is published onto the destination"
+    );
+
+    sftp.close().await.unwrap();
+}
+
 /// `-filemask=|skip/` prunes the excluded subtree in both the transfer and
 /// the delete phases: the preview lists the surviving file and neither of
 /// the excluded ones. Without the acknowledgment the run aborts naming the
