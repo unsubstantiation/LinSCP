@@ -77,7 +77,8 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Linux host tests cover private filesystem helpers and configuration directory lookup.",
-          "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Linux CI."
+          "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Linux CI.",
+          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -128,7 +129,8 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only.",
-          "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Windows CI."
+          "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Windows CI.",
+          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -2332,7 +2334,7 @@
       "id": "transfer.ascii-automatic",
       "area": "Transfers",
       "status": "partial",
-      "notes": "The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; acknowledged SFTP staged publication converts before staging; FTP staged publication still requires binary mode.",
+      "notes": "The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; acknowledged SFTP and FTP staged publication convert before staging; the FTP rename remains explicitly acknowledged as non-atomic and racy.",
       "source": [
         "crates/linscp-engine/src/text_mode.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2349,29 +2351,33 @@
         ],
         "engine-dav-ascii": [
           "conditional_ascii_upload_converts_before_applying_etag"
+        ],
+        "engine-ftp-ascii": [
+          "staged_ftp_ascii_preserves_guards_and_reports_converted_size"
         ]
       },
       "verified_on": {
         "linux": [
           "engine-sftp",
           "live-dav",
-          "engine-dav-ascii"
+          "engine-dav-ascii",
+          "engine-ftp-ascii"
         ],
         "windows": [
           "engine-sftp",
           "live-dav",
-          "engine-dav-ascii"
+          "engine-dav-ascii",
+          "engine-ftp-ascii"
         ],
         "android": [
           "engine-sftp",
           "live-dav"
         ]
       },
-      "gap": "Linux and Windows CI exercised SFTP exclusive and acknowledged staged ASCII uploads and WebDAV ETag-conditional uploads, including conflict refusals. FTP staged ASCII remains unsupported, and Android-device behavior has not been exercised. The upstream live WebDAV suite requires a CLI binary this GUI-only build does not ship.",
+      "gap": "Linux and Windows CI exercise exclusive and staged SFTP, staged FTP and ETag-conditional WebDAV ASCII uploads using loopback fixtures, including guard refusals. Android-device behavior and live third-party server behavior remain unverified. The upstream live WebDAV suite requires a CLI binary this GUI-only build does not ship.",
       "acceptance": [
-        "Implement and test FTP staged ASCII upload without weakening publication guards.",
         "Exercise Android-device behavior where applicable.",
-        "Cover any remaining desired live-server behavior without depending on the removed CLI."
+        "Cover remaining desired live-server behavior without depending on the removed CLI."
       ]
     },
     {
