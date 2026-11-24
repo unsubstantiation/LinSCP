@@ -340,6 +340,14 @@ pub enum MemNode {
 pub struct MemFs {
     pub nodes: HashMap<String, MemNode>,
     pub disable_shell_cp: bool,
+    /// The server's `ls` has no `--full-time`, so the client has to ask in
+    /// the plainer way.
+    pub disable_ls_full_time: bool,
+    /// The server's shell has no `env`, so the client has to ask without it.
+    pub disable_env: bool,
+    /// How many `ls` calls carried `--full-time`, so a case can show the
+    /// client tried the richer form first.
+    pub ls_full_time_attempts: u32,
 }
 
 impl MemFs {
@@ -369,6 +377,9 @@ impl MemFs {
         Self {
             nodes,
             disable_shell_cp: false,
+            disable_ls_full_time: false,
+            disable_env: false,
+            ls_full_time_attempts: 0,
         }
     }
 
@@ -720,141 +731,23 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
         let _ = channel.close().await;
         return;
     } else {
-        match prog {
-            "pwd" => {
-                stdout.push_str("/home/tester\n");
+        // A server command may be a chain: the engine's own exclusive-upload
+        // stage runs `(umask 077 && set -C && : > 'stage')`, and the shell
+        // answers with the last command's status. A failing command stops
+        // the chain, exactly as a real shell does.
+        let chain = split_shell_chain(&cmd);
+        let mut cwd = "/home/tester".to_string();
+        for (index, part) in chain.iter().enumerate() {
+            let outcome = run_mock_shell_command(part, &fs, &mut cwd).await;
+            stdout.push_str(&outcome.stdout);
+            stderr.push_str(&outcome.stderr);
+            code = outcome.code;
+            if code != 0 && index + 1 < chain.len() {
+                // The chain stops at the first failure.
+                break;
             }
-            "ls" => {
-                let is_dir_self = args.iter().any(|a| a == "-d");
-                let path = args.last().map(String::as_str).unwrap_or(".");
-                let guard = fs.lock().await;
-                let norm = MemFs::normalize(path);
-                if is_dir_self {
-                    match guard.attrs_for(&norm, false) {
-                        Some(attrs) => {
-                            let sym = match guard.nodes.get(&norm) {
-                                Some(MemNode::Symlink { target, .. }) => Some(target.as_str()),
-                                _ => None,
-                            };
-                            stdout.push_str(&format_ls_line(&norm, &attrs, sym));
-                        }
-                        None => {
-                            code = 2;
-                            stderr.push_str(&format!("ls: cannot access '{path}': No such file or directory\n"));
-                        }
-                    }
-                } else if matches!(guard.nodes.get(&norm), Some(MemNode::Dir { .. })) {
-                    stdout.push_str("total 4\n");
-                    for (name, attrs, sym) in guard.children_of(&norm) {
-                        stdout.push_str(&format_ls_line(&name, &attrs, sym.as_deref()));
-                    }
-                } else {
-                    code = 2;
-                    stderr.push_str(&format!("ls: cannot access '{path}': No such file or directory\n"));
-                }
-            }
-            "mkdir" => {
-                let path = args.last().map(String::as_str).unwrap_or("");
-                fs.lock().await.nodes.insert(
-                    MemFs::normalize(path),
-                    MemNode::Dir {
-                        mode: 0o755,
-                        mtime: 1_760_000_000,
-                    },
-                );
-            }
-            "rm" => {
-                let path = args.last().map(String::as_str).unwrap_or("");
-                fs.lock().await.nodes.remove(&MemFs::normalize(path));
-            }
-            "rmdir" => {
-                let path = args.last().map(String::as_str).unwrap_or("");
-                let norm = MemFs::normalize(path);
-                let mut guard = fs.lock().await;
-                if guard.children_of(&norm).is_empty() {
-                    guard.nodes.remove(&norm);
-                } else {
-                    code = 1;
-                    stderr.push_str("rmdir: Directory not empty\n");
-                }
-            }
-            "mv" => {
-                if args.len() >= 2 {
-                    let dst = MemFs::normalize(&args[args.len() - 1]);
-                    let src = MemFs::normalize(&args[args.len() - 2]);
-                    let mut guard = fs.lock().await;
-                    if let Some(node) = guard.nodes.remove(&src) {
-                        guard.nodes.insert(dst, node);
-                    } else {
-                        code = 1;
-                        stderr.push_str("mv: No such file or directory\n");
-                    }
-                }
-            }
-            "cp" => {
-                let mut guard = fs.lock().await;
-                if guard.disable_shell_cp {
-                    code = 127;
-                    stderr.push_str("sh: 1: cp: not found\n");
-                } else if args.len() >= 2 {
-                    let dst = MemFs::normalize(&args[args.len() - 1]);
-                    let src = MemFs::normalize(&args[args.len() - 2]);
-                    if let Some(node) = guard.nodes.get(&src).cloned() {
-                        guard.nodes.insert(dst, node);
-                    } else {
-                        code = 1;
-                        stderr.push_str("cp: No such file or directory\n");
-                    }
-                }
-            }
-            "chmod" => {
-                if args.len() >= 2 {
-                    let path = MemFs::normalize(&args[args.len() - 1]);
-                    let mode_str = &args[0];
-                    let parsed_mode = u32::from_str_radix(mode_str, 8).unwrap_or(0o644);
-                    let mut guard = fs.lock().await;
-                    match guard.nodes.get_mut(&path) {
-                        Some(MemNode::File { mode, .. }) | Some(MemNode::Dir { mode, .. }) => {
-                            *mode = parsed_mode;
-                        }
-                        _ => {
-                            code = 1;
-                            stderr.push_str("chmod: No such file or directory\n");
-                        }
-                    }
-                }
-            }
-            "touch" => {}
-            "ln" => {
-                if args.len() >= 2 {
-                    let link_path = MemFs::normalize(&args[args.len() - 1]);
-                    let target = args[args.len() - 2].clone();
-                    fs.lock().await.nodes.insert(
-                        link_path,
-                        MemNode::Symlink {
-                            target,
-                            mtime: 1_760_000_000,
-                        },
-                    );
-                }
-            }
-            "sha256sum" => {
-                let path = MemFs::normalize(args.last().map(String::as_str).unwrap_or(""));
-                let guard = fs.lock().await;
-                if let Some(MemNode::File { data, .. }) = guard.nodes.get(&path) {
-                    let hex: String = compute_digest(DigestAlgorithm::Sha256, data)
-                        .iter()
-                        .map(|b| format!("{b:02x}"))
-                        .collect();
-                    stdout.push_str(&format!("{hex}  {path}\n"));
-                } else {
-                    code = 1;
-                    stderr.push_str("sha256sum: No such file\n");
-                }
-            }
-            _ => {
-                code = 127;
-                stderr.push_str(&format!("{prog}: command not found\n"));
+            if code != 0 {
+                break;
             }
         }
     }
@@ -868,6 +761,450 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
     let _ = channel.exit_status(code).await;
     let _ = channel.eof().await;
     let _ = channel.close().await;
+}
+
+/// What one shell command printed and how it ended.
+struct ShellOutcome {
+    code: u32,
+    stdout: String,
+    stderr: String,
+}
+
+impl ShellOutcome {
+    fn ok() -> Self {
+        Self {
+            code: 0,
+            stdout: String::new(),
+            stderr: String::new(),
+        }
+    }
+
+    fn failed(code: u32, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            stdout: String::new(),
+            stderr: format!("{}\n", message.into()),
+        }
+    }
+}
+
+/// Splits a server command on the top-level `&&`, keeping quoted text and
+/// parenthesised groups whole.
+fn split_shell_chain(cmd: &str) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut depth = 0i32;
+    let chars: Vec<char> = cmd.chars().collect();
+    let mut i = 0usize;
+    while i < chars.len() {
+        let ch = chars[i];
+        if ch == '\'' && !in_double {
+            in_single = !in_single;
+        } else if ch == '"' && !in_single {
+            in_double = !in_double;
+        } else if !in_single && !in_double {
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                depth -= 1;
+            } else if ch == '&' && depth == 0 && chars.get(i + 1) == Some(&'&') {
+                parts.push(std::mem::take(&mut cur));
+                i += 2;
+                continue;
+            }
+        }
+        cur.push(ch);
+        i += 1;
+    }
+    parts.push(cur);
+    parts
+        .into_iter()
+        .map(|p| p.trim().to_string())
+        .filter(|p| !p.is_empty())
+        .collect()
+}
+
+/// Days since the epoch for a civil date (Howard Hinnant's algorithm).
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe - 719468
+}
+
+/// Parses the POSIX `touch -t` stamp (`YYYYMMDDhhmm.ss`) the client writes.
+fn parse_touch_stamp(stamp: &str) -> Option<i64> {
+    let digits: String = stamp.chars().filter(|c| c.is_ascii_digit()).collect();
+    if digits.len() < 12 {
+        return None;
+    }
+    let year: i64 = digits[0..4].parse().ok()?;
+    let month: i64 = digits[4..6].parse().ok()?;
+    let day: i64 = digits[6..8].parse().ok()?;
+    let hour: i64 = digits[8..10].parse().ok()?;
+    let minute: i64 = digits[10..12].parse().ok()?;
+    let second: i64 = digits.get(12..14).and_then(|s| s.parse().ok()).unwrap_or(0);
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day) * 86_400 + hour * 3600 + minute * 60 + second)
+}
+
+/// Resolves a path the way a shell in `cwd` does: an absolute path is
+/// itself, a relative one hangs off the working directory.
+fn resolve_in(cwd: &str, path: &str) -> String {
+    if path.starts_with('/') {
+        MemFs::normalize(path)
+    } else {
+        MemFs::normalize(&format!("{cwd}/{path}"))
+    }
+}
+
+/// Runs one command of a chain against the server's filesystem.
+async fn run_mock_shell_command(
+    raw: &str,
+    fs: &Arc<Mutex<MemFs>>,
+    cwd: &mut String,
+) -> ShellOutcome {
+    let mut part = raw.trim().to_string();
+    if part.starts_with('(') && part.ends_with(')') {
+        part = part[1..part.len() - 1].trim().to_string();
+    }
+
+    let tokens = unquote_shell_args(&part);
+    let mut idx = 0usize;
+    if tokens.get(idx).map(String::as_str) == Some("env") {
+        if fs.lock().await.disable_env {
+            return ShellOutcome::failed(127, "env: not found");
+        }
+        idx += 1;
+        while tokens.get(idx).is_some_and(|t| t.contains('=')) {
+            idx += 1;
+        }
+    }
+    let prog = tokens.get(idx).map(String::as_str).unwrap_or("");
+    let args = &tokens[(idx + 1).min(tokens.len())..];
+
+    match prog {
+        "pwd" => {
+            let mut out = ShellOutcome::ok();
+            out.stdout.push_str(&format!("{cwd}\n"));
+            out
+        }
+        "cd" => {
+            let target = args.last().map(String::as_str).unwrap_or("");
+            let wanted = if target == "~" {
+                "/home/tester".to_string()
+            } else {
+                resolve_in(cwd, target)
+            };
+            let guard = fs.lock().await;
+            match guard.nodes.get(&wanted) {
+                Some(MemNode::Dir { .. }) => {
+                    drop(guard);
+                    *cwd = wanted;
+                    ShellOutcome::ok()
+                }
+                Some(_) => ShellOutcome::failed(
+                    1,
+                    format!("cd: cannot change directory to '{target}': Not a directory"),
+                ),
+                None => ShellOutcome::failed(
+                    1,
+                    format!("cd: cannot change directory to '{target}': No such file or directory"),
+                ),
+            }
+        }
+        "ls" => {
+            let is_dir_self = args.iter().any(|a| a == "-d");
+            let path = args.last().map(String::as_str).unwrap_or(".");
+            let wants_full_time = args.iter().any(|a| a == "--full-time");
+            let mut guard = fs.lock().await;
+            if wants_full_time {
+                guard.ls_full_time_attempts += 1;
+                if guard.disable_ls_full_time {
+                    return ShellOutcome::failed(2, "ls: unrecognized option '--full-time'");
+                }
+            }
+            let norm = resolve_in(cwd, path);
+            if is_dir_self {
+                match guard.attrs_for(&norm, false) {
+                    Some(attrs) => {
+                        let sym = match guard.nodes.get(&norm) {
+                            Some(MemNode::Symlink { target, .. }) => Some(target.as_str()),
+                            _ => None,
+                        };
+                        let mut out = ShellOutcome::ok();
+                        out.stdout.push_str(&format_ls_line(&norm, &attrs, sym));
+                        out
+                    }
+                    None => ShellOutcome::failed(
+                        2,
+                        format!("ls: cannot access '{path}': No such file or directory"),
+                    ),
+                }
+            } else if matches!(guard.nodes.get(&norm), Some(MemNode::Dir { .. })) {
+                let mut out = ShellOutcome::ok();
+                out.stdout.push_str("total 4\n");
+                if let Some(attrs) = guard.attrs_for(&norm, false) {
+                    out.stdout.push_str(&format_ls_line(".", &attrs, None));
+                }
+                let parent = match norm.rsplit_once('/') {
+                    Some(("", rest)) => format!("/{rest}"),
+                    Some((dir, _)) => dir.to_string(),
+                    None => norm.clone(),
+                };
+                let parent_attrs = guard
+                    .attrs_for(&parent, false)
+                    .or_else(|| guard.attrs_for(&norm, false));
+                if let Some(attrs) = parent_attrs {
+                    out.stdout.push_str(&format_ls_line("..", &attrs, None));
+                }
+                for (name, attrs, sym) in guard.children_of(&norm) {
+                    out.stdout.push_str(&format_ls_line(&name, &attrs, sym.as_deref()));
+                }
+                out
+            } else {
+                ShellOutcome::failed(
+                    2,
+                    format!("ls: cannot access '{path}': No such file or directory"),
+                )
+            }
+        }
+        "mkdir" => {
+            let path = args.last().map(String::as_str).unwrap_or("");
+            let mut guard = fs.lock().await;
+            let norm = resolve_in(cwd, path);
+            if matches!(guard.nodes.get(&norm), Some(MemNode::Dir { .. })) {
+                return ShellOutcome::failed(
+                    1,
+                    format!("mkdir: cannot create directory '{path}': File exists"),
+                );
+            }
+            guard.nodes.insert(
+                norm,
+                MemNode::Dir {
+                    mode: 0o755,
+                    mtime: 1_760_000_000,
+                },
+            );
+            ShellOutcome::ok()
+        }
+        "rm" => {
+            let path = args.last().map(String::as_str).unwrap_or("");
+            let force = args.iter().any(|a| a == "-f");
+            let mut guard = fs.lock().await;
+            let norm = resolve_in(cwd, path);
+            if guard.nodes.remove(&norm).is_none() && !force {
+                return ShellOutcome::failed(
+                    1,
+                    format!("rm: cannot remove '{path}': No such file or directory"),
+                );
+            }
+            ShellOutcome::ok()
+        }
+        "rmdir" => {
+            let path = args.last().map(String::as_str).unwrap_or("");
+            let mut guard = fs.lock().await;
+            let norm = resolve_in(cwd, path);
+            if guard.children_of(&norm).is_empty() {
+                guard.nodes.remove(&norm);
+                ShellOutcome::ok()
+            } else {
+                ShellOutcome::failed(1, "rmdir: Directory not empty")
+            }
+        }
+        "mv" => {
+            if args.len() >= 2 {
+                let dst = resolve_in(cwd, &args[args.len() - 1]);
+                let src = resolve_in(cwd, &args[args.len() - 2]);
+                let mut guard = fs.lock().await;
+                if let Some(node) = guard.nodes.remove(&src) {
+                    guard.nodes.insert(dst, node);
+                    ShellOutcome::ok()
+                } else {
+                    ShellOutcome::failed(1, "mv: No such file or directory")
+                }
+            } else {
+                ShellOutcome::failed(1, "mv: missing destination file operand")
+            }
+        }
+        "cp" => {
+            let mut guard = fs.lock().await;
+            if guard.disable_shell_cp {
+                return ShellOutcome::failed(127, "sh: 1: cp: not found");
+            }
+            if args.len() >= 2 {
+                let dst = resolve_in(cwd, &args[args.len() - 1]);
+                let src = resolve_in(cwd, &args[args.len() - 2]);
+                if let Some(node) = guard.nodes.get(&src).cloned() {
+                    guard.nodes.insert(dst, node);
+                    ShellOutcome::ok()
+                } else {
+                    ShellOutcome::failed(1, "cp: No such file or directory")
+                }
+            } else {
+                ShellOutcome::failed(1, "cp: missing destination file operand")
+            }
+        }
+        "chmod" => {
+            if args.len() >= 2 {
+                let path = resolve_in(cwd, &args[args.len() - 1]);
+                let mode_str = &args[0];
+                let parsed_mode = u32::from_str_radix(mode_str, 8).unwrap_or(0o644);
+                let mut guard = fs.lock().await;
+                match guard.nodes.get_mut(&path) {
+                    Some(MemNode::File { mode, .. }) | Some(MemNode::Dir { mode, .. }) => {
+                        *mode = parsed_mode;
+                        ShellOutcome::ok()
+                    }
+                    _ => ShellOutcome::failed(1, "chmod: No such file or directory"),
+                }
+            } else {
+                ShellOutcome::failed(1, "chmod: missing operand")
+            }
+        }
+        "touch" => {
+            // `touch -t YYYYMMDDhhmm.ss -- path` sets the timestamp the
+            // client asked for, so a case can assert the server kept it.
+            let stamp = args
+                .iter()
+                .position(|a| a == "-t")
+                .and_then(|pos| args.get(pos + 1))
+                .and_then(|s| parse_touch_stamp(s));
+            let path = args.last().map(String::as_str).unwrap_or("");
+            let mut guard = fs.lock().await;
+            let norm = resolve_in(cwd, path);
+            match stamp {
+                Some(when) => match guard.nodes.get_mut(&norm) {
+                    Some(MemNode::File { mtime, .. }) => {
+                        *mtime = when as u32;
+                        ShellOutcome::ok()
+                    }
+                    Some(MemNode::Dir { mtime, .. }) => {
+                        *mtime = when as u32;
+                        ShellOutcome::ok()
+                    }
+                    _ => ShellOutcome::failed(1, "touch: cannot touch: No such file or directory"),
+                },
+                None => ShellOutcome::ok(),
+            }
+        }
+        "ln" => {
+            if args.len() >= 2 {
+                let link_path = resolve_in(cwd, &args[args.len() - 1]);
+                let target = args[args.len() - 2].clone();
+                let symbolic = args.iter().any(|a| a == "-s");
+                let mut guard = fs.lock().await;
+                if symbolic {
+                    guard.nodes.insert(
+                        link_path,
+                        MemNode::Symlink {
+                            target,
+                            mtime: 1_760_000_000,
+                        },
+                    );
+                    ShellOutcome::ok()
+                } else {
+                    // A hard link is another name for the same file, so the
+                    // destination gets a copy of what the source holds.
+                    let src = resolve_in(cwd, &target);
+                    if guard.nodes.contains_key(&link_path) {
+                        return ShellOutcome::failed(
+                            1,
+                            format!("ln: failed to create hard link '{link_path}': File exists"),
+                        );
+                    }
+                    match guard.nodes.get(&src).cloned() {
+                        Some(node) => {
+                            guard.nodes.insert(link_path, node);
+                            ShellOutcome::ok()
+                        }
+                        None => ShellOutcome::failed(
+                            1,
+                            format!("ln: failed to create hard link '{link_path}': No such file or directory"),
+                        ),
+                    }
+                }
+            } else {
+                ShellOutcome::failed(1, "ln: missing file operand")
+            }
+        }
+        "readlink" => {
+            let path = args.last().map(String::as_str).unwrap_or("");
+            let guard = fs.lock().await;
+            let norm = resolve_in(cwd, path);
+            match guard.nodes.get(&norm) {
+                Some(MemNode::Symlink { target, .. }) => {
+                    let mut out = ShellOutcome::ok();
+                    out.stdout.push_str(&format!("{target}\n"));
+                    out
+                }
+                Some(_) => ShellOutcome::failed(1, "readlink: invalid argument"),
+                None => ShellOutcome::failed(1, "readlink: No such file or directory"),
+            }
+        }
+        "sha256sum" => {
+            let path = resolve_in(cwd, args.last().map(String::as_str).unwrap_or(""));
+            let guard = fs.lock().await;
+            if let Some(MemNode::File { data, .. }) = guard.nodes.get(&path) {
+                let hex: String = compute_digest(DigestAlgorithm::Sha256, data)
+                    .iter()
+                    .map(|b| format!("{b:02x}"))
+                    .collect();
+                let mut out = ShellOutcome::ok();
+                out.stdout.push_str(&format!("{hex}  {path}\n"));
+                out
+            } else {
+                ShellOutcome::failed(1, "sha256sum: No such file")
+            }
+        }
+        // The shell builtins the client's own stage command uses.
+        ":" => {
+            // `: > path` creates or truncates the file the stage needs.
+            let target = if args.iter().any(|a| a == ">") {
+                args.last().map(String::as_str).unwrap_or("")
+            } else {
+                ""
+            };
+            if target.is_empty() {
+                return ShellOutcome::ok();
+            }
+            let mut guard = fs.lock().await;
+            let norm = resolve_in(cwd, target);
+            let is_file = matches!(guard.nodes.get(&norm), Some(MemNode::File { .. }));
+            let is_other = matches!(
+                guard.nodes.get(&norm),
+                Some(MemNode::Dir { .. }) | Some(MemNode::Symlink { .. })
+            );
+            if is_other {
+                return ShellOutcome::failed(1, format!("bash: {target}: Is a directory"));
+            }
+            if is_file {
+                if let Some(MemNode::File { data, .. }) = guard.nodes.get_mut(&norm) {
+                    data.clear();
+                }
+                return ShellOutcome::ok();
+            }
+            guard.nodes.insert(
+                norm,
+                MemNode::File {
+                    data: Vec::new(),
+                    mode: 0o600,
+                    mtime: 1_760_000_000,
+                },
+            );
+            ShellOutcome::ok()
+        }
+        "umask" | "set" => ShellOutcome::ok(),
+        "" => ShellOutcome::ok(),
+        _ => ShellOutcome::failed(127, format!("{prog}: command not found")),
+    }
 }
 
 async fn run_mock_scp_source(

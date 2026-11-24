@@ -108,11 +108,19 @@ CASE_SOURCES = {
     # The protocol library's own cases: the host-key policy that refuses a
     # wildcard and tells a tunnel challenge from a destination one.
     "proto-hostkey": "crates/linscp-proto/src/lib.rs",
+    # The SCP engine's own cases: the shell quoting a remote path needs, the
+    # path hardening that refuses a traversal and a name the shell would
+    # read as an option, and the rcp wire headers.
+    "proto-scp": "crates/linscp-proto/src/scp.rs",
     # The script interpreter end to end against the mock server: the
     # live-sftp cases ported to Rust, plus the change-guards that pin the
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
     # no Rust tests, so Android rows cite other suites instead.
     "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs",
+    # The SCP engine end to end against the mock server: the live-scp cases
+    # ported to Rust - the directory engine, the shell commands, the
+    # transfers and the refusals.
+    "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs",
     # The engine's own editor workflow: the monitored save and the refusal
     # to overwrite a file the server changed meanwhile, both driven against
     # the engine's local session. The editor double is a shell command, so
@@ -379,8 +387,9 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh", "proto-ftp",
-                               "proto-dav-s3", "proto-webdav", "proto-hostkey", "engine-sftp",
-                               "engine-editor", "vault-password", "service-tabs"):
+                               "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
+                               "engine-sftp", "engine-scp", "engine-editor",
+                               "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking
                     # arguments is not a case: `exercise_remote_delete` was

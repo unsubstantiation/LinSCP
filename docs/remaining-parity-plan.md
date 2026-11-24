@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-49 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+47 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -12,43 +12,13 @@ Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
 **Area:** SCP · **Status:** partial
 
-The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. Downloads stage through '.filepart' and are renamed when whole, uploads carry '-permissions' and '-preservetime', a tree goes through the recursive form of the protocol with an 'E' per closed level, and continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, speed limits, progress and the interrupt behavior are the shared transfer path's and are checked here as well.
+The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. A download stages through '.filepart' and is renamed onto the destination when it is whole; an interrupted one leaves the staging file and nothing under the final name. Uploads carry '-permissions' and '-preservetime'. Continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, the speed limit, the progress meter and the interrupt behavior are the shared transfer path's and are checked here as well.
 
-**Next:** No runnable suite evidences this: live-scp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## scp.shell-directory-engine
-
-**Area:** SCP · **Status:** partial
-
-The directory engine runs `ls -l -a --full-time` in its own SSH connection and parses it with the shared long-listing parser: `.` and `..` are skipped, names with spaces are kept whole, symbolic links keep their link type, and dates are read with the offset the server prints them in. `stat` is `ls -l -d`, so a missing path is reported as missing. `cd` is `cd <path> && pwd`, so the working directory is the one the server actually entered. `open` resolves the home directory and the site's initial path in one command. A server whose `ls` has no `--full-time` and no `env` gets the plainer command rather than an error. Server-supplied rcp header names are rejected when they contain a dot entry or either path separator, matching the upstream traversal hardening at every recursion level.
-
-**Next:** No runnable suite evidences this: live-scp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The recursive form of the rcp protocol is not used: the client's own directory engine walks the tree and each file travels in the single-file form, so no 'E' record closes a level. Everything else the row states is checked by the cited cases.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## scp.command-and-metadata
-
-**Area:** SCP · **Status:** partial
-
-The commands upstream runs on the remote shell, and the metadata a shell can set that 'ls -l' can read back: mkdir, rmdir, rm (never '-f', so a path that is not there stays an error the server words), mv, chmod with the mode the script parsed, 'cp -p' for a server-side copy - with a server that has no 'cp' answered by streaming through the client instead - 'ln -s' for a symbolic link, 'touch -t' asked for in UTC for a modification time, and the rcp timestamp header for the time a transfer carries. Every path is quoted for a POSIX shell and a path holding a control character is refused instead of being sent, because a newline in a name cannot be told apart from the end of a listing line. A refusal arrives as the sentence the server printed, 'call' hands the rest of the line to that shell, and 'checksum' says plainly that the digest came from a downloaded file, this protocol having no server-side hashing to ask for. A relative rmdir operand is resolved against the current remote directory before it reaches the protocol layer, matching the upstream full-path fix.
-
-**Next:** No runnable suite evidences this: live-scp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] A transfer of a tree that speaks the recursive rcp form, with an 'E' record closing each level, proved by a case that runs.
 
 ## transfer.ascii-automatic
 
