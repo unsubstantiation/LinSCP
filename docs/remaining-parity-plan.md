@@ -24,15 +24,15 @@ The id is the row's history: an scp:// transfer is not curl's any more. The byte
 
 **Area:** Transfers · **Status:** partial
 
-The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise.
+The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; staged publication still requires binary mode.
 
-**Next:** The upload direction is still unevidenced: live-dav needs a `linscp` binary this repo does not build, and every protocol this build guards refuses an ASCII upload (a guarded or staged upload has to be binary), so only the curl-backed protocols could show it. Runnable residue: engine-sftp, which checks the download direction.
+**Next:** The live upstream WebDAV suite requires a CLI binary this GUI-only build does not ship. A new engine-sftp case exercises converted exclusive uploads, automatic mode, EOL selection and refusal paths, but has not yet been run in CI; ETag-conditional ASCII upload also needs a runnable protocol test.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Cover the upload direction over a protocol that accepts an ASCII upload.
+- [ ] Run the new exclusive ASCII upload case in CI on Linux and Windows and in the Android host suite.
+- [ ] Exercise successful and rejected ETag-conditional ASCII uploads against a WebDAV or S3 fixture.
+- [ ] Cover any remaining desired live-server behavior without depending on the removed CLI.
 
 ## transfer.filepart-resume
 

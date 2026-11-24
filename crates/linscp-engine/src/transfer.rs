@@ -889,8 +889,13 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if (flags.no_clobber || flags.overwrite_etag.is_some() || flags.ftp_risky_publish || flags.sftp_risky_publish) && effective_ascii {
-        return Err("Guarded or staged uploads require binary transfer mode.".to_string());
+    if (flags.ftp_risky_publish || flags.sftp_risky_publish) && effective_ascii {
+        return Err("Staged uploads require binary transfer mode.".to_string());
+    }
+    if effective_ascii && (flags.no_clobber || flags.overwrite_etag.is_some())
+        && (flags.resume || flags.append || (flags.no_clobber && flags.overwrite_etag.is_some()))
+    {
+        return Err("Exclusive uploads require a fresh transfer and one destination precondition.".to_string());
     }
     if effective_ascii {
         let raw = std::fs::read(local_src)
@@ -910,13 +915,28 @@ pub async fn upload_single_file(
             speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec),
             version_id: None,
         };
-        if let Err(e) = session
-            .upload(remote_dest, req, &mut reader, Some(total), progress)
-            .await
-        {
-            let msg = e.to_string();
-            logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
-            return Err(msg);
+        // Convert before applying the server-side precondition: the known
+        // length and progress must describe the bytes actually sent, not the
+        // source file. Never fall back to an unguarded upload if unsupported.
+        let result = if let Some(etag) = flags.overwrite_etag.as_deref() {
+            session.upload_if_match(remote_dest, etag, req, &mut reader, Some(total), progress).await
+        } else if flags.no_clobber {
+            session.upload_exclusive(remote_dest, req, &mut reader, Some(total), progress).await
+        } else {
+            session.upload(remote_dest, req, &mut reader, Some(total), progress).await
+        };
+        match result {
+            Err(e) => {
+                let msg = e.to_string();
+                logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
+                return Err(msg);
+            }
+            Ok(bytes) if bytes != total => {
+                let msg = format!("Upload did not transfer all converted bytes; remote destination '{remote_dest}' may be incomplete.");
+                logger.record_transfer(true, &src_label, remote_dest, None, Err(&msg));
+                return Err(msg);
+            }
+            Ok(_) => {}
         }
         logger.record_transfer(true, &src_label, remote_dest, Some(total), Ok(()));
         if let Some(mt) = desired_mtime.filter(|_| session.scheme() != ProtocolScheme::S3) {

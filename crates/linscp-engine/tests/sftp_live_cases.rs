@@ -1131,3 +1131,50 @@ async fn test_synchronize_preserves_masked_files_in_deleted_dirs_and_skips_symli
     sftp.close().await.unwrap();
 }
 
+
+/// A no-overwrite upload can convert text without weakening the server-side
+/// exclusive-create guarantee. Automatic mode must leave non-text files alone.
+#[tokio::test]
+async fn test_exclusive_ascii_and_automatic_uploads() {
+    use linscp_engine::transfer::{upload_single_file, TransferFlags};
+    use linscp_types::TransferMode;
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x79, 0x7a).await;
+    let text = tmp.path().join("lines.txt");
+    let binary = tmp.path().join("payload.dat");
+    fs::write(&text, b"one\ntwo\rthree\r\n").unwrap();
+    fs::write(&binary, b"one\r\ntwo\r\n").unwrap();
+    let mut logger = in_memory_logger();
+    let mut flags = TransferFlags { no_clobber: true, transfer_mode: TransferMode::Ascii, ..Default::default() };
+    upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+
+    // A second creation must fail without changing the existing file or
+    // deleting the source, even when delete-after-transfer was requested.
+    flags.delete_source = true;
+    assert!(upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.is_err());
+    assert!(text.exists());
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+
+    flags.delete_source = false;
+    flags.transfer_mode = TransferMode::Automatic;
+    flags.eol_override = Some(EolStyle::Lf);
+    upload_single_file(&*sftp, &text, "/auto-upload.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/auto-upload.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
+    upload_single_file(&*sftp, &binary, "/auto-upload.dat", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/auto-upload.dat", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\n");
+
+    flags.resume = true;
+    assert!(upload_single_file(&*sftp, &text, "/resume-refused.txt", &flags, &mut logger, None).await.is_err());
+    assert!(sftp.stat("/resume-refused.txt").await.unwrap().is_none());
+
+    // SFTP cannot enforce an ETag condition. It must fail closed rather than
+    // silently retrying an unconditional upload.
+    flags.resume = false;
+    flags.no_clobber = false;
+    flags.overwrite_etag = Some("\"approved\"".to_string());
+    assert!(upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.is_err());
+    assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+    sftp.close().await.unwrap();
+}
