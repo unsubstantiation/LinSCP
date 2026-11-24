@@ -37,13 +37,14 @@ The ASCII mode converts the line endings, the binary mode keeps the bytes, and t
 
 **Area:** Transfers · **Status:** partial
 
-Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination.
+Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them.
 
-**Next:** Linux and Windows CI exercise both an interrupted ordinary SFTP download and the GUI verified-resume engine path. The latter rejects a stale prefix even if size and timestamp match, but SFTP size/mtime checks are not an atomic snapshot against concurrent same-metadata changes. The older ordinary resume path does not verify its prefix. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.
+**Next:** Linux and Windows CI exercise interrupted and resumed SFTP downloads, including mismatched prefixes and preservation on refusal. The SFTP size/mtime guard is not an atomic snapshot: a remote or local file can still change concurrently, including with unchanged metadata. Other ordinary protocol resume paths do not yet verify prefixes. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Protect the ordinary resume path against stale prefixes; explicitly handle protocols without a strong remote version.
+- [ ] Protect ordinary resume on the other protocols against stale prefixes and explicitly handle protocols without a strong remote version.
+- [ ] Address concurrent local and remote modification during SFTP resume without claiming size/mtime is an atomic snapshot.
 - [ ] Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.
 - [ ] Exercise Android-device and relevant live-server behavior without the removed CLI.
 
