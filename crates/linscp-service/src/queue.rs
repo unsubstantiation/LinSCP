@@ -2285,6 +2285,19 @@ pub async fn delete_remote_recursive_quiet(
     session: &dyn RemoteSession,
     remote_path: &str,
 ) -> Result<(), String> {
+    delete_remote_tree(session, remote_path, 0).await.map_err(|error| {
+        format!("Deletion of '{remote_path}' failed; the tree may be partially deleted: {error}")
+    })
+}
+
+async fn delete_remote_tree(
+    session: &dyn RemoteSession,
+    remote_path: &str,
+    depth: usize,
+) -> Result<(), String> {
+    if depth > 64 {
+        return Err(format!("Directory nesting limit exceeded at '{remote_path}'."));
+    }
     let Some(entry) = session.stat(remote_path).await.map_err(|e| e.to_string())? else {
         return Ok(());
     };
@@ -2298,13 +2311,25 @@ pub async fn delete_remote_recursive_quiet(
         .list_dir(remote_path)
         .await
         .map_err(|e| e.to_string())?;
+    if children.len() > 100_000 {
+        return Err(format!("Directory entry limit exceeded at '{remote_path}'."));
+    }
+    // A server controls listing names. Reject the entire listing before
+    // deleting any child if a name could escape this directory.
+    for child in &children {
+        let name = &child.name;
+        if name == "." || name == ".." { continue; }
+        if name.is_empty() || name.contains('/') || name.contains('\\') || name.chars().any(char::is_control) {
+            return Err(format!("Invalid entry name in directory '{remote_path}'."));
+        }
+    }
     for child in children {
         if child.name == "." || child.name == ".." {
             continue;
         }
         let child_path = join_remote_path(remote_path, &child.name);
         if child.is_dir && !child.is_symlink {
-            Box::pin(delete_remote_recursive_quiet(session, &child_path)).await?;
+            Box::pin(delete_remote_tree(session, &child_path, depth + 1)).await?;
         } else {
             session
                 .remove_file(&child_path)

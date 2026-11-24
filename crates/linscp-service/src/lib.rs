@@ -2863,10 +2863,9 @@ impl CommanderService {
                     });
                     removed.push(name);
                 }
-                // A name that is already gone is the state the user asked for.
-                Err(error) if error.to_lowercase().contains("not found") => {
-                    removed.push(name);
-                }
+                // A missing top-level item is handled by stat returning None.
+                // Never interpret an error string as success: a descendant may
+                // have disappeared after earlier children were removed.
                 Err(error) => {
                     self.record_gui_xml_action(&tab.name, |logger| {
                         logger.record_rm(&path, false, Err(&error));
@@ -19692,6 +19691,8 @@ mod tests {
         lost: Mutex<bool>,
         scheme_override: Mutex<Option<ProtocolScheme>>,
         copy_unsupported: Mutex<bool>,
+        fail_remove: Mutex<Option<String>>,
+        listing_injection: Mutex<Option<(String, String)>>,
         perms: Mutex<HashMap<String, String>>,
         modes: Mutex<HashMap<String, u32>>,
         symlinks: Mutex<Vec<(String, String)>>,
@@ -19710,6 +19711,8 @@ mod tests {
                 lost: Mutex::new(false),
                 scheme_override: Mutex::new(None),
                 copy_unsupported: Mutex::new(false),
+                fail_remove: Mutex::new(None),
+                listing_injection: Mutex::new(None),
                 perms: Mutex::new(HashMap::new()),
                 modes: Mutex::new(HashMap::new()),
                 symlinks: Mutex::new(Vec::new()),
@@ -19834,7 +19837,7 @@ mod tests {
                 .filter(|path| Self::parent_of(path) == remote_path && path.as_str() != remote_path)
                 .cloned().collect();
             paths.sort();
-            Ok(paths
+            let mut entries: Vec<FileEntry> = paths
                 .iter()
                 .map(|path| {
                     let mut entry = Self::entry_for(path, &docs[path]);
@@ -19843,7 +19846,16 @@ mod tests {
                     }
                     entry
                 })
-                .collect())
+                .collect();
+            if let Some((dir, name)) = self.listing_injection.lock().expect("m").as_ref() {
+                if dir == remote_path {
+                    let doc = MockRemoteDoc { bytes: Vec::new(), is_dir: false, mtime: 0 };
+                    let mut entry = Self::entry_for(name, &doc);
+                    entry.name = name.clone();
+                    entries.push(entry);
+                }
+            }
+            Ok(entries)
         }
 
         async fn mkdir(&self, remote_path: &str) -> Result<(), ProtoError> {
@@ -19856,6 +19868,9 @@ mod tests {
         }
 
         async fn remove_file(&self, remote_path: &str) -> Result<(), ProtoError> {
+            if self.fail_remove.lock().expect("m").as_deref() == Some(remote_path) {
+                return Err(ProtoError::Transport(format!("Not found while deleting '{remote_path}': simulated interruption")));
+            }
             let mut docs = self.docs.lock().expect("m");
             match docs.get(remote_path) {
                 Some(doc) if !doc.is_dir => { docs.remove(remote_path); Ok(()) }
@@ -20057,6 +20072,50 @@ mod tests {
         let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
         service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
         7
+    }
+
+    #[tokio::test]
+    async fn remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, Arc::clone(&session), "/");
+        session.add_dir("/tree");
+        session.add_file("/tree/a.txt", b"a");
+        session.add_file("/tree/b.txt", b"b");
+        session.add_file("/other.txt", b"other");
+        *session.fail_remove.lock().unwrap() = Some("/tree/b.txt".to_string());
+        let request = |names: Value| ApiEnvelope {
+            method: "POST".into(), path: "/api/remote/delete".into(),
+            body: json!({"tab": id, "names": names}),
+        };
+        let reply = svc.dispatch_async(request(json!(["tree", "other.txt"]))).await;
+        assert_eq!(reply.status, 200, "{}", reply.payload);
+        assert_eq!(reply.payload["deleted"], json!(["other.txt"]));
+        assert_eq!(reply.payload["failed"][0]["name"], "tree");
+        assert!(reply.payload["failed"][0]["error"].as_str().unwrap().contains("partially deleted"));
+        assert!(session.bytes_of("/tree/a.txt").is_none());
+        assert_eq!(session.bytes_of("/tree/b.txt"), Some(b"b".to_vec()));
+        assert!(session.stat("/tree").await.unwrap().is_some());
+        assert!(session.bytes_of("/other.txt").is_none());
+
+        // A malformed child listing must be rejected before deleting even a
+        // valid sibling; never join a server-provided traversal to the parent.
+        *session.fail_remove.lock().unwrap() = None;
+        session.add_dir("/unsafe");
+        session.add_file("/unsafe/valid.txt", b"kept");
+        session.add_file("/outside.txt", b"outside");
+        *session.listing_injection.lock().unwrap() = Some(("/unsafe".into(), "../outside.txt".into()));
+        let reply = svc.dispatch_async(request(json!(["unsafe"]))).await;
+        assert_eq!(reply.status, 400, "{}", reply.payload);
+        assert_eq!(session.bytes_of("/unsafe/valid.txt"), Some(b"kept".to_vec()));
+        assert_eq!(session.bytes_of("/outside.txt"), Some(b"outside".to_vec()));
+        assert!(session.stat("/unsafe").await.unwrap().is_some());
+
+        // A missing top-level entry still counts as already deleted.
+        let reply = svc.dispatch_async(request(json!(["already-gone"]))).await;
+        assert_eq!(reply.status, 200, "{}", reply.payload);
+        assert_eq!(reply.payload["deleted"], json!(["already-gone"]));
     }
 
     /* The embedded shell and a tab's session run over one connection, so a
