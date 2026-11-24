@@ -1199,11 +1199,13 @@ async fn test_staged_ascii_upload_converts_before_publish() {
         ..Default::default()
     };
     let mut logger = in_memory_logger();
-    let progress = AtomicU64::new(0);
-    let total = AtomicU64::new(0);
-    let callback = |done: u64, size: u64| {
-        progress.store(done, Ordering::SeqCst);
-        total.store(size, Ordering::SeqCst);
+    let progress = Arc::new(AtomicU64::new(0));
+    let total = Arc::new(AtomicU64::new(0));
+    let progress_for_callback = Arc::clone(&progress);
+    let total_for_callback = Arc::clone(&total);
+    let callback = move |done: u64, size: u64| {
+        progress_for_callback.store(done, Ordering::SeqCst);
+        total_for_callback.store(size, Ordering::SeqCst);
     };
     upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, Some(&callback)).await.unwrap();
     let expected = b"one\r\ntwo\r\nthree\r\n";
