@@ -773,6 +773,27 @@ fn apply_downloaded_attrs(local_dest: &Path, info: &FileEntry, flags: &TransferF
     }
 }
 
+// Staged publication needs the transmitted length, which can differ from the
+// source length after EOL conversion. Convert before creating a remote stage.
+async fn staged_upload_source(
+    local_src: &Path,
+    source_size: u64,
+    ascii: bool,
+    eol: Option<EolStyle>,
+) -> Result<(Box<dyn AsyncRead + Unpin + Send>, u64), String> {
+    if ascii {
+        let raw = std::fs::read(local_src)
+            .map_err(|e| format!("Cannot read local file '{}': {e}", local_src.display()))?;
+        let converted = convert_eol_bytes(&raw, eol.unwrap_or(EolStyle::Crlf));
+        let len = converted.len() as u64;
+        Ok((Box::new(std::io::Cursor::new(converted)), len))
+    } else {
+        let file = tokio::fs::File::open(local_src).await
+            .map_err(|e| format!("Cannot open local file '{}': {e}", local_src.display()))?;
+        Ok((Box::new(file), source_size))
+    }
+}
+
 /// Uploads a single local file (or stdin when `local_src == Path::new("-")`) to `remote_dest`.
 pub async fn upload_single_file(
     session: &dyn RemoteSession,
@@ -889,15 +910,15 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if (flags.ftp_risky_publish || flags.sftp_risky_publish) && effective_ascii {
-        return Err("Staged uploads require binary transfer mode.".to_string());
+    if effective_ascii && flags.ftp_risky_publish {
+        return Err("FTP staged uploads require binary transfer mode.".to_string());
     }
     if effective_ascii && (flags.no_clobber || flags.overwrite_etag.is_some())
         && (flags.resume || flags.append || (flags.no_clobber && flags.overwrite_etag.is_some()))
     {
         return Err("Exclusive uploads require a fresh transfer and one destination precondition.".to_string());
     }
-    if effective_ascii {
+    if effective_ascii && !flags.ftp_risky_publish && !flags.sftp_risky_publish {
         let raw = std::fs::read(local_src)
             .map_err(|e| format!("Cannot read local file '{src_label}': {e}"))?;
         // Default server newline target on upload: CRLF unless overridden (`-eol=lf`)
@@ -950,6 +971,9 @@ pub async fn upload_single_file(
     }
 
     if flags.ftp_risky_publish {
+        if flags.overwrite_etag.is_some() {
+            return Err("ETag-conditional overwrite cannot be combined with FTP staged publication.".to_string());
+        }
         if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || effective_ascii || flags.delete_source {
             return Err("FTP staged upload requires a fresh binary copy.".to_string());
         }
@@ -977,11 +1001,11 @@ pub async fn upload_single_file(
         if !matches!(session.scheme(), ProtocolScheme::Sftp | ProtocolScheme::Scp | ProtocolScheme::Ssh) {
             return Err("The acknowledged staged publish is for SFTP/SCP sessions; FTP(S) uploads have their own staged mode, and WebDAV and S3 have their own approved overwrite preconditions.".to_string());
         }
-        if flags.resume || flags.append || effective_ascii || flags.delete_source {
-            return Err("SFTP staged upload requires a fresh binary copy.".to_string());
+        if flags.resume || flags.append || flags.delete_source {
+            return Err("SFTP staged upload requires a fresh copy without source deletion.".to_string());
         }
-        if flags.no_clobber {
-            return Err("Exclusive creation and the acknowledged staged SFTP publish are separate modes; give only one of them.".to_string());
+        if flags.no_clobber || flags.overwrite_etag.is_some() {
+            return Err("Exclusive or ETag-conditional creation and staged SFTP publication are separate modes; give only one of them.".to_string());
         }
         let directory = remote_dest
             .rsplit_once('/')
@@ -993,9 +1017,7 @@ pub async fn upload_single_file(
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let stage = format!("{directory}/.{leaf}.linscp-sftp-stage-{nanos}");
-        let input = tokio::fs::File::open(local_src)
-            .await
-            .map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let (input, upload_size) = staged_upload_source(local_src, local_info.size, effective_ascii, flags.eol_override).await?;
         let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest {
             resume_offset: 0,
@@ -1010,13 +1032,13 @@ pub async fn upload_single_file(
         // is ours to rename onto the destination. The destination itself is
         // never unlinked; the server replaces it atomically on publish.
         let bytes = session
-            .upload_exclusive(&stage, req, &mut reader, Some(local_info.size), progress)
+            .upload_exclusive(&stage, req, &mut reader, Some(upload_size), progress)
             .await
             .map_err(|e| format!("Cannot stage the upload as '{stage}': {e}"))?;
         if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
             return Err(format!("Cancelled before publication; temporary SFTP file '{stage}' remains."));
         }
-        if bytes != local_info.size {
+        if bytes != upload_size {
             return Err(format!("Source size changed; temporary SFTP file '{stage}' remains."));
         }
         let current = session

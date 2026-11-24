@@ -10,7 +10,7 @@
 //! Unguarded SFTP uploads stay refused by design ("Unguarded SFTP/FTP
 //! uploads are disabled; ..."). Scripts that must overwrite on the server
 //! opt into the explicitly acknowledged staged publish
-//! (`option sftpriskypublish on`): a fresh binary copy is staged under a
+//! (`option sftpriskypublish on`): a fresh copy is staged under a
 //! name this client created exclusively and published onto the destination
 //! by rename (atomic where the server has `posix-rename`). The destination
 //! is never unlinked first. The acknowledged mode covers `put`,
@@ -432,7 +432,7 @@ async fn test_transfer_speed_append_and_preservetime_all() {
     )
     .await;
     assert!(!ok, "put -append is refused even with the acknowledgment: {out}");
-    assert!(out.contains("fresh binary copy"), "the refusal says why: {out}");
+    assert!(out.contains("fresh copy"), "the refusal says why: {out}");
     let remote_log = download_bytes(&*sftp, "/remote-log.txt", TransferRequest::default())
         .await
         .unwrap();
@@ -1176,5 +1176,56 @@ async fn test_exclusive_ascii_and_automatic_uploads() {
     flags.overwrite_etag = Some("\"approved\"".to_string());
     assert!(upload_single_file(&*sftp, &text, "/ascii-upload.txt", &flags, &mut logger, None).await.is_err());
     assert_eq!(download_bytes(&*sftp, "/ascii-upload.txt", TransferRequest::default()).await.unwrap(), b"one\r\ntwo\r\nthree\r\n");
+    sftp.close().await.unwrap();
+}
+
+/// An acknowledged staged text upload must publish the converted bytes while
+/// keeping the same destination guards as a staged binary upload.
+#[tokio::test]
+async fn test_staged_ascii_upload_converts_before_publish() {
+    use linscp_engine::transfer::{upload_single_file, TransferFlags};
+    use linscp_types::TransferMode;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7b, 0x7c).await;
+    let source = tmp.path().join("source.txt");
+    fs::write(&source, b"one\ntwo\rthree\r\n").unwrap();
+    seed_remote(&sftp, "/publish.txt", b"old", None).await;
+    let mut flags = TransferFlags {
+        transfer_mode: TransferMode::Ascii,
+        sftp_risky_publish: true,
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    let progress = AtomicU64::new(0);
+    let total = AtomicU64::new(0);
+    let callback = |done: u64, size: u64| {
+        progress.store(done, Ordering::SeqCst);
+        total.store(size, Ordering::SeqCst);
+    };
+    upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, Some(&callback)).await.unwrap();
+    let expected = b"one\r\ntwo\r\nthree\r\n";
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), expected);
+    assert_eq!(progress.load(Ordering::SeqCst), expected.len() as u64);
+    assert_eq!(total.load(Ordering::SeqCst), expected.len() as u64);
+    assert_eq!(fs::read(&source).unwrap(), b"one\ntwo\rthree\r\n");
+
+    flags.eol_override = Some(EolStyle::Lf);
+    upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.unwrap();
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
+
+    // Neither a conflicting destination guard nor an append can be silently
+    // weakened by the conversion path.
+    flags.overwrite_etag = Some("\"v1\"".into());
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    flags.overwrite_etag = None;
+    flags.no_clobber = true;
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    flags.no_clobber = false;
+    flags.append = true;
+    assert!(upload_single_file(&*sftp, &source, "/publish.txt", &flags, &mut logger, None).await.is_err());
+    assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
     sftp.close().await.unwrap();
 }

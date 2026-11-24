@@ -24,14 +24,15 @@ The id is the row's history: an scp:// transfer is not curl's any more. The byte
 
 **Area:** Transfers · **Status:** partial
 
-The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; staged publication still requires binary mode.
+The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; acknowledged SFTP staged publication converts before staging; FTP staged publication still requires binary mode.
 
-**Next:** Linux and Windows CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Android-device behavior has not been exercised; live upstream WebDAV tests require a CLI binary this GUI-only build does not ship.
+**Next:** Linux and Windows CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Android-device behavior has not been exercised; live upstream WebDAV tests require a CLI binary this GUI-only build does not ship. The new SFTP staged-ASCII case still needs CI validation; FTP staged-ASCII remains unsupported.
 
 **Acceptance criteria:**
 
 - [ ] Exercise Android-device behavior where applicable.
 - [ ] Cover any remaining desired live-server behavior without depending on the removed CLI.
+- [ ] Run the staged SFTP ASCII test in CI and cover FTP staged ASCII before claiming that behavior.
 
 ## transfer.filepart-resume
 
