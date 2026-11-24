@@ -16,5 +16,23 @@ jobs:
           key: linux-tests
       - name: Install system dependencies
         run: sudo apt-get update -qq && sudo apt-get install -y -qq pkg-config libkrb5-dev libssl-dev
-      - name: Run exclusive ASCII upload integration test
-        run: cargo test -p linscp-engine --test sftp_live_cases test_exclusive_ascii_and_automatic_uploads -- --nocapture
+      - name: Run ASCII upload integration tests
+        shell: bash
+        run: |
+          set +e
+          cargo test -p linscp-engine --test sftp_live_cases test_exclusive_ascii_and_automatic_uploads -- --nocapture > test-output.txt 2>&1
+          status=$?
+          if [ "$status" -eq 0 ]; then
+            cargo test -p linscp-engine --test conditional_ascii_upload -- --nocapture >> test-output.txt 2>&1
+            status=$?
+          fi
+          tail -100 test-output.txt
+          if [ "$status" -ne 0 ]; then
+            python3 - <<'PY'
+          from pathlib import Path
+          lines = Path('test-output.txt').read_text(errors='replace').splitlines()
+          text = '\n'.join(lines[-100:])[-16000:]
+          print('::error::' + text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
+          PY
+          fi
+          exit "$status"
