@@ -507,7 +507,13 @@ impl RemoteSession for ScpSession {
         let mut entries = Vec::new();
         for line in stdout.lines() {
             if let Some(parsed) = parse_unix_listing_line(line) {
-                entries.push(parsed.into_file_entry());
+                let entry = parsed.into_file_entry();
+                // `ls -a` names the directory itself and its parent; neither
+                // is a file the caller can act on.
+                if entry.name == "." || entry.name == ".." {
+                    continue;
+                }
+                entries.push(entry);
             }
         }
         entries.sort_by(|a, b| a.name.cmp(&b.name));

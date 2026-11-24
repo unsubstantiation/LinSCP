@@ -77,6 +77,8 @@ export interface UserPreferences {
   priority: boolean;
   confirm_overwrite: boolean;
   confirm_delete: boolean;
+  permissions: string;
+  preserve_time_dirs: boolean;
 }
 
 export interface TabSummary {

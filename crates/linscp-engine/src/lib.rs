@@ -111,59 +111,12 @@ fn glob_match(pattern: &[u8], text: &[u8]) -> bool {
 
 /// Parses an octal (`0644`, `755`) or symbolic (`u+x,go-w`) permission mode
 /// against `current_mode`, matching `chmod` semantics in `Commands.cpp`.
+///
+/// The parsing itself lives in [`filemask::parse_permissions_expr`], which the
+/// script interpreter, the service handlers and this wrapper all share, so a
+/// mode means the same thing everywhere.
 pub fn parse_chmod_spec(spec: &str, current_mode: u32) -> Result<u32, String> {
-    let trimmed = spec.trim();
-    if trimmed.is_empty() {
-        return Err("Empty permission mode".to_string());
-    }
-    if trimmed.bytes().all(|b| (b'0'..=b'7').contains(&b)) && trimmed.len() <= 4 {
-        return u32::from_str_radix(trimmed, 8).map_err(|e| e.to_string());
-    }
-
-    let mut mode = current_mode & 0o7777;
-    for clause in trimmed.split(',') {
-        if clause.is_empty() {
-            return Err(format!("Invalid chmod clause in '{spec}'"));
-        }
-        let op_pos = clause
-            .find(['+', '-', '='])
-            .ok_or_else(|| format!("Invalid chmod clause '{clause}'"))?;
-        let (who_str, rest) = clause.split_at(op_pos);
-        let op = rest.as_bytes()[0] as char;
-        let perms_str = &rest[1..];
-
-        let mut who_mask = 0u32;
-        if who_str.is_empty() || who_str.contains('a') {
-            who_mask = 0o777;
-        } else {
-            for ch in who_str.chars() {
-                match ch {
-                    'u' => who_mask |= 0o700,
-                    'g' => who_mask |= 0o070,
-                    'o' => who_mask |= 0o007,
-                    _ => return Err(format!("Unknown chmod subject '{ch}'")),
-                }
-            }
-        }
-
-        let mut bits = 0u32;
-        for ch in perms_str.chars() {
-            match ch {
-                'r' => bits |= 0o444 & who_mask,
-                'w' => bits |= 0o222 & who_mask,
-                'x' => bits |= 0o111 & who_mask,
-                _ => return Err(format!("Unsupported chmod permission '{ch}'")),
-            }
-        }
-
-        match op {
-            '+' => mode |= bits,
-            '-' => mode &= !bits,
-            '=' => mode = (mode & !who_mask) | bits,
-            _ => unreachable!(),
-        }
-    }
-    Ok(mode)
+    filemask::parse_permissions_expr(spec, current_mode, false)
 }
 
 /// Convenience wrapper parsing `sessions.ini` into `SessionConfig` profiles.

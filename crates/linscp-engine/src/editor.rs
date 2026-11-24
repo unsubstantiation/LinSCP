@@ -379,3 +379,212 @@ fn cleanup_temp(temp_path: &PathBuf, work_dir: &PathBuf, keep: bool) {
         let _ = std::fs::remove_dir_all(work_dir);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_planner::LocalSyncSession;
+    use linscp_platform::NativeLocalFs;
+    use std::sync::Arc;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("linscp-edit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir.canonicalize().expect("canonical scratch directory")
+    }
+
+    /// The remote side of the editor tests is a directory on disk that the
+    /// engine's own local session serves. The file's timestamp is fixed, so
+    /// "the server changed the file while it was being edited" is a fact the
+    /// test creates rather than a race it hopes for.
+    fn remote_file(root: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, content).expect("remote file");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_600_000_000, 0))
+            .expect("fixed timestamp");
+        path
+    }
+
+    fn session(root: &Path) -> LocalSyncSession {
+        LocalSyncSession::new(
+            root.to_string_lossy().into_owned(),
+            Arc::new(NativeLocalFs::new()),
+        )
+    }
+
+    fn logger() -> SessionLogger {
+        SessionLogger::open(None, 0, false, None, None, false, "").expect("session logger")
+    }
+
+    /// The line endings are normalized before the upload: a file that came
+    /// with CRLF line endings goes back with the ones `-eol=` names, and a
+    /// file that came with LF keeps them. A file in a legacy encoding goes
+    /// back in that encoding, byte for byte.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_normalizes_the_line_endings_before_the_upload() {
+        let root = scratch("eol-normalize");
+        let crlf = remote_file(&root, "crlf.txt", b"a\r\nb\r\n");
+        let lf = remote_file(&root, "lf.txt", b"a\nb\n");
+        let latin1 = remote_file(&root, "latin1.txt", b"caf\xe9\n");
+
+        // The editor appends a byte, so the upload is a real change and the
+        // bytes that come back are the ones the engine built.
+        let editor = "sh -c 'printf x >> \"$1\"' editor";
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            eol: "lf".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/crlf.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&crlf).unwrap(),
+            b"a\nb\nx",
+            "the upload carries the line endings the switch named"
+        );
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            eol: "crlf".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/lf.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&lf).unwrap(),
+            b"a\r\nb\r\nx",
+            "the upload carries the line endings the switch named"
+        );
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            encoding: "iso-8859-1".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/latin1.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&latin1).unwrap(),
+            b"caf\xe9\nx",
+            "the upload carries the bytes of the encoding the switch named"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// `-monitor` watches the temporary copy while the editor is open and
+    /// uploads every save. A save made after the editor started is uploaded,
+    /// and the upload is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_monitor_uploads_a_save_made_while_the_editor_is_open() {
+        let root = scratch("monitor-upload");
+        let remote = remote_file(&root, "note.txt", b"original\n");
+        let opts = EditOptions {
+            // The editor writes the copy a moment after it starts and then
+            // stays open, so the save can only be seen by the monitor. The
+            // write goes through a rename, so the monitor never reads a
+            // half-written copy.
+            editor: "sh -c 'sleep 0.3; printf edited > \"$1.part\"; mv \"$1.part\" \"$1\"; sleep 5' editor"
+                .to_string(),
+            monitor: true,
+            monitor_passes: 1,
+            monitor_interval_ms: 25,
+            ..EditOptions::default()
+        };
+        let mut messages: Vec<String> = Vec::new();
+        let result = edit_remote_file(
+            &session(&root),
+            "/note.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read_to_string(&remote).unwrap_or_default(),
+            "edited",
+            "the monitored save reached the remote file"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("Uploaded")),
+            "the upload was reported: {messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file that changed on the server while it was being edited is never
+    /// overwritten: the local copy is kept and the refusal names the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_monitor_refuses_to_overwrite_a_file_that_changed_on_the_server() {
+        let root = scratch("monitor-conflict");
+        let remote = remote_file(&root, "note.txt", b"original\n");
+        // The server changes the file first and the editor saves afterwards,
+        // so the monitor cannot see the save before the change: the order
+        // is what makes the refusal a fact rather than a race. Both writes
+        // go through a rename, so neither is ever read half-written.
+        let editor = format!(
+            "sh -c 'printf concurrent > \"{}.part\"; mv \"{}.part\" \"{}\"; sleep 0.3; \
+             printf edited > \"$1.part\"; mv \"$1.part\" \"$1\"; sleep 5' editor",
+            remote.to_string_lossy(),
+            remote.to_string_lossy(),
+            remote.to_string_lossy()
+        );
+        let opts = EditOptions {
+            editor,
+            monitor: true,
+            monitor_passes: 1,
+            monitor_interval_ms: 25,
+            ..EditOptions::default()
+        };
+        let mut messages: Vec<String> = Vec::new();
+        let result = edit_remote_file(
+            &session(&root),
+            "/note.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        let error = result.expect_err("the concurrent change must be refused");
+        assert!(
+            error.contains("changed on the server"),
+            "the refusal names the concurrent change: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&remote).unwrap_or_default(),
+            "concurrent",
+            "the remote file kept the content the server gave it"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

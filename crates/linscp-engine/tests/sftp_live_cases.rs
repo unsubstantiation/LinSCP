@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use filetime::FileTime;
 use linscp_engine::filemask::mode_from_permissions_str;
+use linscp_engine::text_mode::EolStyle;
 use linscp_engine::script::{BatchMode, ScriptInterpreter, ScriptRunConfig};
 use linscp_engine::url_and_raw::ParsedSiteSpec;
 use linscp_engine::xml_log::SessionLogger;
@@ -440,6 +441,153 @@ async fn test_transfer_speed_append_and_preservetime_all() {
     sftp.close().await.unwrap();
 }
 
+/// The ASCII mode converts the line endings on the way down and the binary
+/// mode leaves the bytes alone; the automatic mode converts the files its
+/// mask names and leaves the others alone.
+///
+/// The target is the local native end of line, so the expectation is spelled
+/// out rather than assumed: a build that runs on Linux ends the lines with
+/// LF, one that runs on Windows with CRLF.
+#[tokio::test]
+async fn test_ascii_and_automatic_downloads_convert_line_endings() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6b, 0x6c).await;
+    seed_remote(&sftp, "/crlf.txt", b"a\r\nb\r\n", None).await;
+    seed_remote(&sftp, "/payload.dat", b"a\r\nb\r\n", None).await;
+
+    let expected = match EolStyle::local_native() {
+        EolStyle::Lf => b"a\nb\n".to_vec(),
+        EolStyle::Crlf => b"a\r\nb\r\n".to_vec(),
+        EolStyle::Cr => b"a\rb\r".to_vec(),
+    };
+
+    let ascii_out = tmp.path().join("ascii.txt");
+    let binary_out = tmp.path().join("binary.out");
+    let automatic_out = tmp.path().join("automatic.txt");
+    let automatic_other_out = tmp.path().join("automatic.out");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let script = format!(
+        "get -transfer=ascii /crlf.txt {}\n\
+         get -transfer=binary /crlf.txt {}\n\
+         get -transfer=automatic /crlf.txt {}\n\
+         get -transfer=automatic /payload.dat {}",
+        ascii_out.display(),
+        binary_out.display(),
+        automatic_out.display(),
+        automatic_other_out.display()
+    );
+    let (ok, out) = run_script(&mut interp, &script).await;
+    assert!(ok, "the downloads run: {out}");
+
+    assert_eq!(
+        fs::read(&ascii_out).unwrap(),
+        expected,
+        "the ASCII download converts the line endings"
+    );
+    assert_eq!(
+        fs::read(&binary_out).unwrap(),
+        b"a\r\nb\r\n",
+        "the binary download keeps the bytes as they are"
+    );
+    assert_eq!(
+        fs::read(&automatic_out).unwrap(),
+        expected,
+        "the automatic mode converts a file its mask names"
+    );
+    assert_eq!(
+        fs::read(&automatic_other_out).unwrap(),
+        b"a\r\nb\r\n",
+        "the automatic mode leaves a file its mask does not name alone"
+    );
+
+    sftp.close().await.unwrap();
+}
+
+/// An interrupted transfer leaves its bytes in a `.filepart` staging file
+/// beside the destination, and the resumed transfer continues that staging
+/// file rather than the old destination: the destination that was there
+/// before is never spliced into the result.
+///
+/// The state an interruption leaves behind is the state the test builds:
+/// the bytes received so far in `<name>.filepart`, the destination not yet
+/// written. The resumed transfer has to finish the file from there.
+#[tokio::test]
+async fn test_staged_resume_continues_the_staging_file_not_the_old_final() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6d, 0x6e).await;
+    let payload = b"0123456789".to_vec();
+    seed_remote(&sftp, "/staged.bin", &payload, None).await;
+
+    let dest = tmp.path().join("staged.bin");
+    let stage = tmp.path().join("staged.bin.filepart");
+    // The staging file holds the bytes received before the interruption.
+    fs::write(&stage, b"01234").expect("write the staged bytes");
+    // The destination still holds an older, shorter file. The resume must
+    // not splice that one in.
+    fs::write(&dest, b"old").expect("write the old destination");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let (ok, out) = run_script(
+        &mut interp,
+        &format!("get -resume -resumesupport=on /staged.bin {}", dest.display()),
+    )
+    .await;
+    assert!(ok, "the resumed download runs: {out}");
+
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        payload,
+        "the download continues the staging file and replaces the old destination"
+    );
+    assert!(
+        !stage.exists(),
+        "the staging file is gone once the download is published"
+    );
+
+    sftp.close().await.unwrap();
+}
+
+/// A fresh download that stages its bytes writes them to the `.filepart`
+/// file first and publishes them onto the destination only when the whole
+/// file has arrived, so a failed transfer never leaves a half-written
+/// destination behind.
+#[tokio::test]
+async fn test_a_staged_download_publishes_only_the_whole_file() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6f, 0x70).await;
+    let payload = b"the whole payload".to_vec();
+    seed_remote(&sftp, "/whole.bin", &payload, None).await;
+
+    let dest = tmp.path().join("whole.bin");
+    let stage = tmp.path().join("whole.bin.filepart");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let (ok, out) = run_script(
+        &mut interp,
+        &format!("get -resumesupport=on /whole.bin {}", dest.display()),
+    )
+    .await;
+    assert!(ok, "the download runs: {out}");
+    assert_eq!(
+        fs::read(&dest).unwrap(),
+        payload,
+        "the destination holds the whole file"
+    );
+    assert!(
+        !stage.exists(),
+        "the staging file is published onto the destination"
+    );
+
+    sftp.close().await.unwrap();
+}
+
 /// `-filemask=|skip/` prunes the excluded subtree in both the transfer and
 /// the delete phases: the preview lists the surviving file and neither of
 /// the excluded ones. Without the acknowledgment the run aborts naming the
@@ -698,6 +846,77 @@ async fn test_synchronize_conflict_policy_and_keepuptodate() {
     let stale = sftp.stat("/home/tester/watch/stale.txt").await.unwrap();
     assert!(stale.is_none(), "the stale remote file is deleted");
 
+    sftp.close().await.unwrap();
+}
+
+/// The upstream case name is `test_keepuptodate_wakes_on_a_local_change`:
+/// a file that arrives in the watched tree wakes the watcher, so the next
+/// pass runs straight away instead of waiting for the rescan interval.
+///
+/// The interval is set far longer than the test may take, so only the
+/// watcher can end the wait: the new file is published well before the
+/// interval would have expired.
+#[tokio::test]
+async fn test_keepuptodate_wakes_on_a_local_change() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let watch = tmp.path().join("watch");
+    fs::create_dir_all(&watch).unwrap();
+
+    let (sftp, _fp) = connect_mock(0x71, 0x72).await;
+    sftp.mkdir("/home/tester/woken").await.expect("watch root");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+    let seen = interp.capture_console();
+
+    let script = format!(
+        "option confirm off ; option sftpriskypublish on ; \
+         keepuptodate -count=2 -interval=120 {} /home/tester/woken ; exit",
+        watch.display()
+    );
+    let handle = tokio::spawn(async move { interp.run_command_string(&script, false).await });
+
+    // The change is made after the first pass, so the watcher has to see it.
+    let first_pass = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let (out, _) = ScriptInterpreter::collected_console(&seen);
+        if out.contains("Pass 1") {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < first_pass,
+            "the first pass ran: {out}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    let arrived = std::time::Instant::now();
+    fs::write(watch.join("arrived.txt"), b"arrived\n").expect("write the arrival");
+
+    // The second pass publishes it. The wait ends long before the interval
+    // would have expired.
+    let published = arrived + std::time::Duration::from_secs(45);
+    loop {
+        if sftp
+            .stat("/home/tester/woken/arrived.txt")
+            .await
+            .expect("the remote side answers")
+            .is_some()
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < published,
+            "the arrival woke the watcher"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        arrived.elapsed() < std::time::Duration::from_secs(30),
+        "the arrival woke the watcher before the interval expired"
+    );
+
+    let _ = handle.await;
     sftp.close().await.unwrap();
 }
 

@@ -4280,6 +4280,17 @@ impl CommanderService {
         };
         if entry.is_dir { return api_error(400, "Cannot open a directory in the text editor.") }
         if entry.is_symlink { return api_error(400, "Refusing to edit a symbolic link.") }
+        if query.get("stat").is_some_and(|v| v == "1") {
+            return ApiReply { status: 200, payload: json!({
+                "success": true,
+                "path": path,
+                "info": {
+                    "size": entry.size,
+                    "mtime": entry.mtime,
+                    "mtime_ns": entry.mtime.to_string(),
+                },
+            })};
+        }
         // The limit is the local editor's, so a file it accepts over SFTP is
         // accepted here too, and a larger one is refused before downloading it.
         if entry.size > ops::MAX_GUI_EDIT_BYTES {
@@ -4436,16 +4447,19 @@ impl CommanderService {
             .map_err(|error| api_error(500, error.to_string()))?;
         let mut interpreter = linscp_engine::script::ScriptInterpreter::new(cfg, logger);
         interpreter.set_secret_vault(self.secret_vault.clone());
-        if let Some(tab) = tab.filter(|tab| tab.connected) {
+        if let Some(ref tab) = tab {
             // The local directory is the panel's, so `lcd`/`lpwd` start where
-            // the user is looking rather than at the process's own directory.
-            if Path::new(&tab.local_dir).is_dir() {
+            // the user is looking rather than at the process's own directory,
+            // even when the tab is local-only or disconnected.
+            if !tab.local_dir.is_empty() && Path::new(&tab.local_dir).is_dir() {
                 interpreter.set_local_dir(PathBuf::from(&tab.local_dir));
             }
             // The tab's own session is shared, not reconnected: the
             // interpreter only needs the directories around it.
-            if let (Some(session), Some(spec)) = (tab.remote.clone(), tab.spec.clone()) {
-                interpreter.adopt_session(spec, session, tab.remote_dir.clone(), PathBuf::from(&tab.local_dir));
+            if tab.connected {
+                if let (Some(session), Some(spec)) = (tab.remote.clone(), tab.spec.clone()) {
+                    interpreter.adopt_session(spec, session, tab.remote_dir.clone(), PathBuf::from(&tab.local_dir));
+                }
             }
         }
         Ok(interpreter)
@@ -4472,24 +4486,50 @@ impl CommanderService {
             Ok(interpreter) => interpreter,
             Err(reply) => return reply,
         };
+        let has_tab_local_dir = tab
+            .as_ref()
+            .map(|t| !t.local_dir.is_empty() && Path::new(&t.local_dir).is_dir())
+            .unwrap_or(false);
+        if !has_tab_local_dir {
+            if let Some(req_local) = body.get("local_dir").and_then(Value::as_str) {
+                if !req_local.is_empty() && Path::new(req_local).is_dir() {
+                    interpreter.set_local_dir(PathBuf::from(req_local));
+                }
+            }
+        }
         let (ok, stdout, stderr) = interpreter.run_captured(&line).await;
         // `cd` and `lcd` move the panes, so the tab's directories follow the
         // interpreter's own working directories after the line ran.
-        if let Some((local_cwd, remote_cwd)) = interpreter.working_directories() {
-            if let Some(tab) = tab.filter(|tab| tab.connected && !tab.is_local) {
-                if let Some(current) = self.state.lock().expect("state mutex").tabs.get_mut(&tab.id) {
-                    current.remote_dir = remote_cwd;
-                    current.local_dir = local_cwd.to_string_lossy().into_owned();
+        let new_local_dir = interpreter.local_dir().to_string_lossy().into_owned();
+        let new_remote_dir = interpreter.working_directories().map(|(_, r)| r);
+        // The interpreter starts in the process's own directory when the tab
+        // has no usable local path, so the pane only follows a directory that
+        // really exists.
+        let new_local_dir_is_real = Path::new(&new_local_dir).is_dir();
+        if let Some(ref tab) = tab {
+            if let Some(current) = self.state.lock().expect("state mutex").tabs.get_mut(&tab.id) {
+                if new_local_dir_is_real {
+                    current.local_dir = new_local_dir.clone();
+                }
+                if tab.connected && !tab.is_local {
+                    if let Some(ref remote_cwd) = new_remote_dir {
+                        current.remote_dir = remote_cwd.clone();
+                    }
                 }
             }
         }
         let exit_code = if ok && interpreter.error_count() == 0 { 0 } else { 1 };
-        ApiReply { status: 200, payload: json!({
+        let mut payload = json!({
             "success": ok,
             "stdout": stdout,
             "stderr": stderr,
             "exit_code": exit_code,
-        })}
+            "local_dir": new_local_dir,
+        });
+        if let Some(remote_cwd) = new_remote_dir {
+            payload["remote_dir"] = json!(remote_cwd);
+        }
+        ApiReply { status: 200, payload }
     }
 
     /// Runs one saved Explorer command over the selected files.
@@ -4841,6 +4881,21 @@ impl CommanderService {
             .unwrap_or(false);
         let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
         let has_explicit_no_permissions = body.get("no_permissions").is_some();
+        let explicit_permissions = match body
+            .get("permissions")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            None => None,
+            Some(raw) => {
+                let mut tmp = linscp_engine::presets::TransferPreset::default();
+                if let Err(error) = tmp.parse_setting("permissions", raw) {
+                    return api_error(400, error);
+                }
+                tmp.permissions
+            }
+        };
         let speed_kb = match body.get("speed") {
             None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
             Some(v) => match v.as_u64() {
@@ -5078,17 +5133,20 @@ impl CommanderService {
             flags.transfer_mode = transfer_mode;
             flags.file_mask = parsed_mask.clone();
             flags.speed_kbytes_per_sec = if speed_kb == 0 { None } else { Some(speed_kb) };
-            flags.permissions = if has_explicit_no_permissions {
-                if no_permissions {
-                    linscp_engine::presets::PresetPermissions::Off
-                } else {
+            flags.permissions = if let Some(perms) = explicit_permissions {
+                perms
+            } else if no_permissions {
+                linscp_engine::presets::PresetPermissions::Off
+            } else if let Some(preset_perms) = matched_preset.as_ref().and_then(|p| p.permissions) {
+                if has_explicit_no_permissions
+                    && matches!(preset_perms, linscp_engine::presets::PresetPermissions::Off)
+                {
                     linscp_engine::presets::PresetPermissions::FromFile
+                } else {
+                    preset_perms
                 }
             } else {
-                matched_preset
-                    .as_ref()
-                    .and_then(|p| p.permissions)
-                    .unwrap_or(linscp_engine::presets::PresetPermissions::FromFile)
+                linscp_engine::presets::PresetPermissions::FromFile
             };
             flags.eol_override = matched_preset.as_ref().and_then(|p| p.eol);
             flags.ftp_risky_publish = is_ftp_upload && !append && ftp_risk_accepted;
@@ -5105,6 +5163,12 @@ impl CommanderService {
                 .and_then(Value::as_bool)
                 .or_else(|| matched_preset.as_ref().and_then(|p| p.preserve_time))
                 .unwrap_or(true);
+            flags.preserve_time_dirs = flags.preserve_time
+                && body
+                    .get("preserve_time_dirs")
+                    .and_then(Value::as_bool)
+                    .or_else(|| matched_preset.as_ref().and_then(|p| p.preserve_time_dirs))
+                    .unwrap_or(false);
             if (!upload && move_item && !tab.is_local) || resume {
                 let sess = session.as_ref().unwrap();
                 match sess.scheme() {
@@ -5886,12 +5950,25 @@ impl CommanderService {
             Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
         };
         let encoding_opt = query.get("encoding").map(String::as_str);
+        let stat_only = query.get("stat").is_some_and(|v| v == "1");
         // A granted document reads through the bridge; a plain path keeps the
         // direct reader.
         if is_saf_path(&resolved) {
+            if stat_only {
+                return match ops::stat_local_text_file_via_fs(self.local_fs.as_ref(), &resolved) {
+                    Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "info": info})},
+                    Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+                };
+            }
             return match ops::read_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
                 Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
                 Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+            };
+        }
+        if stat_only {
+            return match ops::stat_local_text_file(Path::new(&resolved)) {
+                Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "info": info})},
+                Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
         }
         match ops::read_local_text_file_encoded(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
@@ -5948,10 +6025,23 @@ impl CommanderService {
                 Ok(p) => p, Err(e) => return ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
             };
             let encoding_opt = query.get("encoding").map(String::as_str);
+            let stat_only = query.get("stat").is_some_and(|v| v == "1");
             if is_saf_path(&resolved) {
+                if stat_only {
+                    return match ops::stat_local_text_file_via_fs(self.local_fs.as_ref(), &resolved) {
+                        Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "info": info})},
+                        Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+                    };
+                }
                 return match ops::read_local_text_file_via_fs_encoded(self.local_fs.as_ref(), &resolved, ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
                     Ok((content, info)) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "content": content, "info": info})},
                     Err(error) => ApiReply{ status: 400, payload: json!({"success": false, "error": error})},
+                };
+            }
+            if stat_only {
+                return match ops::stat_local_text_file(Path::new(&resolved)) {
+                    Ok(info) => ApiReply{ status: 200, payload: json!({"success": true, "path": resolved, "info": info})},
+                    Err(e) => ApiReply{ status: 400, payload: json!({"success": false, "error": e})},
                 };
             }
             match ops::read_local_text_file_encoded(Path::new(&resolved), ops::MAX_GUI_EDIT_BYTES, encoding_opt) {
@@ -9520,8 +9610,9 @@ impl CommanderService {
             // The approvals a dialog collected belong to the same request, so a
             // retry is the same drop plus one decision.
             for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
-                        "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
-                        "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions"] {
+                        "overwrite", "priority", "preserve_time", "preserve_time_dirs", "conflict_versions", "resume",
+                        "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions",
+                        "permissions", "preset"] {
                 if let Some(value) = body.get(key) {
                     request[key] = value.clone();
                 }
@@ -9590,8 +9681,9 @@ impl CommanderService {
             "__cleanup_staging": true,
         });
         for key in ["accept_directory_copy_risk", "accept_ftp_rename_risk", "merge_directories",
-                    "overwrite", "priority", "preserve_time", "conflict_versions", "resume",
-                    "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions"] {
+                    "overwrite", "priority", "preserve_time", "preserve_time_dirs", "conflict_versions", "resume",
+                    "transfer", "speed", "filemask", "resumesupport", "newer_only", "append", "no_permissions",
+                    "permissions", "preset"] {
             if let Some(value) = body.get(key) {
                 request[key] = value.clone();
             }
@@ -18890,6 +18982,190 @@ mod tests {
             "the error explains the missing connection: {}",
             reply.payload
         );
+    }
+
+    /// Local console commands (`lmkdir`, `find -local`, `lcd`) work on a local
+    /// tab and persist the new local working directory back into the tab state.
+    #[tokio::test]
+    async fn local_console_commands_update_local_tab_and_reply_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let work = temp.path().join("workspace");
+        std::fs::create_dir_all(&work).unwrap();
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let opened = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/local".into(),
+            body: json!({
+                "local_dir": work.to_string_lossy(),
+                "remote_dir": work.to_string_lossy(),
+            }),
+        });
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        let tab_id = opened.payload["tab"]["id"].as_u64().unwrap();
+
+        let mk = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/command/exec".into(),
+            body: json!({"command": "lmkdir -parents alpha/beta", "tab": tab_id}),
+        }).await;
+        assert_eq!(mk.status, 200, "{}", mk.payload);
+        assert_eq!(mk.payload["success"], true, "{}", mk.payload);
+        assert!(work.join("alpha").join("beta").is_dir());
+
+        std::fs::write(work.join("alpha").join("beta").join("note.txt"), b"hi").unwrap();
+        let found = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/command/exec".into(),
+            body: json!({"command": "find -local *.txt", "tab": tab_id}),
+        }).await;
+        assert_eq!(found.status, 200, "{}", found.payload);
+        assert_eq!(found.payload["success"], true, "{}", found.payload);
+        assert!(found.payload["stdout"].as_str().unwrap_or("").contains("note.txt"));
+
+        let moved = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/command/exec".into(),
+            body: json!({"command": "lcd alpha", "tab": tab_id}),
+        }).await;
+        assert_eq!(moved.status, 200, "{}", moved.payload);
+        assert_eq!(moved.payload["success"], true, "{}", moved.payload);
+        assert!(moved.payload["local_dir"].as_str().unwrap_or("").ends_with("alpha"));
+        let status = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/status".into(),
+            body: json!({}),
+        });
+        assert!(
+            status.payload["tabs"][0]["local_dir"]
+                .as_str()
+                .unwrap_or("")
+                .ends_with("alpha"),
+            "{}",
+            status.payload
+        );
+    }
+
+    /// `queue_transfer_async` validates explicit `permissions`, applies custom
+    /// octal modes to transferred files, and preserves directory timestamps
+    /// when `preserve_time_dirs` is enabled.
+    #[tokio::test]
+    async fn queue_transfer_honors_explicit_permissions_and_preserve_time_dirs() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(src.join("bundle")).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("bundle").join("file.txt"), b"payload").unwrap();
+        linscp_platform::terminal::set_local_file_times(
+            &src.join("bundle"),
+            1_700_000_000,
+            1_700_000_000,
+        )
+        .unwrap();
+
+        let svc = CommanderService::new(temp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let opened = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/tabs/local".into(),
+            body: json!({
+                "local_dir": src.to_string_lossy(),
+                "remote_dir": dst.to_string_lossy(),
+            }),
+        });
+        assert_eq!(opened.status, 200, "{}", opened.payload);
+        let tab_id = opened.payload["tab"]["id"].as_u64().unwrap();
+
+        let bad = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/upload".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "local_dir": src.to_string_lossy(),
+                    "remote_dir": dst.to_string_lossy(),
+                    "names": ["bundle"],
+                    "permissions": "not-octal",
+                }),
+            })
+            .await;
+        assert_eq!(bad.status, 400, "{}", bad.payload);
+
+        let idx = svc.queue.snapshot().0.len();
+        let ok = svc
+            .dispatch_async(ApiEnvelope {
+                method: "POST".into(),
+                path: "/api/transfer/upload".into(),
+                body: json!({
+                    "tab": tab_id,
+                    "local_dir": src.to_string_lossy(),
+                    "remote_dir": dst.to_string_lossy(),
+                    "names": ["bundle"],
+                    "permissions": "0600",
+                    "preserve_time": true,
+                    "preserve_time_dirs": true,
+                }),
+            })
+            .await;
+        assert_eq!(ok.status, 200, "{}", ok.payload);
+
+        let mut completed = false;
+        for _ in 0..250 {
+            let (tasks, _) = svc.queue.snapshot();
+            if let Some(status) = tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                assert_ne!(status, "Failed", "{tasks:?}");
+                if status == "Completed" {
+                    completed = true;
+                    break;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(completed, "queued local directory transfer did not complete");
+        let dir_stat = linscp_platform::gui_os::stat_extended(&dst.join("bundle")).unwrap();
+        assert_eq!(dir_stat.mtime_secs, 1_700_000_000);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(dst.join("bundle").join("file.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+    }
+
+    /// The transfer dialog's permission mode and its directory-timestamp
+    /// option belong to the preferences document, so they survive a restart
+    /// the way the other transfer settings do.
+    #[test]
+    fn preferences_keep_the_permission_mode_and_the_directory_timestamps() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let mut prefs = svc
+            .dispatch(ApiEnvelope {
+                method: "GET".into(),
+                path: "/api/preferences".into(),
+                body: json!({}),
+            })
+            .payload["preferences"]
+            .clone();
+        assert!(prefs.is_object(), "the preferences document is readable");
+        prefs["permissions"] = json!("0644");
+        prefs["preserve_time_dirs"] = json!(true);
+        let saved = svc.dispatch(ApiEnvelope {
+            method: "POST".into(),
+            path: "/api/preferences".into(),
+            body: json!({"action": "save", "preferences": prefs}),
+        });
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let read = svc.dispatch(ApiEnvelope {
+            method: "GET".into(),
+            path: "/api/preferences".into(),
+            body: json!({}),
+        });
+        assert_eq!(read.payload["preferences"]["permissions"], "0644");
+        assert_eq!(read.payload["preferences"]["preserve_time_dirs"], true);
     }
 
     /// `copyid` and keep-up-to-date both need a live server; with no tab they

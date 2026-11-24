@@ -4,418 +4,57 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-86 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+46 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
-
-## sftp.native-session
-
-**Area:** SFTP · **Status:** partial
-
-Native libssh SFTP session refuses bad credentials and unexpected SSH host keys.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp (the cross-check as written) still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.directory-crud
-
-**Area:** SFTP · **Status:** partial
-
-Transfers, directories, renames, symbolic links (ln/symlink) and chmod use native SFTP requests rather than curl.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.copy-data
-
-**Area:** SFTP · **Status:** partial
-
-Native copy-data replies are used when offered; a multi-source/recursive streamed fallback works when absent.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_cp_multiple_sources_and_recursive_tree is ported against a mock that refuses the copy-data extension, proving the streamed fallback; the native copy-data path is covered by test_cp_uses_native_copy_data_when_the_server_advertises_it. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.check-file-name
-
-**Area:** SFTP · **Status:** partial
-
-Server check-file-name is used for sha-256 and all documented hashes fall back to downloaded bytes when refused.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.permissions-and-times
-
-**Area:** SFTP · **Status:** partial
-
-Octal and recursive symbolic chmod plus file and directory timestamp preservation (-preservetime=all) work against the live SFTP server.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design (the acknowledged staged publish replaces atomically, it does not append) and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 
 ## scp.curl-file-transfer
 
 **Area:** SCP · **Status:** partial
 
-The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. Downloads stage through '.filepart' and are renamed when whole, uploads carry '-permissions' and '-preservetime', a tree goes through the recursive form of the protocol with an 'E' per closed level, and continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, speed limits, progress and the interrupt behavior are the shared transfer path's and are checked here as well.
+The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. A download stages through '.filepart' and is renamed onto the destination when it is whole; an interrupted one leaves the staging file and nothing under the final name. Uploads carry '-permissions' and '-preservetime'. Continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, the speed limit, the progress meter and the interrupt behavior are the shared transfer path's and are checked here as well.
 
-**Next:** No runnable suite evidences this: live-scp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## scp.shell-directory-engine
-
-**Area:** SCP · **Status:** partial
-
-The directory engine runs `ls -l -a --full-time` in its own SSH connection and parses it with the shared long-listing parser: `.` and `..` are skipped, names with spaces are kept whole, symbolic links keep their link type, and dates are read with the offset the server prints them in. `stat` is `ls -l -d`, so a missing path is reported as missing. `cd` is `cd <path> && pwd`, so the working directory is the one the server actually entered. `open` resolves the home directory and the site's initial path in one command. A server whose `ls` has no `--full-time` and no `env` gets the plainer command rather than an error. Server-supplied rcp header names are rejected when they contain a dot entry or either path separator, matching the upstream traversal hardening at every recursion level.
-
-**Next:** No runnable suite evidences this: live-scp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The recursive form of the rcp protocol is not used: the client's own directory engine walks the tree and each file travels in the single-file form, so no 'E' record closes a level. Everything else the row states is checked by the cited cases.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## scp.command-and-metadata
-
-**Area:** SCP · **Status:** partial
-
-The commands upstream runs on the remote shell, and the metadata a shell can set that 'ls -l' can read back: mkdir, rmdir, rm (never '-f', so a path that is not there stays an error the server words), mv, chmod with the mode the script parsed, 'cp -p' for a server-side copy - with a server that has no 'cp' answered by streaming through the client instead - 'ln -s' for a symbolic link, 'touch -t' asked for in UTC for a modification time, and the rcp timestamp header for the time a transfer carries. Every path is quoted for a POSIX shell and a path holding a control character is refused instead of being sent, because a newline in a name cannot be told apart from the end of a listing line. A refusal arrives as the sentence the server printed, 'call' hands the rest of the line to that shell, and 'checksum' says plainly that the digest came from a downloaded file, this protocol having no server-side hashing to ask for. A relative rmdir operand is resolved against the current remote directory before it reaches the protocol layer, matching the upstream full-path fix.
-
-**Next:** No runnable suite evidences this: live-scp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## ftp.curl-transfer
-
-**Area:** FTP/FTPS · **Status:** partial
-
-curl handles authenticated FTP/FTPS downloads and uploads with .filepart staging and PTY progress reporting against live FTP and FTPS servers.
-
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## ftp.listings-and-mlsd
-
-**Area:** FTP/FTPS · **Status:** partial
-
-Plain FTP is served by the native FTP engine, which asks for MLSD where the server advertises it: size, type, time and permissions come from the protocol instead of from an ls -l line each server formats its own way. MLST answers stat, a server that refuses MLSD falls back to LIST, FtpUseMlsd=0 asks for LIST from the start, and FtpUseMlsd=2 (require) fails the listing rather than returning one without the machine-readable facts. The ls -l parser is shared with the curl backend, which serves the LIST replies and every transfer.
-
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## ftp.active-passive
-
-**Area:** FTP/FTPS · **Status:** partial
-
-FtpPasvMode picks the data connection the native engine opens: passive by default, EPSV first with PASV as the fallback, and FtpPasvMode=0 opens it from the client instead, binding a listener and telling the server where it is with PORT or EPRT. FtpForcePasvIp decides whose address a PASV reply may use - 0 the control connection's, 1 (the default) the reply's unless it is unroutable, 2 the reply verbatim - and FtpAccount answers a server that asks for an account name on top of the credentials.
-
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## ftp.tls-policy
-
-**Area:** FTP/FTPS · **Status:** partial
-
-FTPS stays on curl, the TLS client of this build, and upstream's setting names drive it: ftps:// (Ftps=1) is implicit TLS on port 990, ftpes:// (Ftps=2 or 3 on an ftp:// URL) is explicit TLS through --ssl-reqd, MinTlsVersion and MaxTlsVersion become --tlsv1.x and --tls-max, TlsCertificateFile and TlsCertificateKeyFile become --cert and --key, CaCertificateFile and CaCertificateDir become --cacert and --capath, and PinnedPublicKey becomes --pinnedpubkey. A policy curl cannot honour, or one given to a protocol without TLS, is refused before the connection rather than dropped; hostkey='*' is the only value that turns certificate validation off.
-
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## dav.propfind-and-stat
-
-**Area:** WebDAV · **Status:** partial
-
-Depth 0/1 PROPFIND parses collection type, size and modification time; stat distinguishes absent paths.
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## dav.basic-crud
-
-**Area:** WebDAV · **Status:** partial
-
-MKCOL, PUT, GET, DELETE and refusal of nonempty collection removal work against the live server.
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## dav.copy-and-move
-
-**Area:** WebDAV · **Status:** partial
-
-MOVE and COPY send absolute Destination URIs; a refused COPY falls back to a byte-exact stream.
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## dav.escaped-paths
-
-**Area:** WebDAV · **Status:** partial
-
-curl URL paths, DAV href comparisons and Destination headers preserve spaces and literal %, ? and # in names.
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## dav.locks
-
-**Area:** WebDAV · **Status:** partial
-
-'lock <file> [-timeout=SECONDS]' takes an exclusive write lock and keeps its token in the session; 'unlock <file>' releases it. Every later upload, delete and move of that path carries the token as the If header, so a second writer without it is refused with 423 and the locked file keeps its content. A server that does not implement LOCK answers 405 and the command prints that instead of reporting a protected write. Upstream's WebDAV backend sends no LOCK or UNLOCK at all, so this is a LinSCP extension. Exposed in the native GUI via /api/dav/lock and /api/dav/unlock (#davToolsModal).
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## dav.dead-properties-and-preconditions
-
-**Area:** WebDAV · **Status:** partial
-
-'property <file> -set=NAME=VALUE' stores one dead property through PROPPATCH and 'property <file> -get=NAME' reads it back with a named-property PROPFIND; both use this client's own namespace (urn:linscp:properties), a name that would build invalid XML is refused before any request, and a property the server does not have prints 'NAME is not set' rather than failing. The conditional write is the lock token: PUT, DELETE and MOVE of a locked path send If, which is what makes the server refuse a write whose lock is gone (423). Exposed in the native GUI via /api/dav/property (#davToolsModal).
-
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## s3.sigv4-auth
-
-**Area:** Amazon S3 · **Status:** partial
-
-Requests are signed with AWS Signature Version 4; absent or incorrect credentials fail against a TLS verifier.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## s3.bucket-object-listing
-
-**Area:** Amazon S3 · **Status:** partial
-
-ListBuckets, ListObjectsV2, HEAD and virtual directories are exercised against the test endpoint; malformed or repeated pagination state is an error rather than a partial directory listing.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## s3.small-objects-and-range-get
-
-**Area:** Amazon S3 · **Status:** partial
-
-PutObject, GET and a resumed HTTP byte-range download roundtrip.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## s3.multipart-upload
-
-**Area:** Amazon S3 · **Status:** partial
-
-Files over 16 MiB use initiate/parts/complete and abort on handled completion errors.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## s3.copy-object
-
-**Area:** Amazon S3 · **Status:** partial
-
-Single-object CopyObject, embedded HTTP-200 errors and rename-as-copy-plus-delete are tested.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## s3.multipart-restart-and-copy
-
-**Area:** Amazon S3 · **Status:** partial
-
-Interrupted multipart uploads persist completed part ETags in a local sidecar to resume remaining parts, and large server-side copies use multipart UploadPartCopy with byte ranges.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## s3.object-options
-
-**Area:** Amazon S3 · **Status:** partial
-
-S3 rawsettings configure signed x-amz-storage-class, x-amz-acl, x-amz-server-side-encryption, KMS key ID, x-amz-request-payer and custom x-amz-meta-* headers on uploads and copies.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## transfer.masks
-
-**Area:** Transfers · **Status:** partial
-
-Name/path/directory masks and size/time criteria filter transfers and synchronization.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] A transfer of a tree that speaks the recursive rcp form, with an 'E' record closing each level, proved by a case that runs.
 
 ## transfer.ascii-automatic
 
 **Area:** Transfers · **Status:** partial
 
-ASCII conversion is byte-checked through a live upload; automatic mode selects text files by mask.
+The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The upload direction is still unevidenced: live-dav needs a `linscp` binary this repo does not build, and every protocol this build guards refuses an ASCII upload (a guarded or staged upload has to be binary), so only the curl-backed protocols could show it. Runnable residue: engine-sftp, which checks the download direction.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Cover the upload direction over a protocol that accepts an ASCII upload.
 
 ## transfer.filepart-resume
 
 **Area:** Transfers · **Status:** partial
 
-Interrupted uploads/downloads stage in .filepart and continue there rather than splicing the final destination.
+Interrupted uploads and downloads stage in a `.filepart` file beside the destination and continue there rather than splicing the final destination: the bytes that arrived are kept, the resumed transfer continues them, and the file is published onto the destination only when the whole file has arrived.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which stages the bytes in the `.filepart` file, resumes that staging file rather than the old destination, and publishes the whole file onto the destination only when it has arrived.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Interrupt a transfer mid-flight and check that the staging file is what survives.
 
 ## transfer.resume-modes
 
 **Area:** Transfers · **Status:** partial
 
-Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging.
+Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging. The interpreter offers the three modes, refuses a value outside them, and refuses to resume an ASCII transfer because the byte offsets would not survive the line-ending conversion.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## transfer.time-permissions
-
-**Area:** Transfers · **Status:** partial
-
-SFTP preserves file and directory timestamps (-preservetime=all) and applies -permissions modes on uploads and downloads.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design and its refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## transfer.speed-and-append
-
-**Area:** Transfers · **Status:** partial
-
-Native SFTP supports -append without overwriting existing bytes and -speed= bandwidth throttling; curl uses --limit-rate and refuses append.
-
-**Next:** The ported case now executes in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. -append is covered on download; 'put -append' is refused by design, even with the acknowledged staged SFTP publish, and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the modes the interpreter offers and the refusal to resume an ASCII transfer.
 
 **Acceptance criteria:**
 
@@ -428,7 +67,7 @@ Native SFTP supports -append without overwriting existing bytes and -speed= band
 
 Named, per-site and rule-selected presets change live transfer settings.
 
-**Next:** No runnable suite evidences this: live-dav and script need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the preset store, the rules that match a session or a file mask, and the preset a site stores with itself.
 
 **Acceptance criteria:**
 
@@ -439,64 +78,22 @@ Named, per-site and rule-selected presets change live transfer settings.
 
 **Area:** Transfers · **Status:** partial
 
-curl-backed downloads and uploads stream curl's progress meter into the byte-progress callback and render live PTY progress percentages while staging downloads through .filepart.
+The HTTP-backed downloads and uploads report the bytes as they move: the byte-progress callback is told what has been transferred and how much there is, while the transfer runs, and a download that stages its bytes writes them to the `.filepart` file first. Upstream reads the same numbers out of curl's progress meter and renders them live in the terminal; this build has no curl meter and no live percentage line, so that half of the upstream claim is not implemented here.
 
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The upstream half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: proto-dav-s3, which reports the byte progress of an upload and of a download while they run. The live percentage line is not implemented in this build.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Render the transfer progress as a live percentage line in the terminal, the way upstream does.
 
 ## sync.one-way
 
 **Area:** Synchronization · **Status:** partial
 
-Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server.
+Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server; the same plan and upload run against the mock SFTP server.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sync.both-state
-
-**Area:** Synchronization · **Status:** partial
-
-A persistent state file distinguishes one-sided changes and deletions from two-sided conflicts and applies -conflict=skip|local|remote|newer against a live SFTP server.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case is ported, conflict policy and the keepuptodate mirror alike; uploads go through the acknowledged staged SFTP publish. The keepuptodate refusal without the acknowledgment is pinned by test_keepuptodate_reports_the_unguarded_sftp_upload_by_name (a change-guard, not case coverage). unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## sync.checksum
-
-**Area:** Synchronization · **Status:** partial
-
-Checksum criteria find same-size/same-time changes and stop if contents cannot be hashed.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## sync.exclusions-delete-guard
-
-**Area:** Synchronization · **Status:** partial
-
-An excluded subtree is pruned from the plan and cannot be deleted at the destination.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case runs: without the acknowledgment the run aborts naming the refusal (pinned in the same test); with 'option sftpriskypublish on' the upload half completes and the excluded subtree stays untouched. live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which mirrors the local tree onto the remote side and prunes the excluded subtrees from the plan.
 
 **Acceptance criteria:**
 
@@ -507,28 +104,14 @@ An excluded subtree is pruned from the plan and cannot be deleted at the destina
 
 **Area:** Synchronization · **Status:** partial
 
-Nested local arrivals wake the recursive inotify watcher before the rescan interval.
+A file that arrives in the watched tree wakes the watcher, so the next pass runs straight away instead of waiting for the rescan interval.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sync.criteria-and-mirror
-
-**Area:** Synchronization · **Status:** partial
-
-Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server. The Commander's synchronize dialogue offers the same mirror as a one-way copy that deletes what the source no longer has, and its settings are held to the planner's own rules by a service unit test.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The conflict case is ported in full, keepuptodate included, with uploads through the acknowledged staged SFTP publish. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the arrival waking the watcher with an interval far longer than the wait it took.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
 
 ## sessions.site-manager
 
@@ -536,7 +119,7 @@ Time/size/checksum criteria, -mirror and two-way conflict policies are validated
 
 Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
+**Next:** The rename path and the site's own cleanup still rest on the service suite, which no Android step executes. Runnable residue: engine-script (the store, the folders, the export and the import), the service suite and the GUI suite on Linux and Windows.
 
 **Acceptance criteria:**
 
@@ -557,25 +140,13 @@ Stored site passwords are encrypted under sessions.key and shared between the CL
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms.
 
-## sessions.vault-password-only
-
-**Area:** Sessions/configuration · **Status:** partial
-
-The vault is password-only on every build, and the tree finally says so: the never-wired DPAPI/Keystore constructors, decoder branches, Windows DPAPI functions, KeystoreBridge trait, and Tauri keystore state were removed instead of left as dead surface. sessions.key is LSCPVLT1 (Argon2id plus AES-256-GCM) with legacy raw/base64 migration, and the migration guide claims that described hardware wrapping as implemented now say it was removed or descoped.
-
-**Next:** No Android step executes the Rust vault tests, so the password-only behaviour is unproven on device; and the doc corrections are prose, not runnable evidence.
-
-**Acceptance criteria:**
-
-- [ ] An emulator or device run executing the vault tests, or a native harness that runs Rust cases on Android.
-
 ## sessions.proxy-settings
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials.
+Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials. A proxy method the protocol cannot run, and a proxy without a host, are refused when they are set rather than dropped.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which keeps the proxy a site stores and refuses a proxy method the protocol cannot run or one without a host.
 
 **Acceptance criteria:**
 
@@ -588,34 +159,7 @@ Upstream proxy setting names are applied by open and stored with a site; both SO
 
 'open' and 'savesession' take '-rawsettings' with upstream's names: the proxy settings (ProxyMethod, ProxyHost, ProxyPort, ProxyUsername, ProxyPassword, ProxyTelnetCommand, ProxyLocalCommand, ProxyDNS, ProxyLocalhost, ProxyExcludeList), the FTP engine's policy (FtpPasvMode, FtpForcePasvIp, FtpUseMlsd, FtpAccount) and the TLS policy (Ftps, MinTlsVersion, MaxTlsVersion, TlsCertificateFile, TlsCertificateKeyFile, CaCertificateFile, CaCertificateDir, PinnedPublicKey). A name or value outside that set is refused by name before any connection, so a setting is never stored and then dropped at open time, and 'savesession' writes what it applied under the keys a saved site reads back.
 
-**Next:** No runnable suite evidences this: live-curl and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## security.native-hostkey
-
-**Area:** Security/authentication · **Status:** partial
-
-Native SFTP refuses an unknown/unexpected host key until it is pinned.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## security.password-key-agent
-
-**Area:** Security/authentication · **Status:** partial
-
-Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server. On Windows, SSH agent probing connects to OpenSSH's named pipe first and falls back to same-user Pageant WM_COPYDATA IPC.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which refuses an unknown setting by name, validates every value, and reads the stored settings back.
 
 **Acceptance criteria:**
 
@@ -635,27 +179,13 @@ Agent authentication explains itself when there is no agent to ask. The auth cha
 
 - [ ] An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure.
 
-## security.curl-pins-and-tls
-
-**Area:** Security/authentication · **Status:** partial
-
-`-hostkey=` accepts the fingerprint spellings people paste: SHA-256 in hex (with or without `:`), `SHA256:base64`, curl's `sha256//base64`, and MD5 with or without the `MD5:` marker `ssh-keygen` prints. Both SSH engines compare it with the fingerprint the SSH core reports, so `sftp://` and `scp://` pins share one code path, and no pin depends on the installed curl. A key that does not match is refused. An unknown key in a run nobody can answer is refused with the key printed so it can be pinned, and a checked key is remembered. A TLS session keeps chain validation (the system store, or CaCertificateFile and CaCertificateDir) and pins the server's public key with `--pinnedpubkey`. A value curl cannot compare is refused, and only `*` disables the checks.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-curl, live-scp, live-sftp and script need a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
 ## security.proxy-isolation
 
 **Area:** Security/authentication · **Status:** partial
 
-SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed.
+SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed. A proxy the protocol cannot run never reaches the transport.
 
-**Next:** No runnable suite evidences this: live-dav and live-sftp need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav and live-sftp need a `linscp` binary this repo does not build. Runnable residue: engine-script, which refuses a proxy method the protocol cannot run and a proxy without a host.
 
 **Acceptance criteria:**
 
@@ -681,7 +211,7 @@ There is no local HTTP API and therefore no bearer token to steal or leak. Upstr
 
 Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.
 
-**Next:** Production-KDC validation (Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md.
+**Next:** The live half is still unevidenced: live-tunnel and live-sftp need a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which keeps the jump-host and Kerberos settings a site stores and refuses a jump host that is not named.
 
 **Acceptance criteria:**
 
@@ -716,34 +246,18 @@ An operating-system drop in a native window arrives as paths, not as a File: `dr
 - [ ] Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.
 - [ ] Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop.
 
-## editing.monitor-local-changes
-
-**Area:** Editing/search · **Status:** partial
-
-'edit -monitor' watches the temporary local file while the external editor remains open and uploads each save after verifying the remote file was not modified concurrently.
-
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
 ## editing.encoding-policy
 
 **Area:** Editing/search · **Status:** partial
 
 The browser editor and search enforce UTF-8 text and reject binary files, while CLI 'edit -eol=lf|crlf' normalizes line endings before upload.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: service-commands, which refuses a binary file and a byte sequence the encoding cannot hold; and engine-editor, which normalizes the line endings before the upload (the editor double is a shell command, so that case runs on the Unix hosts).
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 
 ## automation.command-interpreter
 
@@ -756,19 +270,6 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 **Acceptance criteria:**
 
 - [ ] No restoration is planned for the GUI-only distribution.
-
-## automation.parameter-and-timestamp
-
-**Area:** Automation · **Status:** partial
-
-%1%..%9%, timestamp formats and environment expansion follow tested script behavior.
-
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 
 ## automation.literal-gui-command
 
@@ -788,7 +289,7 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The operation elements of a real session (upload, download, ls, ...) are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the group and failure structure, the masking of the secrets and the shipped fixtures.
 
 **Acceptance criteria:**
 
@@ -931,14 +432,14 @@ An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
 
 **Area:** Packaging/platforms · **Status:** partial
 
-The Linux platform layer supplies temporary directories, home/config lookup and concurrent child stdout/stderr capture.
+Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from the upstream POSIX runtime services; the host tests cover only filesystem and configuration behavior.
 
-**Next:** No runnable suite evidences this: unit has no build target and cannot be compiled.
+**Next:** The upstream unit suite has no build target. Host-side platform-linux tests cover private directories and files and configuration lookup, but do not exercise signal handling, concurrent child output capture, or Android runtime behavior.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Capture a child's stdout and stderr at the same time, the way the curl progress meter needs it.
 
 ## platform.terminal-and-console
 
@@ -946,7 +447,7 @@ The Linux platform layer supplies temporary directories, home/config lookup and 
 
 Linux command-line parsing, terminal-facing configuration and the native console entry point are built from the Linux sources. Which terminal 'terminal' starts depends on the display server the session runs on; that behavior is its own row, desktop.wayland-session.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The Linux build targets themselves are still unevidenced: unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the command list and each command's own help.
 
 **Acceptance criteria:**
 
@@ -958,9 +459,9 @@ Linux command-line parsing, terminal-facing configuration and the native console
 
 **Area:** Packaging/platforms · **Status:** partial
 
-The Linux synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.
+The synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the watcher ending the wait on a change rather than on the interval; the fallback polling for a root that cannot be watched stays unevidenced.
 
 **Acceptance criteria:**
 
@@ -1016,67 +517,26 @@ Session transfers with a granted local side stage through private temporary file
 
 - [ ] Upload, download and move files between a granted folder and a server on an Android device or emulator, covering a tree transfer, the document-cap refusal and the resume refusal.
 
-## ftp.non-unix-listings
-
-**Area:** FTP/FTPS · **Status:** partial
-
-Shared LIST parser handles Unix long listings, DOS/IIS listings (MM-DD-YY[YY] HH:MM[AM|PM] <DIR>/size with spaces in names, date/size variants) and VMS listings (name;version size DD-MON-YYYY HH:MM:SS [OWNER] (RWED,RWED,RE,RE) with directory detection via .DIR extension and protection-field permissions). MLSD provides machine-readable alternative; DOS/VMS malformed-input is rejected and treated as empty rather than silently succeeding, and LIST fallback is exercised against live servers that emit the supported formats. Other non-Unix dialects remain undocumented as unsupported.
-
-**Next:** No runnable suite evidences this: live-curl needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## dav.etag-preconditions
-
-**Area:** WebDAV · **Status:** partial
-
-'etag <file> -match=ETAG' records an If-Match precondition and '-nomatch=ETAG' an If-None-Match one, per path and per session; '-get' reads the current tag with a Depth-0 PROPFIND and tells a missing path apart from a server that reported no tag; '-clear' forgets a recorded one. A WebDAV upload, delete or move of that path carries the tag in the If header, in one no-tag condition list together with a lock token when the path is also locked - '(<opaquelocktoken:...> ["tag"])' - because RFC 4918 reads an If header as either no-tag lists or tagged lists and never as both, and the token has to be the Coded-URL of angle brackets a standard server looks for. '-nomatch=' is sent as '(Not ["tag"])': a list without the Not would have been If-Match, the opposite of the documented 'write only if the version differs'. The value travels quoted as the entity tag the server gave - 'etag -get' prints "abc", the command splitter strips those quotes, and DavEntityTag puts them back with a W/ weakness prefix left outside them - and '*' is refused by name instead of sent, since an If header has no way to say 'only if absent' and a quoted asterisk is a tag no resource carries, which would guard nothing while looking like a guard. DAV response text is XML-unescaped on the way in, so an escaped getetag arrives as the tag it is rather than as '&quot;...&quot;', which no precondition could ever match. Against a live server a matching tag writes, a stale one is refused with 412 and leaves the destination's bytes and its collection listing exactly as they were, If-None-Match writes where the version differs and is refused where it does not, an absent resource answers it, and a 412 on MOVE says which of its two causes it was rather than always blaming an existing destination. Collection semantics are defined rather than inherited: a precondition guards the path it was recorded for and nothing below it, because a collection's tag names its listing - the first member written under an inherited one would stale it and fail every later write in that directory. A session whose protocol has no entity tags (the SSH engines, FTP, S3) is refused by name, '-get' included, rather than left believing a later write is conditional. Upstream's WebDAV backend sends no ETag precondition at all, so this is a LinSCP extension.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The etag case is ported in full, including the trailing put (through the acknowledged staged SFTP publish). live-dav and live-sftp need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## s3.versioned-objects
-
-**Area:** Amazon S3 · **Status:** partial
-
-`versions` lists exact-key or prefix history and delete markers through guarded ListObjectVersions pagination; `get -versionid=` reads one version, HEAD metadata handles delete markers, and resumable staging uses an ID-specific suffix; `rm -versionid=` deletes only the named version/marker. Live tests cover opaque query characters, a 1001-record two-page history plus missing/repeated pagination-marker refusals, historical/current downloads, isolated resume staging and marker creation/removal without losing other versions. Exposed in the native GUI via /api/s3/versions, /api/s3/version-download, /api/s3/version-delete and /api/s3/version-restore (#s3VersionsModal), with conditional If-Match DELETE support for guarded moves.
-
-**Next:** No runnable suite evidences this: live-s3 needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
 ## editing.non-utf8-encodings
 
 **Area:** Editing/search · **Status:** partial
 
-CLI editing supports explicit legacy-encoding selection via iconv (ISO-8859-1, Windows-1252, EUC-JP, Shift-JIS, UTF-16 etc.): 'edit -encoding=ENC' converts between the file's encoding and UTF-8, round-tripping byte-exact fixtures with BOM/EOL preservation, and rejects invalid sequences or unrepresentable output without silent replacement. Browser editor/search remain UTF-8-only and reject binary/non-UTF-8 files with an explicit message; the encoding contract is documented and tested.
+CLI editing supports explicit legacy-encoding selection ('edit -encoding=ENC'): the file is converted between its encoding and UTF-8, the round trip is byte exact with the BOM preserved, and invalid sequences or unrepresentable output are refused without a silent replacement. Browser editor/search remain UTF-8-only and reject binary files.
 
-**Next:** No runnable suite evidences this: unit has no build target and cannot be compiled.
+**Next:** The live half is still unevidenced: unit has no build target and cannot be compiled. Runnable residue: service-commands, which refuses a binary file, an invalid byte sequence and an unknown encoding, and round-trips a legacy encoding byte exactly with its byte-order mark; and engine-editor, which edits a file in a legacy encoding and uploads it in that encoding (the editor double is a shell command, so that case runs on the Unix hosts).
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Cover the search path as well as the editor path: the browser search rejects binary files too.
 
 ## automation.upstream-xml-compatibility
 
 **Area:** Automation · **Status:** partial
 
-The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns="http://winscp.net/schema/session/1.0" name="user@host"|site|nosession start="...Z">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success="true|false">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The script suite validates the shipped fixtures (fixtures/xml/) and freshly produced logs against that schema with xmlschema - including a masked-password failure - and reads operations back the way an upstream-style consumer does; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.
+The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns="http://winscp.net/schema/session/1.0" name="user@host"|site|nosession start="...Z">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success="true|false">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The engine-script suite reads the shipped fixtures (fixtures/xml/) and a freshly produced log back the way an upstream-style consumer does - the namespace, the groups, the failure and the masked-password failure - and holds the log to the operation elements the fixtures show; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The XSD validation with xmlschema and the operation elements of a real session are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which reads the shipped fixtures and a produced log back as an upstream-style consumer does.
 
 **Acceptance criteria:**
 
@@ -1115,7 +575,7 @@ The panes' delete runs on the session: each selected name is validated as a leaf
 
 Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` proves Linux→Windows→Android round-trip with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.
 
-**Next:** No runnable suite evidences this on Android: script needs a `linscp` binary this repo does not build. Runnable residue: backup on Linux and Windows.
+**Next:** The script-level export and import path is evidenced by engine-script; the backup bundle itself is evidenced by the backup suite on all three platforms.
 
 **Acceptance criteria:**
 

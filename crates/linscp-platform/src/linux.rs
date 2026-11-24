@@ -377,3 +377,89 @@ pub fn write_clipboard_text_on_main_thread(text: &str) -> Result<(), PlatformErr
     gtk_clipboard::write_text_on_main_thread(text)
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "linscp-platform-{}-{name}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir
+    }
+
+    /// The temporary directory and the temporary file it holds belong to the
+    /// user alone: nobody else may read what the session keeps there.
+    #[test]
+    fn the_private_directory_and_file_belong_to_the_user_alone() {
+        let root = scratch("private");
+        let dir = root.join("private-dir");
+        ensure_private_dir(&dir).expect("the private directory is created");
+        let mode = std::fs::metadata(&dir).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory is readable by its owner only");
+
+        // A directory that already exists is still made private.
+        std::fs::set_permissions(&dir, Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&dir).expect("the private directory is created");
+        let mode = std::fs::metadata(&dir).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o700, "the directory is readable by its owner only");
+
+        let file = dir.join("secret.bin");
+        create_exclusive_private_file(&file, b"secret").expect("the file is created");
+        let mode = std::fs::metadata(&file).unwrap().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the file is readable by its owner only");
+        assert_eq!(std::fs::read(&file).unwrap(), b"secret");
+
+        // A file that is already there is never overwritten: the caller
+        // created it, so replacing it would destroy what it held.
+        let again = create_exclusive_private_file(&file, b"other");
+        assert!(
+            matches!(&again, Err(PlatformError::AlreadyExists(_))),
+            "an existing file is not replaced: {again:?}"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"secret");
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// The configuration directory is the one the desktop expects: under
+    /// `XDG_CONFIG_HOME` when it is set, and under the home directory
+    /// otherwise.
+    #[test]
+    fn the_configuration_directory_is_the_one_the_desktop_expects() {
+        let dir = default_config_dir();
+        assert!(!dir.as_os_str().is_empty(), "the directory is named");
+        let text = dir.to_string_lossy().into_owned();
+        if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(
+                dir,
+                PathBuf::from(xdg).join("linscp"),
+                "the directory follows XDG_CONFIG_HOME"
+            );
+        } else if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(
+                dir,
+                PathBuf::from(home).join(".config").join("linscp"),
+                "the directory is under the home directory"
+            );
+        } else {
+            assert!(text.ends_with("linscp"), "the directory is named: {text}");
+        }
+
+        // The roots the file pane offers start with the home directory.
+        let roots = list_roots();
+        assert!(!roots.is_empty(), "there is a root to offer");
+        if let Some(home) = std::env::var_os("HOME").filter(|v| !v.is_empty()) {
+            assert_eq!(
+                roots[0].path,
+                PathBuf::from(home).to_string_lossy().into_owned(),
+                "the home directory is the first root"
+            );
+        }
+    }
+
+}

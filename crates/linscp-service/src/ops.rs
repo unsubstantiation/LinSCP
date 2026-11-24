@@ -8,7 +8,6 @@ use std::path::{Path, PathBuf};
 
 use linscp_crypto::digests::{crc32_hex, md5_hex, sha1_hex, sha256_hex};
 use linscp_engine::filemask::{join_remote_path, mode_from_permissions_str, FileMask};
-use linscp_engine::parse_chmod_spec;
 use linscp_engine::transfer::{upload_single_file, TransferFlags};
 use linscp_engine::xml_log::SessionLogger;
 use linscp_platform::gui_os::{create_local_symlink, format_listing_date, stat_extended};
@@ -309,6 +308,38 @@ pub fn read_local_text_file_via_fs_encoded(
         "bom": had_bom,
     });
     Ok((content, meta_json))
+}
+
+/// Lightweight stat for editor change polling (`?stat=1`): returns the same
+/// `info` shape as the edit readers without reading file bytes.
+pub fn stat_local_text_file(path: &Path) -> Result<Value, String> {
+    let info = stat_extended(path).map_err(|e| format!("Cannot read '{}': {e}", path.display()))?;
+    if info.is_dir {
+        return Err("Cannot open a directory in the text editor.".to_string());
+    }
+    Ok(json!({
+        "size": info.size,
+        "mtime": info.mtime_secs,
+        "mtime_ns": info.mtime_ns.to_string(),
+        "mtime_ns_num": info.mtime_ns as i64,
+        "permissions": info.permissions,
+    }))
+}
+
+/// Lightweight stat through `LocalFs` for SAF editor polling.
+pub fn stat_local_text_file_via_fs(fs: &dyn LocalFs, path: &str) -> Result<Value, String> {
+    let info = fs.stat(path).map_err(|e| format!("Cannot read '{path}': {e}"))?;
+    if info.is_dir {
+        return Err("Cannot open a directory in the text editor.".to_string());
+    }
+    let mtime_ns = (info.mtime as i128) * 1_000_000_000;
+    Ok(json!({
+        "size": info.size,
+        "mtime": info.mtime,
+        "mtime_ns": mtime_ns.to_string(),
+        "mtime_ns_num": mtime_ns as i64,
+        "permissions": info.permissions,
+    }))
 }
 
 /// Saves edited UTF-8 text through `LocalFs`, mirroring
@@ -1891,14 +1922,18 @@ pub fn execute_cleanup(config_root: &Path, ids: &[String]) -> Result<Vec<Value>,
     for id in ids {
         if let Some((label, path)) = catalog.get(id.as_str()) {
             let existed = std::fs::symlink_metadata(path).is_ok();
+            let mut error = String::new();
             if existed {
-                remove_path_any(path)?;
+                if let Err(e) = remove_path_any(path) {
+                    error = e;
+                }
             }
             removed.push(json!({
                 "id": id,
                 "label": label,
                 "path": path.to_string_lossy(),
-                "removed": existed,
+                "removed": existed && error.is_empty(),
+                "error": error,
             }));
         }
     }
@@ -2013,16 +2048,6 @@ pub fn dismiss_shell_manifest(config_root: &Path, id: &str) -> Result<(), String
         std::fs::remove_file(&path).map_err(|e| e.to_string())?;
     }
     Ok(())
-}
-
-/// Parses either octal `"755"` / `"0644"` or symbolic `"u+x,go-w"` chmod modes.
-pub fn resolve_chmod_mode(mode_spec: &str, current_mode: u32) -> Result<u32, String> {
-    let trimmed = mode_spec.trim();
-    if trimmed.is_empty() {
-        return Err("Permissions mode is required.".to_string());
-    }
-    let new_mode = parse_chmod_spec(trimmed, current_mode)?;
-    Ok(new_mode)
 }
 
 #[cfg(test)]
@@ -2407,6 +2432,99 @@ mod tests {
             file_mode_after, file_mode_before,
             "editing a file must preserve its executable/permission bits"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stat_local_text_file_reports_mtime_without_reading_content() {
+        let dir = scratch("stat-local");
+        let target = dir.join("note.txt");
+        std::fs::write(&target, b"hello\n").unwrap();
+        let info = stat_local_text_file(&target).expect("stat must succeed");
+        assert_eq!(info["size"], 6);
+        assert!(info["mtime"].as_i64().unwrap() > 0);
+        assert!(!info["mtime_ns"].as_str().unwrap().is_empty());
+        assert!(stat_local_text_file(&dir).is_err(), "directories must be refused");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn the_editor_refuses_what_it_cannot_represent() {
+        // A file with NUL bytes is binary, not text: it is refused by name
+        // rather than edited into something else.
+        let err = decode_editor_bytes(b"a\0b", None).expect_err("NUL bytes are refused");
+        assert!(err.contains("NUL"), "the refusal names the reason: {err}");
+
+        // Bytes that are not valid in the named encoding are refused too,
+        // and nothing is replaced silently.
+        let err = decode_editor_bytes(&[0xFF, 0xFE, 0x41], Some("utf-8"))
+            .expect_err("invalid UTF-8 is refused");
+        assert!(err.contains("UTF-8"), "the refusal names the encoding: {err}");
+
+        let err = decode_editor_bytes(&[0x41], Some("utf-16le"))
+            .expect_err("an invalid byte sequence is refused");
+        assert!(
+            err.contains("Invalid byte sequence"),
+            "the refusal names the reason: {err}"
+        );
+
+        // An encoding the build does not know is refused by name.
+        let err = decode_editor_bytes(b"plain", Some("no-such-encoding"))
+            .expect_err("an unknown encoding is refused");
+        assert!(
+            err.contains("no-such-encoding"),
+            "the refusal names the encoding: {err}"
+        );
+
+        // A round trip through a legacy encoding is byte exact, and the
+        // byte-order mark survives it.
+        let latin1 = [b'c', b'a', b'f', 0xE9];
+        let (text, label, eol, bom) =
+            decode_editor_bytes(&latin1, Some("iso-8859-1")).expect("a Latin-1 file decodes");
+        assert_eq!(text, "caf\u{00e9}");
+        assert_eq!(label, "iso-8859-1");
+        assert_eq!(eol, "lf");
+        assert!(!bom);
+        let encoded = encode_editor_text(&text, Some("iso-8859-1"), None, Some(false))
+            .expect("the text encodes back");
+        assert_eq!(encoded, latin1, "the round trip is byte exact");
+
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend("hi".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        let (text, _label, _eol, bom) =
+            decode_editor_bytes(&utf16, Some("utf-16le")).expect("a UTF-16 file decodes");
+        assert_eq!(text, "hi");
+        assert!(bom, "the byte-order mark is reported");
+        let encoded = encode_editor_text(&text, Some("utf-16le"), None, Some(true))
+            .expect("the text encodes back");
+        assert_eq!(encoded, utf16, "the round trip keeps the mark");
+
+        // The line endings are normalized only when the caller asks for it.
+        let encoded = encode_editor_text("a\r\nb\r\n", None, Some("lf"), None)
+            .expect("the text encodes");
+        assert_eq!(encoded, b"a\nb\n", "the line endings are normalized");
+        let encoded = encode_editor_text("a\r\nb\r\n", None, Some("crlf"), None)
+            .expect("the text encodes");
+        assert_eq!(encoded, b"a\r\nb\r\n", "the line endings are normalized");
+        let encoded = encode_editor_text("a\r\nb\r\n", None, None, None).expect("the text encodes");
+        assert_eq!(encoded, b"a\r\nb\r\n", "without a request the text is left alone");
+        assert!(
+            encode_editor_text("a\nb\n", None, Some("nonsense"), None).is_err(),
+            "an unknown line-ending style is refused"
+        );
+    }
+
+    #[test]
+    fn execute_cleanup_reports_per_item_errors() {
+        let dir = scratch("cleanup-errors");
+        // Unknown id still fails fast before touching anything.
+        assert!(execute_cleanup(&dir, &["nope".to_string()]).is_err());
+        // Known ids return per-item results with an error field.
+        let removed = execute_cleanup(&dir, &["sessions".to_string()]).expect("known id must succeed");
+        assert_eq!(removed.len(), 1);
+        assert_eq!(removed[0]["id"], "sessions");
+        assert!(removed[0].get("error").is_some());
+        assert!(removed[0].get("label").is_some());
         let _ = std::fs::remove_dir_all(dir);
     }
 }

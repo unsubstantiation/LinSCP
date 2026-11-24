@@ -87,11 +87,13 @@ pub const COMMAND_NAMES: &[&str] = &[
     "end",
     "etag",
     "exit",
+    "find",
     "get",
     "help",
     "keepuptodate",
     "lcd",
     "lls",
+    "lmkdir",
     "ln",
     "lock",
     "lpwd",
@@ -182,6 +184,10 @@ const SCRIPT_COMMAND_HELPS: &[(&str, &str)] = &[
     ),
     ("exit", "exit\n  Ends the session and exits."),
     (
+        "find",
+        "find [ -local ] [ <directory> ] [ <mask> ]\n  Recursively searches for files matching <mask> (default *)\n  under <directory>, on the server or locally with -local.",
+    ),
+    (
         "get",
         "get [ <switches> ] <file> [ <file>... ] [ <target> ]\n  Downloads files. Switches: -delete, -resume, -append,\n  -resumesupport=on|off|<KB>, -speed=<KB/s>, -neweronly,\n  -noneweronly, -latest, -preservetime, -preservetime=all,\n  -nopreservetime, -r, -transfer=binary|ascii|automatic,\n  -permissions[=<mode>], -nopermissions, -versionid=<ID>,\n  -rawtransfersettings[=<count>], -filemask=<mask>.\n  -latest transfers only the newest file the command named,\n  by the source's modification time.\n  For S3, -versionid downloads that exact object version; it\n  stages separately per version so resumes never mix versions.\n  Without a value, -permissions gives the downloaded file\n  the permissions of the remote one.",
     ),
@@ -200,6 +206,10 @@ const SCRIPT_COMMAND_HELPS: &[(&str, &str)] = &[
     (
         "lls",
         "lls [ <directory>[/<mask>] ]\n  Lists the local working directory.",
+    ),
+    (
+        "lmkdir",
+        "lmkdir [ -parents ] <directory> [ <directory>... ]\n  Creates local directories; with -parents (or -p) missing\n  parent directories are created as well.",
     ),
     (
         "ln",
@@ -525,6 +535,12 @@ impl ScriptInterpreter {
     /// and `lcd` start in the panel the user is looking at.
     pub fn set_local_dir(&mut self, local_cwd: PathBuf) {
         self.local_cwd = local_cwd;
+    }
+
+    /// Returns the interpreter's current local working directory, even when no
+    /// remote session slot is open.
+    pub fn local_dir(&self) -> &Path {
+        &self.local_cwd
     }
 
     /// The working directories after a command ran, so the panes follow `cd`
@@ -1475,6 +1491,8 @@ impl ScriptInterpreter {
             }
             "lcd" => self.cmd_lcd(args),
             "lls" => self.cmd_lls(args),
+            "lmkdir" => self.cmd_lmkdir(args),
+            "find" => self.cmd_find(args).await,
             "presets" => self.cmd_presets(args),
             "savepreset" => self.cmd_savepreset(args),
             "rmspreset" => self.cmd_rmspreset(args),
@@ -1883,6 +1901,233 @@ impl ScriptInterpreter {
         }
         self.local_cwd = canon;
         self.out(&format!("{}", self.local_cwd.display()));
+        Ok(())
+    }
+
+    fn cmd_lmkdir(&mut self, args: &[String]) -> Result<(), String> {
+        let mut parents = false;
+        let mut dirs: Vec<String> = Vec::new();
+        for a in args {
+            if a.eq_ignore_ascii_case("-parents") || a.eq_ignore_ascii_case("-p") {
+                parents = true;
+            } else if a.starts_with('-') {
+                let h = self.trp(
+                    "Unsupported switch '{switch}'; it will not be ignored.",
+                    &[("switch", a)],
+                );
+                return Err(self.wrong_args("lmkdir", &h));
+            } else {
+                dirs.push(a.clone());
+            }
+        }
+        if dirs.is_empty() {
+            return Err("Syntax: lmkdir [-parents] <directory>...".to_string());
+        }
+        for raw in dirs {
+            let expanded = expand_tilde(&raw);
+            let target = resolve_local_against(&self.local_cwd, &expanded);
+            let res = if parents {
+                std::fs::create_dir_all(&target)
+            } else {
+                std::fs::create_dir(&target)
+            };
+            if let Err(e) = res {
+                return Err(format!(
+                    "Cannot create local directory '{}': {e}",
+                    target.display()
+                ));
+            }
+            self.out(&format!("{}", target.display()));
+        }
+        Ok(())
+    }
+
+    async fn cmd_find(&mut self, args: &[String]) -> Result<(), String> {
+        const MAX_FIND_RESULTS: usize = 1000;
+        const MAX_FIND_DIRS: usize = 512;
+        let mut local = false;
+        let mut explicit_mask: Option<String> = None;
+        let mut positional: Vec<String> = Vec::new();
+        for a in args {
+            let low = a.to_ascii_lowercase();
+            if low == "-local" {
+                local = true;
+            } else if low.starts_with("-name=") {
+                explicit_mask = Some(a["-name=".len()..].to_string());
+            } else if a.starts_with('-') {
+                let h = self.trp("Unknown switch '{switch}'.", &[("switch", a)]);
+                return Err(self.wrong_args("find", &h));
+            } else {
+                positional.push(a.clone());
+            }
+        }
+        if positional.len() > 2 || (explicit_mask.is_some() && positional.len() > 1) {
+            return Err("Syntax: find [-local] [<directory>] [<mask>]".to_string());
+        }
+        if local {
+            let (start_dir, mask) = match positional.len() {
+                0 => (
+                    self.local_cwd.clone(),
+                    explicit_mask.unwrap_or_else(|| "*".to_string()),
+                ),
+                1 => {
+                    let raw = expand_tilde(&positional[0]);
+                    if let Some(m) = explicit_mask {
+                        (resolve_local_against(&self.local_cwd, &raw), m)
+                    } else if has_wildcard(&raw) {
+                        let resolved = resolve_local_against(&self.local_cwd, &raw);
+                        let parent = resolved
+                            .parent()
+                            .filter(|p| !p.as_os_str().is_empty())
+                            .map(Path::to_path_buf)
+                            .unwrap_or_else(|| self.local_cwd.clone());
+                        let leaf = resolved
+                            .file_name()
+                            .map(|s| s.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| "*".to_string());
+                        (parent, leaf)
+                    } else {
+                        let resolved = resolve_local_against(&self.local_cwd, &raw);
+                        if resolved.is_dir() {
+                            (resolved, "*".to_string())
+                        } else {
+                            (self.local_cwd.clone(), positional[0].clone())
+                        }
+                    }
+                }
+                _ => {
+                    let raw = expand_tilde(&positional[0]);
+                    (
+                        resolve_local_against(&self.local_cwd, &raw),
+                        positional[1].clone(),
+                    )
+                }
+            };
+            if !start_dir.is_dir() {
+                return Err(format!("'{}' is not a directory.", start_dir.display()));
+            }
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(start_dir);
+            let mut visited_dirs = 0usize;
+            let mut matches_found: Vec<String> = Vec::new();
+            while let Some(dir) = queue.pop_front() {
+                if visited_dirs >= MAX_FIND_DIRS || matches_found.len() >= MAX_FIND_RESULTS {
+                    break;
+                }
+                visited_dirs += 1;
+                let Ok(rd) = std::fs::read_dir(&dir) else {
+                    continue;
+                };
+                let mut items: Vec<(String, PathBuf, bool, bool)> = Vec::new();
+                for entry in rd.flatten() {
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if name == "." || name == ".." {
+                        continue;
+                    }
+                    let p = entry.path();
+                    let (is_dir, is_symlink) = match std::fs::symlink_metadata(&p) {
+                        Ok(meta) => (meta.is_dir(), meta.file_type().is_symlink()),
+                        Err(_) => (false, false),
+                    };
+                    items.push((name, p, is_dir, is_symlink));
+                }
+                items.sort_by(|a, b| a.0.cmp(&b.0));
+                for (name, p, is_dir, is_symlink) in items {
+                    if matches_wildcard(&mask, &name) {
+                        matches_found.push(p.display().to_string());
+                        if matches_found.len() >= MAX_FIND_RESULTS {
+                            break;
+                        }
+                    }
+                    if is_dir && !is_symlink && queue.len() + visited_dirs < MAX_FIND_DIRS {
+                        queue.push_back(p);
+                    }
+                }
+            }
+            if matches_found.is_empty() {
+                return self.emit_no_match(&mask, "");
+            }
+            for m in &matches_found {
+                self.out(m);
+            }
+            return Ok(());
+        }
+
+        let cwd = self.active_slot()?.remote_cwd.clone();
+        let (start_dir, mask) = match positional.len() {
+            0 => (cwd, explicit_mask.unwrap_or_else(|| "*".to_string())),
+            1 => {
+                let raw = &positional[0];
+                if let Some(m) = explicit_mask {
+                    (resolve_remote_path(&cwd, raw), m)
+                } else if has_wildcard(raw) {
+                    if raw.contains('/') {
+                        let resolved = resolve_remote_path(&cwd, raw);
+                        let (p, m) = remote_parent_and_name(&resolved);
+                        (p, m)
+                    } else {
+                        (cwd, raw.clone())
+                    }
+                } else {
+                    let resolved = resolve_remote_path(&cwd, raw);
+                    let is_dir = matches!(
+                        self.slots[self.active_slot].session.stat(&resolved).await,
+                        Ok(Some(ref entry)) if entry.is_dir
+                    );
+                    if is_dir {
+                        (resolved, "*".to_string())
+                    } else {
+                        (cwd, raw.clone())
+                    }
+                }
+            }
+            _ => (
+                resolve_remote_path(&cwd, &positional[0]),
+                positional[1].clone(),
+            ),
+        };
+        let first_entries = match self.slots[self.active_slot].session.list_dir(&start_dir).await {
+            Ok(v) => v,
+            Err(e) => return Err(self.remote_error("read directory", &start_dir, &e.to_string())),
+        };
+        let mut queue: std::collections::VecDeque<(String, Option<Vec<FileEntry>>)> =
+            std::collections::VecDeque::new();
+        queue.push_back((start_dir, Some(first_entries)));
+        let mut visited_dirs = 0usize;
+        let mut matches_found: Vec<String> = Vec::new();
+        while let Some((dir_path, preloaded)) = queue.pop_front() {
+            if visited_dirs >= MAX_FIND_DIRS || matches_found.len() >= MAX_FIND_RESULTS {
+                break;
+            }
+            visited_dirs += 1;
+            let mut entries = match preloaded {
+                Some(v) => v,
+                None => match self.slots[self.active_slot].session.list_dir(&dir_path).await {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                },
+            };
+            entries.retain(|e| e.name != "." && e.name != "..");
+            entries.sort_by(|a, b| a.name.cmp(&b.name));
+            for entry in entries {
+                let full = join_remote_path(&dir_path, &entry.name);
+                if matches_wildcard(&mask, &entry.name) {
+                    matches_found.push(full.clone());
+                    if matches_found.len() >= MAX_FIND_RESULTS {
+                        break;
+                    }
+                }
+                if entry.is_dir && !entry.is_symlink && queue.len() + visited_dirs < MAX_FIND_DIRS {
+                    queue.push_back((full, None));
+                }
+            }
+        }
+        if matches_found.is_empty() {
+            return self.emit_no_match(&mask, "");
+        }
+        for m in &matches_found {
+            self.out(m);
+        }
         Ok(())
     }
 
@@ -6386,6 +6631,32 @@ mod console_sink_tests {
         let mut slot = interpreter();
         slot.set_local_dir(dir.clone());
         assert!(slot.execute_line("lpwd").await);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `lmkdir`, `find -local`, and `local_dir()` work without an open remote
+    /// session slot so the GUI's CLI panel can manage and search local folders.
+    #[tokio::test]
+    async fn lmkdir_find_local_and_local_dir_work_without_a_session() {
+        let dir = temp_dir("lmkdir_find");
+        let mut slot = interpreter();
+        slot.set_local_dir(dir.clone());
+        let (ok, stdout, stderr) = slot.run_captured("lmkdir -parents nested/sub").await;
+        assert!(ok, "lmkdir -parents succeeds: {stderr:?}");
+        assert!(dir.join("nested").join("sub").is_dir(), "{stdout:?}");
+
+        std::fs::write(dir.join("nested").join("sub").join("report.log"), b"ok").unwrap();
+        let (ok, stdout, stderr) = slot.run_captured("find -local *.log").await;
+        assert!(ok, "find -local succeeds: {stderr:?}");
+        assert!(stdout.contains("report.log"), "find reports matched path: {stdout:?}");
+
+        let (ok, _, stderr) = slot.run_captured("lcd nested").await;
+        assert!(ok, "lcd nested succeeds: {stderr:?}");
+        assert!(
+            slot.local_dir().ends_with("nested"),
+            "local_dir() reflects lcd without a remote slot: {:?}",
+            slot.local_dir()
+        );
         let _ = std::fs::remove_dir_all(dir);
     }
 }

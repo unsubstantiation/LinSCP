@@ -91,14 +91,52 @@ CASE_SOURCES = {
     # than trusting the call that set it, so they fail on an inherited DACL even
     # where only one user exists. Windows-only; the other platforms flag it.
     "platform-windows-acl": "crates/linscp-platform/src/windows.rs",
+    # The POSIX platform layer: the private temporary directory and file, the
+    # configuration directory the desktop expects. The file is Linux-only, so a Windows build
+    # carries none of these cases.
+    "platform-linux": "crates/linscp-platform/src/linux.rs",
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+    # The FTP/FTPS behaviour against the mock server: the native engine's
+    # passive and active data connections, the MLSD/MLST and LIST dialects,
+    # the resume and append transfers and the TLS policy.
+    "proto-ftp": "crates/linscp-proto/tests/ftp_and_ftps.rs",
+    # The WebDAV and S3 behaviour against the mock servers: PROPFIND, MKCOL,
+    # PUT, COPY/MOVE, LOCK/UNLOCK, dead properties, ETag preconditions, SigV4
+    # signing, resumable multipart uploads and object versioning.
+    "proto-dav-s3": "crates/linscp-proto/tests/webdav_and_s3.rs",
+    # The WebDAV helpers the protocol is built from: the RFC 4918 If-header
+    # and entity-tag forms, the lock-token and dead-property XML.
+    "proto-webdav": "crates/linscp-proto/src/webdav.rs",
+    # The protocol library's own cases: the host-key policy that refuses a
+    # wildcard and tells a tunnel challenge from a destination one.
+    "proto-hostkey": "crates/linscp-proto/src/lib.rs",
+    # The SCP engine's own cases: the shell quoting a remote path needs, the
+    # path hardening that refuses a traversal and a name the shell would
+    # read as an option, and the rcp wire headers.
+    "proto-scp": "crates/linscp-proto/src/scp.rs",
     # The script interpreter end to end against the mock server: the
     # live-sftp cases ported to Rust, plus the change-guards that pin the
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
     # no Rust tests, so Android rows cite other suites instead.
     "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs",
+    # The SCP engine end to end against the mock server: the live-scp cases
+    # ported to Rust - the directory engine, the shell commands, the
+    # transfers and the refusals.
+    "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs",
+    # The script interpreter's own cases: the parameter and timestamp
+    # expansion, the transfer presets and the resume modes, the stored
+    # sessions and their export, the raw session settings, and the XML
+    # action log. The retired Python suite drove a `linscp` binary this
+    # repository does not build, so these cases drive the same behaviour
+    # through the engine instead.
+    "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs",
+    # The engine's own editor workflow: the monitored save and the refusal
+    # to overwrite a file the server changed meanwhile, both driven against
+    # the engine's local session. The editor double is a shell command, so
+    # these cases run on the Unix hosts only.
+    "engine-editor": "crates/linscp-engine/src/editor.rs",
     # The password-only vault: setup/unlock/lock and the retired prefixes.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "vault-password": "crates/linscp-platform/src/password_vault.rs",
@@ -359,7 +397,9 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "proto-ssh", "engine-sftp",
+                               "platform-windows-acl", "platform-linux", "proto-ssh", "proto-ftp",
+                               "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
+                               "engine-sftp", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking

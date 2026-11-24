@@ -90,10 +90,10 @@ const responses = {
   '/api/cleanup': {
     success: true, any: true,
     locations: [
-      { id: 'sessions', caption: 'Stored sessions (sites, user names and host keys)',
-        path: '/tmp/cfg/sessions.ini', kind: 'file', exists: true },
-      { id: 'bookmarks', caption: 'Saved bookmarks',
-        path: '/tmp/cfg/bookmarks.json', kind: 'file', exists: false }
+      { id: 'sessions', label: 'Stored sessions (sites, user names and host keys)',
+        path: '/tmp/cfg/sessions.ini', kind: 'file', exists: true, bytes: 2048 },
+      { id: 'bookmarks', label: 'Saved bookmarks',
+        path: '/tmp/cfg/bookmarks.json', kind: 'file', exists: false, bytes: 0 }
     ]
   },
   '/api/remote/transfer/targets': {
@@ -844,6 +844,26 @@ function options(id) {
     save && JSON.parse(save.options.body).content === 'keep\nmore\n');
   check('save sent the base modification time',
     save && JSON.parse(save.options.body).base_mtime === 1791875271);
+
+  // The in-page editor polls for external changes: a clean buffer reloads,
+  // a dirty buffer warns instead of losing the edits.
+  const originalRemoteEdit = responses['/api/remote/edit'];
+  responses['/api/remote/edit'] = { success: true, path: '/tmp/slowremote/keep.txt',
+    content: 'keep\n', info: { size: 5, mtime: 1791875272, mtime_ns: '1791875272' } };
+  await window.pollEditorFile();
+  await new Promise(resolve => setTimeout(resolve, 80));
+  check('a clean editor reloads when the file changes on disk',
+    window.getEditorValue() === 'keep\n',
+    JSON.stringify(window.getEditorValue()));
+  window.setEditorValue('dirty edit\n');
+  responses['/api/remote/edit'] = { success: true, path: '/tmp/slowremote/keep.txt',
+    content: 'keep\n', info: { size: 5, mtime: 1791875273, mtime_ns: '1791875273' } };
+  await window.pollEditorFile();
+  check('a dirty editor warns instead of reloading',
+    text('editorStatus').indexOf('changed on disk') >= 0,
+    text('editorStatus'));
+  responses['/api/remote/edit'] = originalRemoteEdit;
+  window.closeEditor();
 
   // Local and remote panels use the same bounded editor workflow.
   doc.getElementById('localFileList').children[0]
@@ -2664,7 +2684,9 @@ function options(id) {
   check('the cleanup dialog lists every stored location',
     doc.getElementById('cleanupModal').classList.contains('open') &&
       cleanupBoxes().length === 2 &&
-      text('cleanupList').includes('/tmp/cfg/sessions.ini'),
+      text('cleanupList').includes('/tmp/cfg/sessions.ini') &&
+      text('cleanupList').includes('Stored sessions') &&
+      !text('cleanupList').includes('undefined'),
     text('cleanupList'));
   check('a location that is not there cannot be ticked',
     cleanupBoxes()[0].checked === true && cleanupBoxes()[1].disabled === true);
@@ -6916,6 +6938,167 @@ function options(id) {
       check('Escape closes #terminalHelpModal opened from Commander Help',
         !doc.getElementById('terminalHelpModal').classList.contains('open'));
       window.prompt = savedPromptCli;
+    }
+
+    // Completed features: string matched preset & rule persistence, CLI lcd local sync & canonical completion,
+    // Preferences resume default, and Editor Go-to-line + Search match line jump.
+    {
+      // 1. Transfer Presets: string `matched` from Rust `/api/presets`, `filename=` query param,
+      //    reopening `#transferModal` preserves rule/permission/EOL/preserve_time='all' fields,
+      //    and `saveTransferSettings()` forwards octal `permissions` + `preserve_time_dirs` in `transferOptions()`.
+      wfState.focusPane = 'local';
+      wfState.local.selection.clear();
+      wfState.local.selection.add('a.txt');
+      responses['/api/presets'] = {
+        success: true,
+        matched: 'StringMatchedPreset',
+        presets: [{
+          name: 'StringMatchedPreset',
+          description: 'transfer=ascii preservetime=all permissions=0644',
+          transfer: 'ascii',
+          preserve_time: 'all',
+          newer_only: true,
+          speed: 384,
+          permissions: '0644',
+          eol: 'lf',
+          filemask: '*.txt',
+          host: '127.0.0.1',
+          username: 'user',
+          remote_dir: '/tmp/*',
+          local_dir: '/tmp/*'
+        }]
+      };
+      window.openTransferSettings();
+      await window.loadTransferPresets();
+      const lastPresetsGet = calls.filter(c => c.path === '/api/presets' && (!c.options.method || c.options.method === 'GET')).pop();
+      check('loadTransferPresets passes selected filename and renders string matched preset from backend',
+        !!lastPresetsGet &&
+        String(lastPresetsGet.url || '').indexOf('filename=a.txt') >= 0 &&
+        doc.getElementById('transferPresetMatchedHint').style.display === 'flex' &&
+        doc.getElementById('transferPresetMatchedHint').textContent.indexOf('StringMatchedPreset') >= 0);
+
+      window.applyMatchedTransferPreset();
+      await window.saveTransferSettings();
+      const savedPresetOpts = window.transferOptions();
+      check('saving a selected preset forwards octal permissions and preserve_time_dirs in transferOptions()',
+        savedPresetOpts.preset === 'StringMatchedPreset' &&
+        savedPresetOpts.permissions === '0644' &&
+        savedPresetOpts.preserve_time === true &&
+        savedPresetOpts.preserve_time_dirs === true);
+
+      // The transfer settings are kept in the preferences document, so the
+      // permission mode and the directory timestamps survive a restart.
+      const prefsSave = calls.filter(c => c.path === '/api/preferences'
+        && String(c.options.method || 'POST').toUpperCase() === 'POST').pop();
+      const prefsBody = prefsSave ? JSON.parse(prefsSave.options.body) : {};
+      const prefRoundTrip = window.preferencesToSettings({
+        permissions: '0644', preserve_time_dirs: true
+      });
+      check('the transfer dialog keeps its permission mode and directory timestamps in the preferences',
+        !!prefsBody.preferences &&
+        prefsBody.preferences.permissions === '0644' &&
+        prefsBody.preferences.preserve_time_dirs === true &&
+        prefRoundTrip.permissions === '0644' &&
+        prefRoundTrip.preserveTimeDirs === true);
+
+      window.openTransferSettings();
+      await new Promise(resolve => setTimeout(resolve, 25));
+      check('reopening #transferModal restores preset permissions, octal mode, EOL, and rule fields',
+        doc.getElementById('transferPresetPermissions').value === 'mode' &&
+        doc.getElementById('transferPresetModeOctal').value === '0644' &&
+        doc.getElementById('transferPresetEol').value === 'lf' &&
+        doc.getElementById('transferPresetHost').value === '127.0.0.1');
+      await window.resetTransferSettings();
+      window.closeModal('transferModal');
+      delete responses['/api/presets'];
+
+      // 2. Preferences `#prefResume` defaults to false when `resume` is omitted/false.
+      window.fillPreferencesForm({});
+      check('fillPreferencesForm defaults #prefResume to unchecked when resume is omitted',
+        doc.getElementById('prefResume').checked === false &&
+        doc.getElementById('prefPreserveTime').checked === true);
+      await window.loadTransferSettings();
+
+      // 3. CLI Console: expanded canonical Tab-completion (`lmkdir`, `find`, `savepreset`, `backup`)
+      //    and `lcd` updating `state.local.path` from `result.local_dir` on local/disconnected tabs.
+      const cliIn = doc.getElementById('cliInput');
+      cliIn.value = 'lmk';
+      window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'Tab', cancelable: true }));
+      const completedLmkdir = cliIn.value;
+      cliIn.value = 'savep';
+      window.handleCliInputKeydown(new window.KeyboardEvent('keydown', { key: 'Tab', cancelable: true }));
+      const completedSavepreset = cliIn.value;
+      const prevLocalPath = wfState.local.path;
+      const prevExecResp = responses['/api/command/exec'];
+      const prevLocalListResp = responses['/api/local/list'];
+      responses['/api/command/exec'] = {
+        success: true,
+        exit_code: 0,
+        stdout: '/tmp/cli-moved\n',
+        stderr: '',
+        local_dir: '/tmp/cli-moved'
+      };
+      responses['/api/local/list'] = { success: true, path: '/tmp/cli-moved', entries: [] };
+      cliIn.value = 'lcd /tmp/cli-moved';
+      await window.execCliCommand();
+      const lastCliExec = calls.filter(c => c.path === '/api/command/exec').pop();
+      const lastLocalList = calls.filter(c => c.path === '/api/local/list').pop();
+      check('CLI Console completes lmkdir/savepreset, sends local_dir, and updates local pane from result.local_dir',
+        completedLmkdir === 'lmkdir ' &&
+        completedSavepreset === 'savepreset ' &&
+        !!lastCliExec && JSON.parse(lastCliExec.options.body).local_dir === prevLocalPath &&
+        wfState.local.path === '/tmp/cli-moved' &&
+        !!lastLocalList && decodeURIComponent(String(lastLocalList.url || '')).indexOf('/tmp/cli-moved') >= 0);
+      responses['/api/command/exec'] = prevExecResp;
+      responses['/api/local/list'] = prevLocalListResp;
+      await window.loadLocal(prevLocalPath);
+
+      // 4. Editor Go-to-line button, live cursor indicator, and Search content-match line jump.
+      check('Editor toolbar exposes #editorGotoLineBtn and #editorCursorPos',
+        !!doc.getElementById('editorGotoLineBtn') && !!doc.getElementById('editorCursorPos'));
+      const prevRemoteEdit = responses['/api/remote/edit'];
+      const prevRemoteSearch = responses['/api/remote/search'];
+      responses['/api/remote/edit'] = {
+        success: true,
+        content: 'line1\nline2\nline3\nneedle line 4\nline5\n',
+        info: { size: 38, mtime: 1700000000, mtime_ns: '1700000000000000000', encoding: 'UTF-8', eol: 'lf', bom: false }
+      };
+      responses['/api/remote/search'] = {
+        success: true,
+        scanned: 1,
+        skipped: 0,
+        bytes_scanned: 38,
+        matches: [{
+          name: 'keep.txt',
+          path: '/tmp/slowremote/keep.txt',
+          size: 38,
+          is_dir: false,
+          line: 4,
+          snippet: 'needle line 4'
+        }]
+      };
+      window.openSearch('remote');
+      doc.getElementById('searchContents').checked = true;
+      window.toggleSearchContents();
+      doc.getElementById('searchText').value = 'needle';
+      await window.runSearch();
+      const matchEditBtn = Array.from(doc.querySelectorAll('#searchResults button'))
+        .find(b => b.textContent === 'Edit');
+      check('Search content match renders Edit action button', !!matchEditBtn);
+      matchEditBtn.click();
+      await new Promise(resolve => setTimeout(resolve, 70));
+      if (window.LinSCPEditor) {
+        check('Search Edit action opens #editorModal jumped directly to match.line and updates #editorCursorPos',
+          doc.getElementById('editorModal').classList.contains('open') &&
+          doc.getElementById('editorCursorPos').textContent.indexOf('4') >= 0);
+        window.openEditorGotoLine();
+        check('openEditorGotoLine() opens CodeMirror .cm-goto-line panel inside #editorHost',
+          !!doc.querySelector('#editorHost .cm-goto-line'));
+      }
+      window.closeEditor();
+      responses['/api/remote/edit'] = prevRemoteEdit;
+      if (prevRemoteSearch) responses['/api/remote/search'] = prevRemoteSearch;
+      else delete responses['/api/remote/search'];
     }
   }
 

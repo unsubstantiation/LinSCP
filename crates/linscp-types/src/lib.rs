@@ -299,6 +299,15 @@ pub struct UserPreferences {
     pub priority: bool,
     pub confirm_overwrite: bool,
     pub confirm_delete: bool,
+    /// Permission mode applied to transferred files: empty follows the
+    /// source, `"off"` writes none, `"fromfile"` copies the source's mode and
+    /// an octal mode such as `"0644"` sets one.
+    #[serde(default)]
+    pub permissions: String,
+    /// Preserve the modification time of transferred directories, not only
+    /// of the files inside them.
+    #[serde(default)]
+    pub preserve_time_dirs: bool,
     #[serde(default)]
     pub xml_log_enabled: bool,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -322,6 +331,8 @@ impl Default for UserPreferences {
             priority: false,
             confirm_overwrite: true,
             confirm_delete: true,
+            permissions: String::new(),
+            preserve_time_dirs: false,
             xml_log_enabled: false,
             xml_log_path: String::new(),
             custom_install_scripts: std::collections::BTreeMap::new(),
@@ -419,6 +430,8 @@ mod tests {
         assert_eq!(value["transfer"], "binary");
         assert_eq!(value["confirm_overwrite"], true);
         assert_eq!(value["preserve_time"], true);
+        assert_eq!(value["permissions"], "");
+        assert_eq!(value["preserve_time_dirs"], false);
         assert!(value.get("custom_install_scripts").is_none());
         let decoded: UserPreferences = serde_json::from_value(value).expect("deserialize");
         assert_eq!(decoded, prefs);
