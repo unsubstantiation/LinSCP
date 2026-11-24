@@ -1275,3 +1275,54 @@ async fn test_interrupted_staged_download_resumes_its_partial() {
     assert!(!stage.exists(), "the completed stage was published");
     sftp.close().await.unwrap();
 }
+
+/// The GUI's verified-resume path compares every saved byte with the remote
+/// file before publishing. A stale checkpoint must never become a mixed file,
+/// even when the replacement has the same length and timestamp.
+#[tokio::test]
+async fn test_verified_resume_refuses_a_changed_sftp_prefix() {
+    use linscp_engine::transfer::{download_verified_resume, TransferFlags};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7f, 0x80).await;
+    let original = b"0123456789abcdef";
+    seed_remote(&sftp, "/verified.bin", original, Some(1_700_000_000)).await;
+    let destination = tmp.path().join("verified.bin");
+    let checkpoint = tmp.path().join("verified.bin.filepart");
+    fs::write(&checkpoint, &original[..8]).unwrap();
+    let info = sftp.stat("/verified.bin").await.unwrap().unwrap();
+    let flags = TransferFlags {
+        no_clobber: true,
+        resume: true,
+        source_etag: Some(format!("\"sftp:{}:{}\"", info.size, info.mtime)),
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &flags, &mut logger, None).await.unwrap();
+    assert_eq!(fs::read(&destination).unwrap(), original);
+    assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8], "the checkpoint is never changed");
+
+    // The same-length replacement deliberately has the same SFTP timestamp;
+    // metadata alone would not distinguish it from the original.
+    let changed = b"XXXXXXXX89abcdef";
+    seed_remote(&sftp, "/verified.bin", changed, Some(info.mtime)).await;
+    let changed_destination = tmp.path().join("changed.bin");
+    let changed_checkpoint = tmp.path().join("changed.bin.filepart");
+    fs::write(&changed_checkpoint, &original[..8]).unwrap();
+    let result = download_verified_resume(&*sftp, "/verified.bin", &info, &changed_destination, &flags, &mut logger, None).await;
+    assert!(result.is_err(), "a mismatched prefix must fail");
+    assert!(!changed_destination.exists(), "a mixed destination was not published");
+    assert_eq!(fs::read(&changed_checkpoint).unwrap(), &original[..8]);
+
+    // The no-replace publication guard must also leave a concurrently
+    // existing destination and the original checkpoint intact.
+    let existing = tmp.path().join("existing.bin");
+    let existing_checkpoint = tmp.path().join("existing.bin.filepart");
+    fs::write(&existing, b"local data").unwrap();
+    fs::write(&existing_checkpoint, &changed[..8]).unwrap();
+    assert!(download_verified_resume(&*sftp, "/verified.bin", &info, &existing, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&existing).unwrap(), b"local data");
+    assert_eq!(fs::read(&existing_checkpoint).unwrap(), &changed[..8]);
+    sftp.close().await.unwrap();
+}
