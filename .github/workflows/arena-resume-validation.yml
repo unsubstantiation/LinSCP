@@ -1,0 +1,23 @@
+name: Resume validation
+on:
+  push:
+    branches: [arena/cf506e43-linscp]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+      - name: Resume tests
+        shell: bash
+        run: |
+          cargo test -p linscp-engine --test ordinary_conditional_resume > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -70 test.log | tr '\n' ' ')"; exit 1; }
+          cargo test -p linscp-engine --test ftp_staged_ascii --test sftp_live_cases > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -70 test.log | tr '\n' ' ')"; exit 1; }

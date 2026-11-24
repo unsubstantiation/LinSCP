@@ -630,11 +630,12 @@ pub async fn download_single_file(
         return Err("Safe no-overwrite downloads require a fresh staging file.".to_string());
     }
     let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
-    // Compare FTP/SFTP resume prefixes before moving or opening either local
-    // path for writing. Their size/mtime identity is a best-effort guard, not
-    // a server-side atomic snapshot.
+    // Compare resume prefixes before moving or opening local paths for writing.
+    // FTP/SFTP size/mtime identities remain best-effort, not atomic snapshots.
+    // WebDAV/S3 use a strong ETag for both the comparison and the remaining GET.
     let mut resume_identity = None;
-    if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) {
+    if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())
+        || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
         let candidate = if let Some(stage) = stage_opt.as_ref() {
             let stage_info = stat_local_path(stage);
             if stage_info.exists {
@@ -655,9 +656,23 @@ pub async fn download_single_file(
         if let Some((partial, size)) = candidate {
             let input = linscp_platform::open_private_file_no_follow(partial)
                 .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
-            let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
-            let token = format!("\"{protocol}:{}:{}\"", info.size, info.mtime);
             if size > 0 {
+                let token = if is_webdav_scheme(session.scheme()) {
+                    let (current, etag) = session.dav_stat_with_etag(remote_path).await.map_err(|e| e.to_string())?;
+                    if current.as_ref().map_or(true, |entry| entry.is_dir || entry.size != info.size) {
+                        return Err("Cannot resume: remote source metadata changed.".to_string());
+                    }
+                    etag.ok_or("Cannot resume without a strong source ETag.")?
+                } else if session.scheme() == ProtocolScheme::S3 {
+                    if flags.version_id.is_some() {
+                        return Err("Cannot safely resume a versioned S3 download; start a fresh download instead.".to_string());
+                    }
+                    session.s3_get_etag(remote_path).await.map_err(|e| e.to_string())?
+                        .ok_or("Cannot resume without a strong source ETag.")?
+                } else {
+                    let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
+                    format!("\"{protocol}:{}:{}\"", info.size, info.mtime)
+                };
                 let input = tokio::fs::File::from_std(input);
                 let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
                 session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader).await
@@ -783,10 +798,11 @@ pub async fn download_single_file(
     apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &dest_label, Some(bytes), Ok(()));
     if flags.delete_source {
-        session
-            .remove_file(remote_path)
-            .await
-            .map_err(|e| e.to_string())?;
+        if let Some(etag) = resume_identity.as_deref().filter(|_| is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
+            session.remove_if_match(remote_path, etag).await.map_err(|e| e.to_string())?;
+        } else {
+            session.remove_file(remote_path).await.map_err(|e| e.to_string())?;
+        }
     }
     Ok(true)
 }
