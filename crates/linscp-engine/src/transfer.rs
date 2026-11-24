@@ -701,7 +701,7 @@ pub async fn download_single_file(
             let sp_meta = stat_local_path(sp);
             if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
                 if sp_meta.size < info.size {
-                    if flags.resume && sp_meta.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && resume_identity.is_none() {
+                    if flags.resume && sp_meta.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && resume_identity.is_none() {
                         return Err("Resume partial changed after verification; retry the transfer.".to_string());
                     }
                     (sp.clone(), sp_meta.size)
@@ -716,7 +716,7 @@ pub async fn download_single_file(
                 && local_stat.size < info.size
             {
                 // Do not adopt a partial that appeared after the verification pass.
-                if local_stat.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && resume_identity.is_none() {
+                if local_stat.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && resume_identity.is_none() {
                     return Err("Resume partial changed after verification; retry the transfer.".to_string());
                 }
                 // Adopt existing partial target into stage path or resume directly
