@@ -417,6 +417,88 @@ mod tests {
         SessionLogger::open(None, 0, false, None, None, false, "").expect("session logger")
     }
 
+    /// The line endings are normalized before the upload: a file that came
+    /// with CRLF line endings goes back with the ones `-eol=` names, and a
+    /// file that came with LF keeps them. A file in a legacy encoding goes
+    /// back in that encoding, byte for byte.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_normalizes_the_line_endings_before_the_upload() {
+        let root = scratch("eol-normalize");
+        let crlf = remote_file(&root, "crlf.txt", b"a\r\nb\r\n");
+        let lf = remote_file(&root, "lf.txt", b"a\nb\n");
+        let latin1 = remote_file(&root, "latin1.txt", b"caf\xe9\n");
+
+        // The editor appends a byte, so the upload is a real change and the
+        // bytes that come back are the ones the engine built.
+        let editor = "sh -c 'printf x >> \"$1\"' editor";
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            eol: "lf".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/crlf.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&crlf).unwrap(),
+            b"a\nb\nx",
+            "the upload carries the line endings the switch named"
+        );
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            eol: "crlf".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/lf.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&lf).unwrap(),
+            b"a\r\nb\r\nx",
+            "the upload carries the line endings the switch named"
+        );
+
+        let mut messages: Vec<String> = Vec::new();
+        let opts = EditOptions {
+            editor: editor.to_string(),
+            encoding: "iso-8859-1".to_string(),
+            ..EditOptions::default()
+        };
+        let result = edit_remote_file(
+            &session(&root),
+            "/latin1.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read(&latin1).unwrap(),
+            b"caf\xe9\nx",
+            "the upload carries the bytes of the encoding the switch named"
+        );
+
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     /// `-monitor` watches the temporary copy while the editor is open and
     /// uploads every save. A save made after the editor started is uploaded,
     /// and the upload is reported.

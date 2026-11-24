@@ -2449,6 +2449,72 @@ mod tests {
     }
 
     #[test]
+    fn the_editor_refuses_what_it_cannot_represent() {
+        // A file with NUL bytes is binary, not text: it is refused by name
+        // rather than edited into something else.
+        let err = decode_editor_bytes(b"a\0b", None).expect_err("NUL bytes are refused");
+        assert!(err.contains("NUL"), "the refusal names the reason: {err}");
+
+        // Bytes that are not valid in the named encoding are refused too,
+        // and nothing is replaced silently.
+        let err = decode_editor_bytes(&[0xFF, 0xFE, 0x41], Some("utf-8"))
+            .expect_err("invalid UTF-8 is refused");
+        assert!(err.contains("UTF-8"), "the refusal names the encoding: {err}");
+
+        let err = decode_editor_bytes(&[0x41], Some("utf-16le"))
+            .expect_err("an invalid byte sequence is refused");
+        assert!(
+            err.contains("Invalid byte sequence"),
+            "the refusal names the reason: {err}"
+        );
+
+        // An encoding the build does not know is refused by name.
+        let err = decode_editor_bytes(b"plain", Some("no-such-encoding"))
+            .expect_err("an unknown encoding is refused");
+        assert!(
+            err.contains("no-such-encoding"),
+            "the refusal names the encoding: {err}"
+        );
+
+        // A round trip through a legacy encoding is byte exact, and the
+        // byte-order mark survives it.
+        let latin1 = [b'c', b'a', b'f', 0xE9];
+        let (text, label, eol, bom) =
+            decode_editor_bytes(&latin1, Some("iso-8859-1")).expect("a Latin-1 file decodes");
+        assert_eq!(text, "caf\u{00e9}");
+        assert_eq!(label, "iso-8859-1");
+        assert_eq!(eol, "lf");
+        assert!(!bom);
+        let encoded = encode_editor_text(&text, Some("iso-8859-1"), None, Some(false))
+            .expect("the text encodes back");
+        assert_eq!(encoded, latin1, "the round trip is byte exact");
+
+        let mut utf16 = vec![0xFF, 0xFE];
+        utf16.extend("hi".encode_utf16().flat_map(|u| u.to_le_bytes()));
+        let (text, _label, _eol, bom) =
+            decode_editor_bytes(&utf16, Some("utf-16le")).expect("a UTF-16 file decodes");
+        assert_eq!(text, "hi");
+        assert!(bom, "the byte-order mark is reported");
+        let encoded = encode_editor_text(&text, Some("utf-16le"), None, Some(true))
+            .expect("the text encodes back");
+        assert_eq!(encoded, utf16, "the round trip keeps the mark");
+
+        // The line endings are normalized only when the caller asks for it.
+        let encoded = encode_editor_text("a\r\nb\r\n", None, Some("lf"), None)
+            .expect("the text encodes");
+        assert_eq!(encoded, b"a\nb\n", "the line endings are normalized");
+        let encoded = encode_editor_text("a\r\nb\r\n", None, Some("crlf"), None)
+            .expect("the text encodes");
+        assert_eq!(encoded, b"a\r\nb\r\n", "the line endings are normalized");
+        let encoded = encode_editor_text("a\r\nb\r\n", None, None, None).expect("the text encodes");
+        assert_eq!(encoded, b"a\r\nb\r\n", "without a request the text is left alone");
+        assert!(
+            encode_editor_text("a\nb\n", None, Some("nonsense"), None).is_err(),
+            "an unknown line-ending style is refused"
+        );
+    }
+
+    #[test]
     fn execute_cleanup_reports_per_item_errors() {
         let dir = scratch("cleanup-errors");
         // Unknown id still fails fast before touching anything.

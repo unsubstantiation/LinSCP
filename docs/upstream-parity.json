@@ -3832,28 +3832,37 @@
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
+        ],
+        "service-commands": [
+          "the_editor_refuses_what_it_cannot_represent"
+        ],
+        "engine-editor": [
+          "edit_normalizes_the_line_endings_before_the_upload"
         ]
       },
       "verified_on": {
         "linux": [
           "live-sftp",
-          "unit"
+          "unit",
+          "engine-editor",
+          "service-commands"
         ],
         "windows": [
           "live-sftp",
-          "unit"
+          "unit",
+          "service-commands"
         ],
         "android": [
           "live-sftp",
-          "unit"
+          "unit",
+          "engine-editor",
+          "service-commands"
         ]
       },
-      "gap": "No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.",
+      "gap": "The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: service-commands, which refuses a binary file and a byte sequence the encoding cannot hold; and engine-editor, which normalizes the line endings before the upload (the editor double is a shell command, so that case runs on the Unix hosts).",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests.",
-        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on."
+        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
       ]
     },
     {
@@ -4781,7 +4790,7 @@
       "id": "editing.non-utf8-encodings",
       "area": "Editing/search",
       "status": "partial",
-      "notes": "CLI editing supports explicit legacy-encoding selection via iconv (ISO-8859-1, Windows-1252, EUC-JP, Shift-JIS, UTF-16 etc.): 'edit -encoding=ENC' converts between the file's encoding and UTF-8, round-tripping byte-exact fixtures with BOM/EOL preservation, and rejects invalid sequences or unrepresentable output without silent replacement. Browser editor/search remain UTF-8-only and reject binary/non-UTF-8 files with an explicit message; the encoding contract is documented and tested.",
+      "notes": "CLI editing supports explicit legacy-encoding selection ('edit -encoding=ENC'): the file is converted between its encoding and UTF-8, the round trip is byte exact with the BOM preserved, and invalid sequences or unrepresentable output are refused without a silent replacement. Browser editor/search remain UTF-8-only and reject binary files.",
       "source": [
         "crates/linscp-engine/src/editor.rs",
         "crates/linscp-service/src/lib.rs"
@@ -4790,23 +4799,34 @@
         "unit": [
           "TestEncodingHelpers",
           "TestEditorHelpers"
+        ],
+        "service-commands": [
+          "the_editor_refuses_what_it_cannot_represent"
+        ],
+        "engine-editor": [
+          "edit_normalizes_the_line_endings_before_the_upload"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit"
+          "unit",
+          "engine-editor",
+          "service-commands"
         ],
         "windows": [
-          "unit"
+          "unit",
+          "service-commands"
         ],
         "android": [
-          "unit"
+          "unit",
+          "engine-editor",
+          "service-commands"
         ]
       },
-      "gap": "No runnable suite evidences this: unit has no build target and cannot be compiled.",
+      "gap": "The live half is still unevidenced: unit has no build target and cannot be compiled. Runnable residue: service-commands, which refuses a binary file, an invalid byte sequence and an unknown encoding, and round-trips a legacy encoding byte exactly with its byte-order mark; and engine-editor, which edits a file in a legacy encoding and uploads it in that encoding (the editor double is a shell command, so that case runs on the Unix hosts).",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+        "Cover the search path as well as the editor path: the browser search rejects binary files too."
       ]
     },
     {
