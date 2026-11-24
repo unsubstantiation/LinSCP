@@ -910,9 +910,6 @@ pub async fn upload_single_file(
         .unwrap_or_default();
     let effective_ascii = wants_ascii_conversion(flags.transfer_mode, &leaf);
 
-    if effective_ascii && flags.ftp_risky_publish {
-        return Err("FTP staged uploads require binary transfer mode.".to_string());
-    }
     if effective_ascii && (flags.no_clobber || flags.overwrite_etag.is_some())
         && (flags.resume || flags.append || (flags.no_clobber && flags.overwrite_etag.is_some()))
     {
@@ -974,18 +971,18 @@ pub async fn upload_single_file(
         if flags.overwrite_etag.is_some() {
             return Err("ETag-conditional overwrite cannot be combined with FTP staged publication.".to_string());
         }
-        if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || effective_ascii || flags.delete_source {
-            return Err("FTP staged upload requires a fresh binary copy.".to_string());
+        if !is_ftp_scheme(session.scheme()) || flags.resume || flags.append || flags.delete_source {
+            return Err("FTP staged upload requires a fresh copy without source deletion.".to_string());
         }
         let directory = remote_dest.rsplit_once('/').map(|(dir, _)| if dir.is_empty() { "/" } else { dir }).unwrap_or(".");
-        let input = tokio::fs::File::open(local_src).await.map_err(|e| format!("Cannot open local file '{src_label}': {e}"))?;
+        let (input, upload_size) = staged_upload_source(local_src, local_info.size, effective_ascii, flags.eol_override).await?;
         let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let req = TransferRequest { resume_offset: 0, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None };
-        let (bytes, stage) = session.upload_ftp_unique(directory, req, &mut reader, Some(local_info.size), progress).await.map_err(|e| e.to_string())?;
+        let (bytes, stage) = session.upload_ftp_unique(directory, req, &mut reader, Some(upload_size), progress).await.map_err(|e| e.to_string())?;
         if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) {
             return Err(format!("Cancelled before publication; temporary FTP file '{stage}' remains."));
         }
-        if bytes != local_info.size { return Err(format!("Source size changed; temporary FTP file '{stage}' remains.")); }
+        if bytes != upload_size { return Err(format!("Source size changed; temporary FTP file '{stage}' remains.")); }
         let current = session.stat(remote_dest).await.map_err(|e| format!("Cannot check FTP destination; temporary file '{stage}' remains: {e}"))?;
         if current.as_ref().is_some_and(|e| e.is_dir || e.is_symlink || flags.no_clobber) {
             return Err(format!("FTP destination changed; temporary file '{stage}' remains."));
