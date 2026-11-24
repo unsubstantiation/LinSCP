@@ -2364,7 +2364,7 @@
       "id": "transfer.filepart-resume",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Interrupted uploads/downloads stage in .filepart and continue there rather than splicing the final destination.",
+      "notes": "Interrupted uploads and downloads stage in a `.filepart` file beside the destination and continue there rather than splicing the final destination: the bytes that arrived are kept, the resumed transfer continues them, and the file is published onto the destination only when the whole file has arrived.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
         "crates/linscp-engine/src/script.rs"
@@ -2374,23 +2374,31 @@
           "test_interrupted_get_stages_in_filepart_and_resumes",
           "test_interrupted_put_stages_in_filepart_and_resumes",
           "test_staged_resume_continues_the_staging_file_not_the_old_final"
+        ],
+        "engine-sftp": [
+          "test_staged_resume_continues_the_staging_file_not_the_old_final",
+          "test_a_staged_download_publishes_only_the_whole_file"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-sftp"
+          "live-sftp",
+          "engine-sftp"
         ],
         "windows": [
-          "live-sftp"
+          "live-sftp",
+          "engine-sftp"
         ],
         "android": [
-          "live-sftp"
+          "live-sftp",
+          "engine-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which stages the bytes in the `.filepart` file, resumes that staging file rather than the old destination, and publishes the whole file onto the destination only when it has arrived.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
+        "Interrupt a transfer mid-flight and check that the staging file is what survives."
       ]
     },
     {
@@ -2588,7 +2596,7 @@
       "id": "sync.one-way",
       "area": "Synchronization",
       "status": "partial",
-      "notes": "Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server.",
+      "notes": "Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server; the same plan and upload run against the mock SFTP server.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/script.rs"
@@ -2596,20 +2604,27 @@
       "checks": {
         "live-dav": [
           "test_keepuptodate_reflects_local_files_on_the_remote_side"
+        ],
+        "engine-sftp": [
+          "test_synchronize_conflict_policy_and_keepuptodate",
+          "test_synchronize_filemask_prunes_excluded_subtrees"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "windows": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ],
         "android": [
-          "live-dav"
+          "live-dav",
+          "engine-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which mirrors the local tree onto the remote side and prunes the excluded subtrees from the plan.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -2895,7 +2910,7 @@
       "id": "sessions.proxy-settings",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials.",
+      "notes": "Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials. A proxy method the protocol cannot run, and a proxy without a host, are refused when they are set rather than dropped.",
       "source": [
         "crates/linscp-engine/src/session_store.rs"
       ],
@@ -2904,20 +2919,26 @@
           "test_a_socks5_proxy_carries_the_session",
           "test_a_stored_session_keeps_its_proxy",
           "test_http_connect_proxy_and_direct_isolation"
+        ],
+        "engine-script": [
+          "test_a_stored_session_keeps_its_proxy"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ],
         "windows": [
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ],
         "android": [
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which keeps the proxy a site stores and refuses a proxy method the protocol cannot run or one without a host.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -3146,7 +3167,7 @@
       "id": "security.proxy-isolation",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed.",
+      "notes": "SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed. A proxy the protocol cannot run never reaches the transport.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-proto/src/webdav.rs"
@@ -3158,23 +3179,29 @@
         ],
         "live-dav": [
           "test_the_curl_path_goes_through_a_proxy"
+        ],
+        "engine-script": [
+          "test_a_stored_session_keeps_its_proxy"
         ]
       },
       "verified_on": {
         "linux": [
           "live-dav",
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ],
         "windows": [
           "live-dav",
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ],
         "android": [
           "live-dav",
-          "live-sftp"
+          "live-sftp",
+          "engine-script"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav and live-sftp need a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-dav and live-sftp need a `linscp` binary this repo does not build. Runnable residue: engine-script, which refuses a proxy method the protocol cannot run and a proxy without a host.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."

@@ -38,14 +38,15 @@ The ASCII mode converts the line endings, the binary mode keeps the bytes, and t
 
 **Area:** Transfers · **Status:** partial
 
-Interrupted uploads/downloads stage in .filepart and continue there rather than splicing the final destination.
+Interrupted uploads and downloads stage in a `.filepart` file beside the destination and continue there rather than splicing the final destination: the bytes that arrived are kept, the resumed transfer continues them, and the file is published onto the destination only when the whole file has arrived.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which stages the bytes in the `.filepart` file, resumes that staging file rather than the old destination, and publishes the whole file onto the destination only when it has arrived.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Interrupt a transfer mid-flight and check that the staging file is what survives.
 
 ## transfer.resume-modes
 
@@ -91,9 +92,9 @@ curl-backed downloads and uploads stream curl's progress meter into the byte-pro
 
 **Area:** Synchronization · **Status:** partial
 
-Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server.
+Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server; the same plan and upload run against the mock SFTP server.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which mirrors the local tree onto the remote side and prunes the excluded subtrees from the plan.
 
 **Acceptance criteria:**
 
@@ -144,9 +145,9 @@ Stored site passwords are encrypted under sessions.key and shared between the CL
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials.
+Upstream proxy setting names are applied by open and stored with a site; both SOCKS5 and HTTP CONNECT proxies carry live SFTP sessions and refuse bad credentials. A proxy method the protocol cannot run, and a proxy without a host, are refused when they are set rather than dropped.
 
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which keeps the proxy a site stores and refuses a proxy method the protocol cannot run or one without a host.
 
 **Acceptance criteria:**
 
@@ -183,9 +184,9 @@ Agent authentication explains itself when there is no agent to ask. The auth cha
 
 **Area:** Security/authentication · **Status:** partial
 
-SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed.
+SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed. A proxy the protocol cannot run never reaches the transport.
 
-**Next:** No runnable suite evidences this: live-dav and live-sftp need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav and live-sftp need a `linscp` binary this repo does not build. Runnable residue: engine-script, which refuses a proxy method the protocol cannot run and a proxy without a host.
 
 **Acceptance criteria:**
 

@@ -449,6 +449,94 @@ async fn test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port() {
     assert_eq!(tunnel.local_port, 1080, "the local port survives");
 }
 
+/// The upstream case name is `test_a_stored_session_keeps_its_proxy`:
+/// the proxy a site is saved with is the one the site reads back, and a
+/// proxy the protocol cannot run is refused rather than quietly dropped.
+#[tokio::test]
+async fn test_a_stored_session_keeps_its_proxy() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let config_dir = tmp.path().to_path_buf();
+    let mut interp = ScriptInterpreter::new(test_config(&config_dir), in_memory_logger());
+
+    let (ok, out) = run_line(
+        &mut interp,
+        "savesession proxy-site -protocol=sftp -host=target.example.com -username=alice \
+         -rawsettings ProxyMethod=SOCKS5 ProxyHost=proxy.example ProxyPort=1080 \
+         ProxyUserName=bob",
+    )
+    .await;
+    assert!(ok, "the site with its proxy is stored: {out}");
+
+    let stored = config_dir.join("sessions.ini");
+    let text = std::fs::read_to_string(&stored).expect("the store is readable");
+    assert!(
+        text.contains("proxy_method=SOCKS5"),
+        "the proxy method is stored: {text}"
+    );
+    assert!(
+        text.contains("proxy_host=proxy.example"),
+        "the proxy host is stored: {text}"
+    );
+    assert!(text.contains("proxy_port=1080"), "the proxy port is stored: {text}");
+    assert!(
+        text.contains("proxy_username=bob"),
+        "the proxy user is stored: {text}"
+    );
+
+    let store = SessionStore::load_from_dir(&config_dir, &DefaultOsVault)
+        .expect("the store loads");
+    let site = store.find("proxy-site").expect("the stored site is found").clone();
+    let spec = site_spec_from_stored(&site).expect("the stored site becomes a specification");
+    assert_eq!(
+        spec.raw_fields.get("proxy_method").map(String::as_str),
+        Some("SOCKS5"),
+        "the proxy method survives the round trip"
+    );
+    assert_eq!(
+        spec.raw_fields.get("proxy_host").map(String::as_str),
+        Some("proxy.example"),
+        "the proxy host survives the round trip"
+    );
+    assert_eq!(
+        spec.raw_fields.get("proxy_port").map(String::as_str),
+        Some("1080"),
+        "the proxy port survives the round trip"
+    );
+    assert_eq!(
+        spec.raw_fields.get("proxy_username").map(String::as_str),
+        Some("bob"),
+        "the proxy user survives the round trip"
+    );
+    validate_session_settings(&spec).expect("the restored proxy is valid");
+
+    // A proxy the protocol cannot run is refused at the point it is set,
+    // not accepted and ignored later.
+    let (ok, out) = run_line(
+        &mut interp,
+        "savesession dav-site -protocol=webdav -host=dav.example.com -username=alice \
+         -rawsettings ProxyMethod=Telnet ProxyHost=proxy.example ProxyPort=1080",
+    )
+    .await;
+    assert!(!ok, "a telnet proxy on a curl-backed protocol is refused: {out}");
+    assert!(
+        out.to_lowercase().contains("telnet"),
+        "the refusal names the proxy method: {out}"
+    );
+
+    // A proxy method without a host is refused as well.
+    let (ok, out) = run_line(
+        &mut interp,
+        "savesession nohost-site -protocol=sftp -host=target.example.com -username=alice \
+         -rawsettings ProxyMethod=SOCKS5",
+    )
+    .await;
+    assert!(!ok, "a proxy without a host is refused: {out}");
+    assert!(
+        out.contains("ProxyHost"),
+        "the refusal names the missing setting: {out}"
+    );
+}
+
 /// The upstream case name is `test_tunnel_settings_validation_is_fail_closed`:
 /// a jump host that is not named, or a name that cannot be a host, is
 /// refused before any connection is attempted.
