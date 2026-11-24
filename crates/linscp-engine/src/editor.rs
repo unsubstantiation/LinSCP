@@ -427,8 +427,11 @@ mod tests {
         let remote = remote_file(&root, "note.txt", b"original\n");
         let opts = EditOptions {
             // The editor writes the copy a moment after it starts and then
-            // stays open, so the save can only be seen by the monitor.
-            editor: "sh -c 'sleep 0.3; printf edited > \"$1\"; sleep 5' editor".to_string(),
+            // stays open, so the save can only be seen by the monitor. The
+            // write goes through a rename, so the monitor never reads a
+            // half-written copy.
+            editor: "sh -c 'sleep 0.3; printf edited > \"$1.part\"; mv \"$1.part\" \"$1\"; sleep 5' editor"
+                .to_string(),
             monitor: true,
             monitor_passes: 1,
             monitor_interval_ms: 25,
@@ -463,8 +466,15 @@ mod tests {
     async fn edit_monitor_refuses_to_overwrite_a_file_that_changed_on_the_server() {
         let root = scratch("monitor-conflict");
         let remote = remote_file(&root, "note.txt", b"original\n");
+        // The server changes the file first and the editor saves afterwards,
+        // so the monitor cannot see the save before the change: the order
+        // is what makes the refusal a fact rather than a race. Both writes
+        // go through a rename, so neither is ever read half-written.
         let editor = format!(
-            "sh -c 'sleep 0.3; printf edited > \"$1\"; printf concurrent > \"{}\"; sleep 5' editor",
+            "sh -c 'printf concurrent > \"{}.part\"; mv \"{}.part\" \"{}\"; sleep 0.3; \
+             printf edited > \"$1.part\"; mv \"$1.part\" \"$1\"; sleep 5' editor",
+            remote.to_string_lossy(),
+            remote.to_string_lossy(),
             remote.to_string_lossy()
         );
         let opts = EditOptions {
