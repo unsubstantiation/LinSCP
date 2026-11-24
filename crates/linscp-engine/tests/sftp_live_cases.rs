@@ -1326,3 +1326,42 @@ async fn test_verified_resume_refuses_a_changed_sftp_prefix() {
     assert_eq!(fs::read(&existing_checkpoint).unwrap(), &changed[..8]);
     sftp.close().await.unwrap();
 }
+
+/// Legacy SFTP resume must compare a local prefix before modifying a stage
+/// or adopting a partial destination, even when remote metadata matches.
+#[tokio::test]
+async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
+    use linscp_engine::presets::ResumeSupportMode;
+    use linscp_engine::transfer::{download_single_file, TransferFlags};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x81, 0x82).await;
+    seed_remote(&sftp, "/changed.bin", b"new-data-1234567", Some(1_700_000_000)).await;
+    let mut logger = in_memory_logger();
+    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+
+    let dest = tmp.path().join("staged.bin");
+    let stage = tmp.path().join("staged.bin.filepart");
+    fs::write(&dest, b"old final").unwrap();
+    fs::write(&stage, b"old-data").unwrap();
+    let error = download_single_file(&*sftp, "/changed.bin", None, &dest, &flags, &mut logger, None).await.unwrap_err();
+    assert!(error.contains("do not match"), "{error}");
+    assert_eq!(fs::read(&dest).unwrap(), b"old final");
+    assert_eq!(fs::read(&stage).unwrap(), b"old-data");
+
+    // When no stage exists, the legacy path may adopt the destination as a
+    // partial. A mismatch must be detected before it is renamed or changed.
+    let adopted = tmp.path().join("adopted.bin");
+    let adopted_stage = tmp.path().join("adopted.bin.filepart");
+    fs::write(&adopted, b"old-data").unwrap();
+    assert!(download_single_file(&*sftp, "/changed.bin", None, &adopted, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&adopted).unwrap(), b"old-data");
+    assert!(!adopted_stage.exists());
+
+    // A complete or oversized pre-existing stage is not ours to delete.
+    fs::write(&stage, b"a staging file larger than the remote").unwrap();
+    assert!(download_single_file(&*sftp, "/changed.bin", None, &dest, &flags, &mut logger, None).await.is_err());
+    assert_eq!(fs::read(&stage).unwrap(), b"a staging file larger than the remote");
+    assert_eq!(fs::read(&dest).unwrap(), b"old final");
+    sftp.close().await.unwrap();
+}
