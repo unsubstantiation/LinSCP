@@ -21,10 +21,14 @@ jobs:
         run: |
           set +e
           export CARGO_TERM_COLOR=never
-          cargo test -p linscp-engine --test sftp_live_cases test_exclusive_ascii_and_automatic_uploads -- --nocapture > test-output.txt 2>&1
+          cargo test -p linscp-engine --test sftp_live_cases -- --nocapture > test-output.txt 2>&1
           status=$?
           if [ "$status" -eq 0 ]; then
             cargo test -p linscp-engine --test conditional_ascii_upload -- --nocapture >> test-output.txt 2>&1
+            status=$?
+          fi
+          if [ "$status" -eq 0 ]; then
+            cargo test -p linscp-proto --test ssh_sftp_scp_tunnel -- --nocapture >> test-output.txt 2>&1
             status=$?
           fi
           tail -100 test-output.txt
