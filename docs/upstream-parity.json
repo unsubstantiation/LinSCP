@@ -2341,7 +2341,8 @@
       "checks": {
         "engine-sftp": [
           "test_ascii_and_automatic_downloads_convert_line_endings",
-          "test_exclusive_ascii_and_automatic_uploads"
+          "test_exclusive_ascii_and_automatic_uploads",
+          "test_staged_ascii_upload_converts_before_publish"
         ],
         "live-dav": [
           "test_transfer_preset_drives_ascii_and_loads_with_the_site"
@@ -2366,11 +2367,11 @@
           "live-dav"
         ]
       },
-      "gap": "Linux and Windows CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Android-device behavior has not been exercised; live upstream WebDAV tests require a CLI binary this GUI-only build does not ship. The new SFTP staged-ASCII case still needs CI validation; FTP staged-ASCII remains unsupported.",
+      "gap": "Linux and Windows CI exercised SFTP exclusive and acknowledged staged ASCII uploads and WebDAV ETag-conditional uploads, including conflict refusals. FTP staged ASCII remains unsupported, and Android-device behavior has not been exercised. The upstream live WebDAV suite requires a CLI binary this GUI-only build does not ship.",
       "acceptance": [
+        "Implement and test FTP staged ASCII upload without weakening publication guards.",
         "Exercise Android-device behavior where applicable.",
-        "Cover any remaining desired live-server behavior without depending on the removed CLI.",
-        "Run the staged SFTP ASCII test in CI and cover FTP staged ASCII before claiming that behavior."
+        "Cover any remaining desired live-server behavior without depending on the removed CLI."
       ]
     },
     {
