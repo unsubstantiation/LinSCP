@@ -16,7 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use linscp_proto::ftp::{FtpConnectConfig, FtpSession};
-use linscp_proto::tls::TlsSettings;
+use linscp_proto::tls::{TlsSettings, TlsVersion};
 use linscp_proto::{download_bytes, upload_bytes, RemoteSession, TransferRequest};
 use linscp_types::ProtocolScheme;
 use rustls::ServerConfig;
@@ -790,4 +790,95 @@ async fn explicit_ftpes_and_implicit_ftps_enforce_spki_pinning_on_control_and_da
         b"Implicit FTPS payload"
     );
     ftps.close().await.unwrap();
+}
+
+/// The TLS version window has to be the client's decision, not the server's:
+/// upstream's `MinTlsVersion`/`MaxTlsVersion` settings become the bounds of
+/// the handshake, so a client capped below the server's floor is refused and a
+/// client that asks for the server's own version gets in.
+#[tokio::test]
+async fn ftp_tls_version_bounds_are_enforced_on_the_control_connection() {
+    let pki = common::generate_test_tls_pki(9);
+    // A server that speaks TLS 1.3 only: anything below it has to fail.
+    let server_config = ServerConfig::builder_with_provider(Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_protocol_versions(&[rustls::version::TLS13])
+    .expect("server TLS versions")
+    .with_no_client_auth()
+    .with_single_cert(
+        vec![rustls::pki_types::CertificateDer::from(
+            pki.server_cert_der.clone(),
+        )],
+        rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(pki.server_key_der.clone()),
+        ),
+    )
+    .expect("build rustls ServerConfig");
+    let port = start_mock_ftp_server(
+        true,
+        Some(Arc::new(server_config)),
+        ListDialect::Mlsd,
+        false,
+    )
+    .await;
+
+    let connect_with = |min: Option<TlsVersion>, max: Option<TlsVersion>| {
+        let ca_cert_pem = pki.ca_cert_pem.clone();
+        let port = port;
+        async move {
+            FtpSession::connect(
+                FtpConnectConfig {
+                    scheme: ProtocolScheme::Ftps,
+                    host: "127.0.0.1".to_string(),
+                    port,
+                    username: "ftpuser".to_string(),
+                    password: Some(Zeroizing::new("secret".to_string())),
+                    tls: TlsSettings {
+                        ca_cert_pem: Some(ca_cert_pem),
+                        min_version: min,
+                        max_version: max,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+                0,
+            )
+            .await
+        }
+    };
+
+    // A client that caps itself at TLS 1.2 cannot reach a TLS 1.3-only server.
+    let too_old = connect_with(None, Some(TlsVersion::Tls12)).await;
+    assert!(
+        too_old.is_err(),
+        "a client capped at TLS 1.2 must not reach a TLS 1.3-only server"
+    );
+
+    // A client that names TLS 1.3 on both ends gets in.
+    let exact = connect_with(Some(TlsVersion::Tls13), Some(TlsVersion::Tls13)).await;
+    let mut exact = exact.expect("a client asking for TLS 1.3 must reach a TLS 1.3 server");
+    upload_bytes(
+        &exact,
+        "/versioned.txt",
+        b"TLS 1.3 payload",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        download_bytes(&exact, "/versioned.txt", TransferRequest::default())
+            .await
+            .unwrap(),
+        b"TLS 1.3 payload"
+    );
+    exact.close().await.unwrap();
+
+    // An unbounded client is still allowed to negotiate down to the server.
+    let unbounded = connect_with(None, None).await;
+    assert!(
+        unbounded.is_ok(),
+        "a client without version bounds must still reach the server"
+    );
 }

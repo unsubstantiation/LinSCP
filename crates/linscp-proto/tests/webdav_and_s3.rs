@@ -264,6 +264,14 @@ async fn handle_mock_dav(
             if pre_code != StatusCode::OK {
                 return pre_code.into_response();
             }
+            // A collection that still holds members is not removed: a server
+            // that emptied it first would leave a half-deleted tree behind.
+            if guard.items.get(&path).is_some_and(|r| r.is_dir) {
+                let prefix = format!("{path}/");
+                if guard.items.keys().any(|k| k.starts_with(&prefix)) {
+                    return StatusCode::CONFLICT.into_response();
+                }
+            }
             if guard.items.remove(&path).is_some() {
                 StatusCode::NO_CONTENT.into_response()
             } else {
@@ -504,11 +512,19 @@ async fn webdavs_spki_pinning_locks_etags_and_properties_round_trip() {
     .await
     .unwrap_err();
     assert!(precond_err.to_string().contains("412"));
+    // The refusal left the bytes exactly as they were.
+    assert_eq!(
+        download_bytes(&dav, "project/spec.txt", TransferRequest::default())
+            .await
+            .unwrap(),
+        body_v2,
+        "a refused write must not change the file"
+    );
 
     dav.set_etag_precondition(
         "project/spec.txt",
         Some(DavEtagPrecondition {
-            if_match: Some(current_etag),
+            if_match: Some(current_etag.clone()),
             if_none_match: None,
         }),
     )
@@ -516,6 +532,44 @@ async fn webdavs_spki_pinning_locks_etags_and_properties_round_trip() {
     upload_bytes(&dav, "project/spec.txt", body_v2, TransferRequest::default())
         .await
         .unwrap();
+
+    // If-None-Match writes where the version differs and is refused where it
+    // does not: that is the opposite of If-Match.
+    let written_etag = dav
+        .get_etag("project/spec.txt")
+        .await
+        .unwrap()
+        .expect("etag present");
+    dav.set_etag_precondition(
+        "project/spec.txt",
+        Some(DavEtagPrecondition {
+            if_match: None,
+            if_none_match: Some(written_etag),
+        }),
+    )
+    .await;
+    let same_version = upload_bytes(
+        &dav,
+        "project/spec.txt",
+        b"should fail 412 as well",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap_err();
+    assert!(same_version.to_string().contains("412"));
+
+    dav.set_etag_precondition(
+        "project/spec.txt",
+        Some(DavEtagPrecondition {
+            if_match: None,
+            if_none_match: Some("\"a-different-etag\"".to_string()),
+        }),
+    )
+    .await;
+    upload_bytes(&dav, "project/spec.txt", body_v2, TransferRequest::default())
+        .await
+        .unwrap();
+
     dav.set_etag_precondition("project/spec.txt", None).await;
     dav.unlock("project/spec.txt", None).await.unwrap();
 
@@ -542,6 +596,17 @@ struct MockS3VersionEntry {
     data: Vec<u8>,
 }
 
+/// How the mock answers a `ListObjectsV2` request that claims to be
+/// truncated. A real endpoint either names the next page or admits the
+/// listing is over; a client that cannot tell must refuse the listing rather
+/// than return half of it.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PaginationMode {
+    Normal,
+    TruncatedWithoutToken,
+    RepeatedToken,
+}
+
 struct MockS3State {
     buckets: HashMap<String, BTreeMap<String, Vec<MockS3VersionEntry>>>,
     multiparts: HashMap<String, BTreeMap<u32, (String, Vec<u8>)>>,
@@ -550,6 +615,20 @@ struct MockS3State {
     fail_part_2_once: AtomicBool,
     part_1_uploads: AtomicUsize,
     last_create_bucket_xml: String,
+    /// The headers of the last object write, so a case can prove that the
+    /// configured `x-amz-*` headers really reached the server.
+    last_write_headers: BTreeMap<String, String>,
+    /// The SigV4 `Authorization` header of that write, so a case can prove
+    /// those headers were *signed* rather than merely sent.
+    last_authorization: String,
+    pagination_mode: PaginationMode,
+    /// When `true`, `CompleteMultipartUpload` answers 200 with an error
+    /// document instead of a result: the failure a server hides inside a
+    /// successful status.
+    complete_reports_error: AtomicBool,
+    /// The byte ranges the server was asked to copy, so a case can prove a
+    /// large copy really went through multipart `UploadPartCopy`.
+    copy_ranges: Vec<String>,
 }
 
 impl MockS3State {
@@ -564,6 +643,11 @@ impl MockS3State {
             fail_part_2_once: AtomicBool::new(true),
             part_1_uploads: AtomicUsize::new(0),
             last_create_bucket_xml: String::new(),
+            last_write_headers: BTreeMap::new(),
+            last_authorization: String::new(),
+            pagination_mode: PaginationMode::Normal,
+            complete_reports_error: AtomicBool::new(false),
+            copy_ranges: Vec::new(),
         }
     }
 }
@@ -731,6 +815,23 @@ async fn handle_mock_s3(
             for cp in prefixes {
                 xml.push_str(&format!("<CommonPrefixes><Prefix>{cp}</Prefix></CommonPrefixes>"));
             }
+            // A truncated listing has to name the page that follows, and it
+            // must not name the page it was just given.
+            match guard.pagination_mode {
+                PaginationMode::Normal => {}
+                PaginationMode::TruncatedWithoutToken => {
+                    xml = xml.replace(
+                        "<IsTruncated>false</IsTruncated>",
+                        "<IsTruncated>true</IsTruncated>",
+                    );
+                }
+                PaginationMode::RepeatedToken => {
+                    xml = xml.replace(
+                        "<IsTruncated>false</IsTruncated>",
+                        "<IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken>",
+                    );
+                }
+            }
             xml.push_str("</ListBucketResult>");
             return (StatusCode::OK, xml).into_response();
         }
@@ -739,6 +840,20 @@ async fn handle_mock_s3(
     // Multipart upload endpoints
     if method == Method::POST && qmap.contains_key("uploads") {
         let mut guard = state.lock().await;
+        // `CreateMultipartUpload` is an object write too: the configured
+        // headers have to reach it.
+        let mut recorded = BTreeMap::new();
+        for (name, value) in headers.iter() {
+            recorded.insert(
+                name.as_str().to_ascii_lowercase(),
+                value.to_str().unwrap_or("").to_string(),
+            );
+        }
+        guard.last_authorization = recorded
+            .get("authorization")
+            .cloned()
+            .unwrap_or_default();
+        guard.last_write_headers = recorded;
         let uid = format!("upload-{}", guard.next_upload);
         guard.next_upload += 1;
         guard.multiparts.insert(uid.clone(), BTreeMap::new());
@@ -797,6 +912,12 @@ async fn handle_mock_s3(
                         }
                     }
                 }
+                if let Some(range) = headers
+                    .get("x-amz-copy-source-range")
+                    .and_then(|v| v.to_str().ok())
+                {
+                    guard.copy_ranges.push(range.to_string());
+                }
                 if let Some(parts) = guard.multiparts.get_mut(uid) {
                     parts.insert(pnum, (etag.clone(), src_bytes));
                 }
@@ -810,6 +931,16 @@ async fn handle_mock_s3(
         }
         if method == Method::POST {
             let mut guard = state.lock().await;
+            if guard.complete_reports_error.swap(false, Ordering::SeqCst) {
+                // A failure hidden inside a successful status: the client has
+                // to read the document, not the status line.
+                return (
+                    StatusCode::OK,
+                    "<Error><Code>InternalError</Code>\
+                     <Message>Simulated failure reported with a successful status</Message></Error>",
+                )
+                    .into_response();
+            }
             let Some(parts) = guard.multiparts.remove(uid) else {
                 return StatusCode::NOT_FOUND.into_response();
             };
@@ -846,6 +977,20 @@ async fn handle_mock_s3(
     match method {
         Method::PUT => {
             let mut guard = state.lock().await;
+            // Record what the write actually carried: the configured
+            // `x-amz-*` headers and the signature that covers them.
+            let mut recorded = BTreeMap::new();
+            for (name, value) in headers.iter() {
+                recorded.insert(
+                    name.as_str().to_ascii_lowercase(),
+                    value.to_str().unwrap_or("").to_string(),
+                );
+            }
+            guard.last_authorization = recorded
+                .get("authorization")
+                .cloned()
+                .unwrap_or_default();
+            guard.last_write_headers = recorded;
             let data = if let Some(copy_src) =
                 headers.get("x-amz-copy-source").and_then(|v| v.to_str().ok())
             {
@@ -1209,4 +1354,493 @@ async fn s3_sigv4_resumable_multipart_and_object_versioning_succeed() {
     );
     s3_eu.close().await.unwrap();
     s3.close().await.unwrap();
+}
+
+/// The S3 raw settings are not decoration: they are the headers the object
+/// write has to carry, and a header that is sent but not signed is not
+/// covered by the signature. This drives a client configured with the
+/// upstream header set and reads back what the server actually received.
+#[tokio::test]
+async fn s3_object_write_headers_are_signed_and_sent_on_uploads_and_copies() {
+    let pki = common::generate_test_tls_pki(4);
+    let state = Arc::new(Mutex::new(MockS3State::new()));
+    let router = Router::new()
+        .fallback(handle_mock_s3)
+        .with_state(Arc::clone(&state));
+    let port = spawn_https_router(router, &pki).await;
+
+    let mut object_write_headers = BTreeMap::new();
+    for (name, value) in [
+        ("x-amz-storage-class", "STANDARD_IA"),
+        ("x-amz-acl", "private"),
+        ("x-amz-server-side-encryption", "aws:kms"),
+        (
+            "x-amz-server-side-encryption-aws-kms-key-id",
+            "key-1",
+        ),
+        ("x-amz-request-payer", "requester"),
+        ("x-amz-meta-team", "storage-core"),
+    ] {
+        object_write_headers.insert(name.to_string(), value.to_string());
+    }
+
+    let s3 = S3Session::connect(
+        S3ConnectConfig {
+            use_https: true,
+            host: "localhost".to_string(),
+            port,
+            region: Some("us-east-1".to_string()),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: Zeroizing::new(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            path_style: true,
+            object_write_headers: object_write_headers.clone(),
+            tls: TlsSettings {
+                pinned_public_key: Some(pki.server_spki_pin.clone()),
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    upload_bytes(
+        &s3,
+        "/alpha-bucket/releases/options.txt",
+        b"storage class",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+
+    {
+        let guard = state.lock().await;
+        for (name, value) in &object_write_headers {
+            assert_eq!(
+                guard.last_write_headers.get(name).map(String::as_str),
+                Some(value.as_str()),
+                "{name} must reach the server on an upload"
+            );
+        }
+        let signed: Vec<&str> = guard
+            .last_authorization
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|rest| rest.split(',').next())
+            .expect("the Authorization header carries SignedHeaders")
+            .split(';')
+            .collect();
+        for name in object_write_headers.keys() {
+            assert!(
+                signed.contains(&name.as_str()),
+                "{name} must be covered by the signature, not merely sent: {signed:?}"
+            );
+        }
+    }
+
+    // The same headers have to reach a server-side copy.
+    s3.copy_file(
+        "/alpha-bucket/releases/options.txt",
+        "/alpha-bucket/releases/options-copy.txt",
+    )
+    .await
+    .unwrap();
+
+    {
+        let guard = state.lock().await;
+        for (name, value) in &object_write_headers {
+            assert_eq!(
+                guard.last_write_headers.get(name).map(String::as_str),
+                Some(value.as_str()),
+                "{name} must reach the server on a copy"
+            );
+        }
+    }
+
+    s3.close().await.unwrap();
+}
+
+/// A name may hold spaces and the characters a URL treats as structure. The
+/// client has to encode them on the way out and decode them on the way back,
+/// so what the server stores is what the user typed.
+#[tokio::test]
+async fn dav_paths_with_spaces_and_reserved_characters_round_trip() {
+    let pki = common::generate_test_tls_pki(5);
+    let store = Arc::new(Mutex::new(MockDavStore::new()));
+    let router = Router::new()
+        .fallback(handle_mock_dav)
+        .with_state(Arc::clone(&store));
+    let port = spawn_https_router(router, &pki).await;
+
+    let dav = WebDavSession::connect(
+        WebDavConnectConfig {
+            scheme: ProtocolScheme::Webdavs,
+            host: "localhost".to_string(),
+            port,
+            base_path: "/dav".to_string(),
+            tls: TlsSettings {
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    dav.mkdir("odd names").await.unwrap();
+
+    let names = [
+        "plain name.txt",
+        "100% done.txt",
+        "what?.txt",
+        "hash#.txt",
+        "a&b c.txt",
+    ];
+    for name in names {
+        let path = format!("odd names/{name}");
+        upload_bytes(&dav, &path, name.as_bytes(), TransferRequest::default())
+            .await
+            .unwrap_or_else(|e| panic!("uploading {name} failed: {e}"));
+        let bytes = download_bytes(&dav, &path, TransferRequest::default())
+            .await
+            .unwrap_or_else(|e| panic!("downloading {name} failed: {e}"));
+        assert_eq!(bytes, name.as_bytes(), "the bytes of {name} must survive");
+    }
+
+    let items = dav.list_dir("odd names").await.unwrap();
+    let mut listed: Vec<String> = items.iter().map(|i| i.name.clone()).collect();
+    listed.sort();
+    let mut expected: Vec<String> = names.iter().map(|n| n.to_string()).collect();
+    expected.sort();
+    assert_eq!(
+        listed, expected,
+        "the listing must show the names as they were written"
+    );
+
+    dav.close().await.unwrap();
+}
+
+/// A collection that still holds a member is refused, and the refusal does
+/// not empty it: a server that removed the members first would leave a
+/// half-deleted tree behind. A path the server does not have is told apart
+/// from an empty one.
+#[tokio::test]
+async fn dav_a_non_empty_collection_is_refused_and_a_missing_path_is_told_apart() {
+    let pki = common::generate_test_tls_pki(6);
+    let store = Arc::new(Mutex::new(MockDavStore::new()));
+    let router = Router::new()
+        .fallback(handle_mock_dav)
+        .with_state(Arc::clone(&store));
+    let port = spawn_https_router(router, &pki).await;
+
+    let dav = WebDavSession::connect(
+        WebDavConnectConfig {
+            scheme: ProtocolScheme::Webdavs,
+            host: "localhost".to_string(),
+            port,
+            base_path: "/dav".to_string(),
+            tls: TlsSettings {
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    dav.mkdir("full").await.unwrap();
+    upload_bytes(
+        &dav,
+        "full/child.txt",
+        b"child",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+
+    let refused = dav
+        .remove_dir("full")
+        .await
+        .expect_err("a collection that still holds a member must be refused");
+    assert!(
+        refused.to_string().contains("not empty"),
+        "the refusal must name the reason: {refused}"
+    );
+    let items = dav.list_dir("full").await.unwrap();
+    assert_eq!(
+        items.len(),
+        1,
+        "the refusal must not have emptied the collection"
+    );
+    assert_eq!(items[0].name, "child.txt");
+
+    // A path the server does not have is absent, not empty and not an error.
+    assert!(
+        dav.stat("nowhere.txt").await.unwrap().is_none(),
+        "a missing path must be reported as absent"
+    );
+
+    dav.remove_file("full/child.txt").await.unwrap();
+    dav.remove_dir("full").await.unwrap();
+    dav.close().await.unwrap();
+}
+
+/// A listing that says it is truncated has to name the page that follows,
+/// and it must not name the page it was just given. Either mistake is an
+/// error rather than a directory that quietly shows half of its contents.
+#[tokio::test]
+async fn s3_a_truncated_listing_without_a_usable_continuation_token_is_an_error() {
+    let pki = common::generate_test_tls_pki(7);
+    let state = Arc::new(Mutex::new(MockS3State::new()));
+    let router = Router::new()
+        .fallback(handle_mock_s3)
+        .with_state(Arc::clone(&state));
+    let port = spawn_https_router(router, &pki).await;
+
+    let s3 = S3Session::connect(
+        S3ConnectConfig {
+            use_https: true,
+            host: "localhost".to_string(),
+            port,
+            region: Some("us-east-1".to_string()),
+            access_key_id: "AKIAIOSFODNN7EXAMPLE".to_string(),
+            secret_access_key: Zeroizing::new(
+                "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+            ),
+            path_style: true,
+            tls: TlsSettings {
+                pinned_public_key: Some(pki.server_spki_pin.clone()),
+                ca_cert_pem: Some(pki.ca_cert_pem.clone()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        None,
+        0,
+    )
+    .await
+    .unwrap();
+
+    upload_bytes(
+        &s3,
+        "/alpha-bucket/releases/changelog.txt",
+        b"Release 1.0 notes",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+
+    state.lock().await.pagination_mode = PaginationMode::TruncatedWithoutToken;
+    let without_token = s3
+        .list_dir("/alpha-bucket/releases")
+        .await
+        .expect_err("a truncated listing without a continuation token must be an error");
+    assert!(
+        without_token.to_string().contains("no continuation token"),
+        "the error must name the reason: {without_token}"
+    );
+
+    state.lock().await.pagination_mode = PaginationMode::RepeatedToken;
+    let repeated = s3
+        .list_dir("/alpha-bucket/releases")
+        .await
+        .expect_err("a listing that repeats its continuation token must be an error");
+    assert!(
+        repeated.to_string().contains("repeated a continuation token"),
+        "the error must name the reason: {repeated}"
+    );
+
+    state.lock().await.pagination_mode = PaginationMode::Normal;
+    let items = s3.list_dir("/alpha-bucket/releases").await.unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0].name, "changelog.txt");
+
+    s3.close().await.unwrap();
+}
+
+/// An interrupted multipart upload keeps the parts it finished in a local
+/// sidecar, so a later run resumes instead of starting over. A failure the
+/// server hides inside a successful status still fails the upload, and the
+/// unfinished upload is aborted rather than left behind. A copy of an object
+/// over the threshold goes through multipart `UploadPartCopy`, so the bytes
+/// never travel through this client.
+#[tokio::test]
+async fn s3_multipart_resumes_from_its_sidecar_and_refuses_a_hidden_completion_failure() {
+    let pki = common::generate_test_tls_pki(8);
+    let state = Arc::new(Mutex::new(MockS3State::new()));
+    let router = Router::new()
+        .fallback(handle_mock_s3)
+        .with_state(Arc::clone(&state));
+    let port = spawn_https_router(router, &pki).await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let sidecar_path = dir.path().join("resume.json");
+
+    let connect_with = |store: Arc<MultipartResumeStore>, key: &str| {
+        let ca_cert_pem = pki.ca_cert_pem.clone();
+        let pin = pki.server_spki_pin.clone();
+        let port = port;
+        async move {
+            S3Session::connect(
+                S3ConnectConfig {
+                    use_https: true,
+                    host: "localhost".to_string(),
+                    port,
+                    region: Some("us-east-1".to_string()),
+                    access_key_id: key.to_string(),
+                    secret_access_key: Zeroizing::new(
+                        "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".to_string(),
+                    ),
+                    path_style: true,
+                    multipart_threshold: 16 * 1024,
+                    min_part_size: 8 * 1024,
+                    abort_multipart_on_error: false,
+                    resume_store: store,
+                    tls: TlsSettings {
+                        pinned_public_key: Some(pin),
+                        ca_cert_pem: Some(ca_cert_pem),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+                None,
+                0,
+            )
+            .await
+        }
+    };
+
+    // Credentials the server does not accept are refused by the server.
+    let wrong_key = connect_with(
+        MultipartResumeStore::new_in_memory(),
+        "AKIAWRONGKEYEXAMPLE",
+    )
+    .await
+    .expect("the connection itself is established");
+    let refused = upload_bytes(
+        &wrong_key,
+        "/alpha-bucket/releases/refused.txt",
+        b"wrong credentials",
+        TransferRequest::default(),
+    )
+    .await
+    .expect_err("a request signed with the wrong key must be refused");
+    assert!(
+        refused.to_string().contains("SignatureDoesNotMatch"),
+        "the refusal must name the reason: {refused}"
+    );
+    wrong_key.close().await.unwrap();
+
+    let payload: Vec<u8> = (0..(20 * 1024)).map(|i| (i % 251) as u8).collect();
+
+    // The first attempt is interrupted after its first part.
+    let store = MultipartResumeStore::with_sidecar_file(sidecar_path.clone());
+    let s3 = connect_with(Arc::clone(&store), "AKIAIOSFODNN7EXAMPLE")
+        .await
+        .expect("connect");
+    let interrupted = upload_bytes(
+        &s3,
+        "/alpha-bucket/releases/bundle.bin",
+        &payload,
+        TransferRequest::default(),
+    )
+    .await;
+    assert!(interrupted.is_err(), "the interrupted upload must fail");
+    assert_eq!(
+        state.lock().await.part_1_uploads.load(Ordering::SeqCst),
+        1,
+        "the first part was uploaded once"
+    );
+    assert!(
+        sidecar_path.exists(),
+        "the finished part must be kept in a local sidecar"
+    );
+
+    // A later run, with a store built over that sidecar, resumes the upload.
+    let resumed_store = MultipartResumeStore::with_sidecar_file(sidecar_path.clone());
+    let resumed = connect_with(Arc::clone(&resumed_store), "AKIAIOSFODNN7EXAMPLE")
+        .await
+        .expect("connect");
+    upload_bytes(
+        &resumed,
+        "/alpha-bucket/releases/bundle.bin",
+        &payload,
+        TransferRequest::default(),
+    )
+    .await
+    .expect("the resumed upload succeeds");
+    assert_eq!(
+        state.lock().await.part_1_uploads.load(Ordering::SeqCst),
+        1,
+        "the resumed upload must not send the first part again"
+    );
+    let reassembled = download_bytes(
+        &resumed,
+        "/alpha-bucket/releases/bundle.bin",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(reassembled, payload);
+
+    // A failure the server reports inside a successful status still fails.
+    state.lock().await.complete_reports_error = true;
+    let hidden = upload_bytes(
+        &resumed,
+        "/alpha-bucket/releases/hidden-failure.bin",
+        &payload,
+        TransferRequest::default(),
+    )
+    .await;
+    assert!(
+        hidden.is_err(),
+        "a completion error inside a successful status must fail the upload"
+    );
+    assert!(
+        state.lock().await.multiparts.is_empty(),
+        "the failed multipart upload must be aborted, not left behind"
+    );
+
+    // A copy of an object over the threshold is a server-side multipart copy.
+    upload_bytes(
+        &resumed,
+        "/alpha-bucket/releases/large.bin",
+        &payload,
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+    resumed
+        .copy_file(
+            "/alpha-bucket/releases/large.bin",
+            "/alpha-bucket/releases/large-copy.bin",
+        )
+        .await
+        .expect("a large copy succeeds");
+    let ranges = state.lock().await.copy_ranges.clone();
+    assert!(
+        !ranges.is_empty(),
+        "a copy of an object over the threshold must use multipart UploadPartCopy"
+    );
+    let copied = download_bytes(
+        &resumed,
+        "/alpha-bucket/releases/large-copy.bin",
+        TransferRequest::default(),
+    )
+    .await
+    .unwrap();
+    assert_eq!(copied, payload, "the copy must be byte-exact");
+
+    resumed.close().await.unwrap();
 }

@@ -14,7 +14,7 @@ jobs:
     name: Android unsigned check
     if: github.ref != 'refs/heads/master'
     runs-on: ubuntu-24.04
-    timeout-minutes: 45
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
 
@@ -72,13 +72,12 @@ jobs:
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
 
-      - name: Exercise Android SAF, Keystore, share export and tunnel Rust unit tests
+      - name: Exercise the Rust workspace test suites
         run: |
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform saf_ -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform android_keystore -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-proto tunnel -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
-          python3 tools/run_cargo_ci.py cargo test -p linscp-service share_export -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-proto -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
       - name: Check the Android application ID and signing configuration
         run: |
@@ -131,7 +130,7 @@ jobs:
     name: Signed Android release APK
     if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-24.04
-    timeout-minutes: 50
+    timeout-minutes: 70
     environment: android-release
     steps:
       - uses: actions/checkout@v7
@@ -190,13 +189,12 @@ jobs:
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
 
-      - name: Exercise Android SAF, Keystore, share export and tunnel Rust unit tests
+      - name: Exercise the Rust workspace test suites
         run: |
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform saf_ -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform android_keystore -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-proto tunnel -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
-          python3 tools/run_cargo_ci.py cargo test -p linscp-service share_export -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-proto -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
       - name: Check the Android application ID and signing configuration
         run: |

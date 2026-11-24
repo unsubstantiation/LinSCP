@@ -94,6 +94,17 @@ CASE_SOURCES = {
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+    # The FTP/FTPS behaviour against the mock server: the native engine's
+    # passive and active data connections, the MLSD/MLST and LIST dialects,
+    # the resume and append transfers and the TLS policy.
+    "proto-ftp": "crates/linscp-proto/tests/ftp_and_ftps.rs",
+    # The WebDAV and S3 behaviour against the mock servers: PROPFIND, MKCOL,
+    # PUT, COPY/MOVE, LOCK/UNLOCK, dead properties, ETag preconditions, SigV4
+    # signing, resumable multipart uploads and object versioning.
+    "proto-dav-s3": "crates/linscp-proto/tests/webdav_and_s3.rs",
+    # The WebDAV helpers the protocol is built from: the RFC 4918 If-header
+    # and entity-tag forms, the lock-token and dead-property XML.
+    "proto-webdav": "crates/linscp-proto/src/webdav.rs",
     # The script interpreter end to end against the mock server: the
     # live-sftp cases ported to Rust, plus the change-guards that pin the
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
@@ -364,7 +375,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "proto-ssh", "engine-sftp",
+                               "platform-windows-acl", "proto-ssh", "proto-ftp",
+                               "proto-dav-s3", "proto-webdav", "engine-sftp",
                                "engine-editor", "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking
