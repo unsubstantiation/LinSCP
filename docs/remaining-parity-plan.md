@@ -37,15 +37,15 @@ The ASCII mode converts the line endings, the binary mode keeps the bytes, and t
 
 **Area:** Transfers · **Status:** partial
 
-Interrupted uploads and downloads stage in a `.filepart` file beside the destination and continue there rather than splicing the final destination: the bytes that arrived are kept, the resumed transfer continues them, and the file is published onto the destination only when the whole file has arrived.
+Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy.
 
-**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which stages the bytes in the `.filepart` file, resumes that staging file rather than the old destination, and publishes the whole file onto the destination only when it has arrived.
+**Next:** Linux and Windows CI exercise a real interrupted and resumed download against a mock SFTP server. This does not verify the remote content is unchanged between interruption and resume. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified. The upstream live suite needs a CLI binary that is not shipped.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Interrupt a transfer mid-flight and check that the staging file is what survives.
+- [ ] Verify the remote representation or prefix before resuming an interrupted download so a changed source cannot silently produce a mixed file.
+- [ ] Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.
+- [ ] Exercise Android-device and relevant live-server behavior without the removed CLI.
 
 ## transfer.resume-modes
 
