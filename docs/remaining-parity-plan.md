@@ -560,13 +560,14 @@ Symbolic links can be created in a local pane, not just over SFTP: the other pan
 
 **Area:** GUI · **Status:** partial
 
-The panes' delete runs on the session: each selected name is validated as a leaf, joined to the panel directory and removed with the queue's own tree walk, which empties a directory before removing it and unlinks a symbolic link instead of following it. A name the server no longer has counts as deleted; a refusal is reported per name, and the valid names of the same request still run. A local tab keeps its contained path resolution. It is not transactional: an interruption can leave part of a tree, which the row states as its gap. The service-side evidence is a helper called from live_webdav_gui_upload_download, which the Debian job runs with LSCP_LIVE_WEBDAV=1; the helper is named for what it exercises, not as a separate case.
+Remote deletes walk the selected tree, unlink symlinks without following them, reject unsafe server-provided child names, and report errors per selected name. A missing top-level entry is treated as already deleted. Partial failures are included in the service response and shown in the GUI error log; a failed child operation never counts the whole tree as deleted.
 
-**Next:** Remote deletion is not transactional: a directory is emptied before it is removed, so an interruption can leave part of a tree.
+**Next:** Recursive remote deletion is not transactional and may leave a partially deleted tree after an error. Linux and Windows mock-session tests inject a child deletion failure and verify the partial result is reported; the GUI test verifies the message reaches the error log. Live-server interruption and Android-device behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Prove an interruption leaves the partial tree reported rather than presented as a completed delete.
+- [ ] Exercise actual connection interruption and resulting partial deletion against a live server.
+- [ ] Exercise the partial-failure report on Android and retain the non-transactional warning.
 
 ## backup.full-export-import
 
