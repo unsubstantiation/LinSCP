@@ -1231,3 +1231,47 @@ async fn test_staged_ascii_upload_converts_before_publish() {
     assert_eq!(download_bytes(&*sftp, "/publish.txt", TransferRequest::default()).await.unwrap(), b"one\ntwo\nthree\n");
     sftp.close().await.unwrap();
 }
+
+/// Interrupt a running download after a real SFTP chunk has arrived, then
+/// continue the exact staging file. The old destination must not be published
+/// over until the resumed download completes.
+#[tokio::test]
+async fn test_interrupted_staged_download_resumes_its_partial() {
+    use linscp_engine::presets::ResumeSupportMode;
+    use linscp_engine::transfer::{download_single_file, TransferFlags};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x7d, 0x7e).await;
+    let payload: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+    seed_remote(&sftp, "/interrupt.bin", &payload, None).await;
+    let destination = tmp.path().join("interrupt.bin");
+    let stage = tmp.path().join("interrupt.bin.filepart");
+    fs::write(&destination, b"old destination").unwrap();
+
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let cancel_on_progress = Arc::clone(&cancelled);
+    let callback = move |done: u64, _total: u64| {
+        if done > 0 { cancel_on_progress.store(true, Ordering::SeqCst); }
+    };
+    let mut flags = TransferFlags {
+        resume_support: ResumeSupportMode::On,
+        cancel_flag: Some(Arc::clone(&cancelled)),
+        preserve_time: false,
+        ..Default::default()
+    };
+    let mut logger = in_memory_logger();
+    let result = download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, Some(&callback)).await;
+    assert!(result.is_err(), "the in-flight cancellation must fail the download");
+    assert_eq!(fs::read(&destination).unwrap(), b"old destination");
+    let partial = fs::read(&stage).expect("interruption retains the staging file");
+    assert!(!partial.is_empty() && partial.len() < payload.len());
+    assert_eq!(partial, payload[..partial.len()]);
+
+    cancelled.store(false, Ordering::SeqCst);
+    flags.resume = true;
+    assert!(download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, None).await.unwrap());
+    assert_eq!(fs::read(&destination).unwrap(), payload);
+    assert!(!stage.exists(), "the completed stage was published");
+    sftp.close().await.unwrap();
+}
