@@ -20,6 +20,7 @@ jobs:
         shell: bash
         run: |
           set +e
+          export CARGO_TERM_COLOR=never
           cargo test -p linscp-engine --test sftp_live_cases test_exclusive_ascii_and_automatic_uploads -- --nocapture > test-output.txt 2>&1
           status=$?
           if [ "$status" -eq 0 ]; then
@@ -31,7 +32,7 @@ jobs:
             python3 - <<'PY'
           from pathlib import Path
           lines = Path('test-output.txt').read_text(errors='replace').splitlines()
-          text = '\n'.join(lines[-100:])[-16000:]
+          text = '\n'.join(lines[-50:])[-3500:]
           print('::error::' + text.replace('%', '%25').replace('\r', '%0D').replace('\n', '%0A'))
           PY
           fi
