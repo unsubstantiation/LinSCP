@@ -26,12 +26,11 @@ The id is the row's history: an scp:// transfer is not curl's any more. The byte
 
 The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise. Fresh ASCII uploads can use server-enforced exclusive creation or an ETag precondition; staged publication still requires binary mode.
 
-**Next:** The live upstream WebDAV suite requires a CLI binary this GUI-only build does not ship. A new engine-sftp case exercises converted exclusive uploads, automatic mode, EOL selection and refusal paths, but has not yet been run in CI; ETag-conditional ASCII upload also needs a runnable protocol test.
+**Next:** Linux CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Windows and the Android host suite have not yet run the new cases; live upstream WebDAV tests also require a CLI binary this GUI-only build does not ship.
 
 **Acceptance criteria:**
 
-- [ ] Run the new exclusive ASCII upload case in CI on Linux and Windows and in the Android host suite.
-- [ ] Exercise successful and rejected ETag-conditional ASCII uploads against a WebDAV or S3 fixture.
+- [ ] Run the new SFTP and WebDAV upload cases in CI on Windows and in the Android host suite.
 - [ ] Cover any remaining desired live-server behavior without depending on the removed CLI.
 
 ## transfer.filepart-resume
