@@ -1856,10 +1856,6 @@ impl CommanderService {
         } else {
             std::fs::symlink_metadata(&local_dest).is_ok()
         };
-        let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
-        if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
-            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
-        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if exists && overwrite != "overwrite" {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
@@ -4993,6 +4989,10 @@ impl CommanderService {
         }
         if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
             return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
+        }
+        let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
+        if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
         }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
