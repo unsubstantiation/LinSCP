@@ -45,6 +45,10 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     assert_eq!(std::fs::read(&stage).unwrap(), b"wrong");
     assert_eq!(std::fs::read(&dest).unwrap(), b"old");
     std::fs::write(&stage, b"01234").unwrap();
+    state.lock().unwrap().etag = "W/\"v1\"".into();
+    assert!(download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.is_err());
+    assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
+    state.lock().unwrap().etag = "\"v1\"".into();
     state.lock().unwrap().change_after_prefix = true;
     assert!(download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.is_err());
     assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
@@ -52,6 +56,11 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     state.lock().unwrap().change_after_prefix = false;
     download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    // With staging disabled, the destination itself is the partial.
+    std::fs::write(&dest, b"xxxxx").unwrap();
+    let direct = TransferFlags { resume_support: ResumeSupportMode::Off, ..flags };
+    assert!(download_single_file(session, path, Some(&entry), &dest, &direct, &mut logger, None).await.is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"xxxxx");
 }
 
 #[tokio::test]
