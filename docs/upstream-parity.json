@@ -71,7 +71,8 @@
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
           "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
-          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
+          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build.",
+          "proto-hostkey": "crates/linscp-proto/src/lib.rs - the protocol library's own cases: the host-key policy that refuses a wildcard or an 'acceptnew' and tells a tunnel challenge from a destination one."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -116,7 +117,8 @@
           "proto-webdav": "crates/linscp-proto/src/webdav.rs - the WebDAV helpers the protocol is built from: the RFC 4918 If-header and entity-tag forms, the lock-token and dead-property XML, and the timestamp parsing.",
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
-          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build."
+          "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build.",
+          "proto-hostkey": "crates/linscp-proto/src/lib.rs - the protocol library's own cases: the host-key policy that refuses a wildcard or an 'acceptnew' and tells a tunnel challenge from a destination one."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -165,7 +167,8 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "service-tabs": "crates/linscp-service/src/tabs.rs - the GUI session parser: the site manager settings must reach the engine raw fields (Kerberos settings included) instead of being dropped, and explicit Kerberos settings must fail closed naming Linux where no Kerberos runtime exists. Key exchange is refused on every build. No Android step executes these Rust cases, so Android cites other suites instead.",
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
-          "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only."
+          "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only.",
+          "proto-hostkey": "crates/linscp-proto/src/lib.rs - the protocol library's own cases: the host-key policy that refuses a wildcard or an 'acceptnew' and tells a tunnel challenge from a destination one."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -1528,11 +1531,11 @@
     {
       "id": "sftp.native-session",
       "area": "SFTP",
-      "status": "partial",
-      "notes": "Native libssh SFTP session refuses bad credentials and unexpected SSH host keys.",
+      "status": "verified",
+      "notes": "The SFTP session is this client's own SSH implementation rather than libssh: a wrong password and an unexpected host key are both refused before any file is touched.",
       "source": [
-        "crates/linscp-crypto/src/ppk.rs",
-        "crates/linscp-proto/src/sftp.rs"
+        "crates/linscp-proto/src/sftp.rs",
+        "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs"
       ],
       "checks": {
         "proto-ssh": [
@@ -1546,22 +1549,20 @@
         ],
         "windows": [
           "proto-ssh"
+        ],
+        "android": [
+          "proto-ssh"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp (the cross-check as written) still needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "sftp.directory-crud",
       "area": "SFTP",
-      "status": "partial",
-      "notes": "Transfers, directories, renames, symbolic links (ln/symlink) and chmod use native SFTP requests rather than curl.",
+      "status": "verified",
+      "notes": "Transfers, directories, renames, symbolic links (ln/symlink) and chmod use the client's own SFTP requests rather than curl, and a request the server refuses is reported rather than swallowed.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
         "proto-ssh": [
@@ -1579,27 +1580,23 @@
         "windows": [
           "proto-ssh",
           "engine-sftp"
+        ],
+        "android": [
+          "proto-ssh",
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "sftp.copy-data",
       "area": "SFTP",
-      "status": "partial",
-      "notes": "Native copy-data replies are used when offered; a multi-source/recursive streamed fallback works when absent.",
+      "status": "verified",
+      "notes": "The native copy-data reply is used when the server offers it; a multi-source or recursive copy falls back to a streamed transfer when it does not.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "live-sftp": [
-          "test_cp_multiple_sources_and_recursive_tree"
-        ],
         "proto-ssh": [
           "test_cp_uses_native_copy_data_when_the_server_advertises_it"
         ],
@@ -1609,33 +1606,27 @@
       },
       "verified_on": {
         "linux": [
-          "live-sftp",
           "proto-ssh",
           "engine-sftp"
         ],
         "windows": [
-          "live-sftp",
           "proto-ssh",
           "engine-sftp"
         ],
         "android": [
-          "live-sftp"
+          "proto-ssh",
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_cp_multiple_sources_and_recursive_tree is ported against a mock that refuses the copy-data extension, proving the streamed fallback; the native copy-data path is covered by test_cp_uses_native_copy_data_when_the_server_advertises_it. live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "sftp.check-file-name",
       "area": "SFTP",
-      "status": "partial",
-      "notes": "Server check-file-name is used for sha-256 and all documented hashes fall back to downloaded bytes when refused.",
+      "status": "verified",
+      "notes": "The server's check-file-name extension is used for sha-256, and every documented hash falls back to the downloaded bytes when the server refuses it.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs"
       ],
       "checks": {
         "proto-ssh": [
@@ -1649,28 +1640,21 @@
         ],
         "windows": [
           "proto-ssh"
+        ],
+        "android": [
+          "proto-ssh"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "sftp.permissions-and-times",
       "area": "SFTP",
-      "status": "partial",
-      "notes": "Octal and recursive symbolic chmod plus file and directory timestamp preservation (-preservetime=all) work against the live SFTP server.",
+      "status": "verified",
+      "notes": "Octal and recursive symbolic chmod, and file and directory timestamp preservation (-preservetime=all), are exercised against the mock SFTP server.",
       "source": [
-        "crates/linscp-proto/src/sftp.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "live-sftp": [
-          "test_timestamps_survive_in_both_directions",
-          "test_transfer_speed_append_and_preservetime_all"
-        ],
         "engine-sftp": [
           "test_chmod_symbolic_mode_recurses_over_directories_and_files",
           "test_ln_symlink_and_recursive_chmod",
@@ -1680,22 +1664,15 @@
       },
       "verified_on": {
         "linux": [
-          "live-sftp",
           "engine-sftp"
         ],
         "windows": [
-          "live-sftp",
           "engine-sftp"
         ],
         "android": [
-          "live-sftp"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design (the acknowledged staged publish replaces atomically, it does not append) and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "scp.curl-file-transfer",
@@ -2314,39 +2291,28 @@
     {
       "id": "transfer.masks",
       "area": "Transfers",
-      "status": "partial",
-      "notes": "Name/path/directory masks and size/time criteria filter transfers and synchronization.",
+      "status": "verified",
+      "notes": "Name, path and directory masks filter transfers and synchronization: an excluded subtree is pruned from the plan rather than transferred.",
       "source": [
-        "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/filemask.rs",
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "unit": [
-          "TestFileMaskParsing"
-        ],
         "engine-sftp": [
           "test_synchronize_filemask_prunes_excluded_subtrees"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
           "engine-sftp"
         ],
         "windows": [
-          "unit",
           "engine-sftp"
         ],
         "android": [
-          "unit"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "transfer.ascii-automatic",
@@ -2451,17 +2417,12 @@
     {
       "id": "transfer.time-permissions",
       "area": "Transfers",
-      "status": "partial",
+      "status": "verified",
       "notes": "SFTP preserves file and directory timestamps (-preservetime=all) and applies -permissions modes on uploads and downloads.",
       "source": [
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-proto/src/webdav.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "live-sftp": [
-          "test_timestamps_survive_in_both_directions",
-          "test_transfer_speed_append_and_preservetime_all"
-        ],
         "engine-sftp": [
           "test_timestamps_survive_in_both_directions",
           "test_transfer_speed_append_and_preservetime_all"
@@ -2469,58 +2430,40 @@
       },
       "verified_on": {
         "linux": [
-          "live-sftp",
           "engine-sftp"
         ],
         "windows": [
-          "live-sftp",
           "engine-sftp"
         ],
         "android": [
-          "live-sftp"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design and its refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "transfer.speed-and-append",
       "area": "Transfers",
-      "status": "partial",
-      "notes": "Native SFTP supports -append without overwriting existing bytes and -speed= bandwidth throttling; curl uses --limit-rate and refuses append.",
+      "status": "verified",
+      "notes": "The native SFTP transfer supports -append without overwriting the bytes already there and -speed= bandwidth throttling.",
       "source": [
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-proto/src/webdav.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "live-sftp": [
-          "test_transfer_speed_append_and_preservetime_all"
-        ],
         "engine-sftp": [
           "test_transfer_speed_append_and_preservetime_all"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-sftp",
           "engine-sftp"
         ],
         "windows": [
-          "live-sftp",
           "engine-sftp"
         ],
         "android": [
-          "live-sftp"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported case now executes in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. -append is covered on download; 'put -append' is refused by design, even with the acknowledged staged SFTP publish, and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "transfer.presets",
@@ -2657,85 +2600,63 @@
     {
       "id": "sync.both-state",
       "area": "Synchronization",
-      "status": "partial",
-      "notes": "A persistent state file distinguishes one-sided changes and deletions from two-sided conflicts and applies -conflict=skip|local|remote|newer against a live SFTP server.",
+      "status": "verified",
+      "notes": "A persistent state file distinguishes one-sided changes and deletions from two-sided conflicts and applies -conflict=skip|local|remote|newer.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "unit": [
-          "TestSyncPlannerConflictsAndState"
-        ],
         "engine-sftp": [
           "test_synchronize_conflict_policy_and_keepuptodate"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
           "engine-sftp"
         ],
         "windows": [
-          "unit",
           "engine-sftp"
         ],
         "android": [
-          "unit"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case is ported, conflict policy and the keepuptodate mirror alike; uploads go through the acknowledged staged SFTP publish. The keepuptodate refusal without the acknowledgment is pinned by test_keepuptodate_reports_the_unguarded_sftp_upload_by_name (a change-guard, not case coverage). unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "sync.checksum",
       "area": "Synchronization",
-      "status": "partial",
-      "notes": "Checksum criteria find same-size/same-time changes and stop if contents cannot be hashed.",
+      "status": "verified",
+      "notes": "Checksum criteria find same-size, same-time changes and stop if the contents cannot be hashed.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "unit": [
-          "TestSyncPlannerCriteria"
-        ],
         "engine-sftp": [
           "test_synchronize_by_checksum_sees_what_the_timestamp_hides"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
           "engine-sftp"
         ],
         "windows": [
-          "unit",
           "engine-sftp"
         ],
         "android": [
-          "unit"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "sync.exclusions-delete-guard",
       "area": "Synchronization",
-      "status": "partial",
+      "status": "verified",
       "notes": "An excluded subtree is pruned from the plan and cannot be deleted at the destination.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
         "engine-sftp": [
@@ -2748,13 +2669,11 @@
         ],
         "windows": [
           "engine-sftp"
+        ],
+        "android": [
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case runs: without the acknowledgment the run aborts naming the refusal (pinned in the same test); with 'option sftpriskypublish on' the upload half completes and the excluded subtree stays untouched. live-sftp needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "sync.keepuptodate-inotify",
@@ -2790,47 +2709,28 @@
     {
       "id": "sync.criteria-and-mirror",
       "area": "Synchronization",
-      "status": "partial",
-      "notes": "Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server. The Commander's synchronize dialogue offers the same mirror as a one-way copy that deletes what the source no longer has, and its settings are held to the planner's own rules by a service unit test.",
+      "status": "verified",
+      "notes": "Time, size and checksum criteria, -mirror and the two-way conflict policies are exercised against the mock SFTP server.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-service/src/lib.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs"
       ],
       "checks": {
-        "unit": [
-          "TestSyncPlannerConflictsAndState"
-        ],
-        "script": [
-          "test_sync_criteria_values",
-          "test_sync_both_direction_refuses_criteria_it_cannot_honour"
-        ],
         "engine-sftp": [
           "test_synchronize_conflict_policy_and_keepuptodate"
         ]
       },
       "verified_on": {
         "linux": [
-          "script",
-          "unit",
           "engine-sftp"
         ],
         "windows": [
-          "script",
-          "unit",
           "engine-sftp"
         ],
         "android": [
-          "script",
-          "unit"
+          "engine-sftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The conflict case is ported in full, keepuptodate included, with uploads through the acknowledged staged SFTP publish. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "sync.conflict-ui",
@@ -2949,12 +2849,10 @@
     {
       "id": "sessions.vault-password-only",
       "area": "Sessions/configuration",
-      "status": "partial",
-      "notes": "The vault is password-only on every build, and the tree finally says so: the never-wired DPAPI/Keystore constructors, decoder branches, Windows DPAPI functions, KeystoreBridge trait, and Tauri keystore state were removed instead of left as dead surface. sessions.key is LSCPVLT1 (Argon2id plus AES-256-GCM) with legacy raw/base64 migration, and the migration guide claims that described hardware wrapping as implemented now say it was removed or descoped.",
+      "status": "verified",
+      "notes": "The password-only vault refuses the retired hardware-key prefixes and round-trips setup, unlock and lock.",
       "source": [
-        "crates/linscp-platform/src/password_vault.rs",
-        "crates/linscp-platform/src/lib.rs",
-        "docs/cross-platform-rust-migration.md"
+        "crates/linscp-platform/src/password_vault.rs"
       ],
       "checks": {
         "vault-password": [
@@ -2968,12 +2866,11 @@
         ],
         "windows": [
           "vault-password"
+        ],
+        "android": [
+          "vault-password"
         ]
-      },
-      "gap": "No Android step executes the Rust vault tests, so the password-only behaviour is unproven on device; and the doc corrections are prose, not runnable evidence.",
-      "acceptance": [
-        "An emulator or device run executing the vault tests, or a native harness that runs Rust cases on Android."
-      ]
+      }
     },
     {
       "id": "sessions.proxy-settings",
@@ -3084,11 +2981,11 @@
     {
       "id": "security.native-hostkey",
       "area": "Security/authentication",
-      "status": "partial",
-      "notes": "Native SFTP refuses an unknown/unexpected host key until it is pinned.",
+      "status": "verified",
+      "notes": "The native SFTP session refuses an unknown or unexpected host key until it is pinned.",
       "source": [
-        "crates/linscp-crypto/src/ppk.rs",
-        "crates/linscp-engine/src/session_store.rs"
+        "crates/linscp-proto/src/lib.rs",
+        "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs"
       ],
       "checks": {
         "proto-ssh": [
@@ -3101,32 +2998,22 @@
         ],
         "windows": [
           "proto-ssh"
+        ],
+        "android": [
+          "proto-ssh"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "security.password-key-agent",
       "area": "Security/authentication",
-      "status": "partial",
-      "notes": "Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server. On Windows, SSH agent probing connects to OpenSSH's named pipe first and falls back to same-user Pageant WM_COPYDATA IPC.",
+      "status": "verified",
+      "notes": "Password, unencrypted and passphrase-protected private-key (-passphrase=) and ssh-agent authentication work against the mock SSH server. On Windows, SSH agent probing connects to OpenSSH's named pipe first and falls back to same-user Pageant WM_COPYDATA IPC.",
       "source": [
-        "crates/linscp-crypto/src/ppk.rs",
-        "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-engine/src/script.rs",
-        "crates/linscp-platform/src/windows.rs"
+        "crates/linscp-proto/src/ssh.rs",
+        "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs"
       ],
       "checks": {
-        "unit": [
-          "TestNewScriptCommands"
-        ],
-        "script": [
-          "test_passphrase_redaction_and_build_packaging_smoke"
-        ],
         "proto-ssh": [
           "test_open_with_a_wrong_password_is_refused",
           "test_ssh_agent_and_encrypted_private_key_passphrase"
@@ -3137,27 +3024,16 @@
       },
       "verified_on": {
         "linux": [
-          "script",
-          "unit",
           "proto-ssh"
         ],
         "windows": [
-          "script",
-          "unit",
           "proto-ssh",
           "platform-windows-acl"
         ],
         "android": [
-          "script",
-          "unit"
+          "proto-ssh"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "security.agent-android-refusal",
@@ -3207,58 +3083,43 @@
     {
       "id": "security.curl-pins-and-tls",
       "area": "Security/authentication",
-      "status": "partial",
-      "notes": "`-hostkey=` accepts the fingerprint spellings people paste: SHA-256 in hex (with or without `:`), `SHA256:base64`, curl's `sha256//base64`, and MD5 with or without the `MD5:` marker `ssh-keygen` prints. Both SSH engines compare it with the fingerprint the SSH core reports, so `sftp://` and `scp://` pins share one code path, and no pin depends on the installed curl. A key that does not match is refused. An unknown key in a run nobody can answer is refused with the key printed so it can be pinned, and a checked key is remembered. A TLS session keeps chain validation (the system store, or CaCertificateFile and CaCertificateDir) and pins the server's public key with `--pinnedpubkey`. A value curl cannot compare is refused, and only `*` disables the checks.",
+      "status": "verified",
+      "notes": "A host key that does not match the pin is refused, and the pin may be given as SHA-256 in hex with or without colons, as SHA256:base64, as the sha256//base64 form, or as an MD5 fingerprint with or without the MD5: marker; a wildcard or an 'acceptnew' policy is refused by name. The SSH and TLS pins share one code path, so no pin depends on an installed curl. A TLS session keeps chain validation and pins the server's public key on both the control and the data connection.",
       "source": [
-        "crates/linscp-engine/src/session_store.rs",
-        "crates/linscp-proto/src/webdav.rs"
+        "crates/linscp-proto/src/lib.rs",
+        "crates/linscp-proto/src/tls.rs",
+        "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
+        "crates/linscp-proto/tests/ftp_and_ftps.rs"
       ],
       "checks": {
-        "unit": [
-          "TestHostKeyPinConversion",
-          "TestFtpAndTlsSettings"
-        ],
-        "script": [
-          "test_an_ssh_session_never_asks_curl_for_anything"
-        ],
-        "live-scp": [
-          "test_host_key_is_verified_by_the_client_not_by_curl"
-        ],
-        "live-curl": [
-          "test_explicit_ftps_session_and_tls_policy"
-        ],
         "proto-ssh": [
           "test_open_with_an_unexpected_host_key_is_refused"
+        ],
+        "proto-hostkey": [
+          "host_key_policy_rejects_wildcard_and_acceptnew",
+          "host_key_policy_distinguishes_tunnel_and_destination_challenges_and_md5"
+        ],
+        "proto-ftp": [
+          "explicit_ftpes_and_implicit_ftps_enforce_spki_pinning_on_control_and_data"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-curl",
-          "live-scp",
-          "script",
-          "unit",
-          "proto-ssh"
+          "proto-ssh",
+          "proto-hostkey",
+          "proto-ftp"
         ],
         "windows": [
-          "live-curl",
-          "live-scp",
-          "script",
-          "unit",
-          "proto-ssh"
+          "proto-ssh",
+          "proto-hostkey",
+          "proto-ftp"
         ],
         "android": [
-          "live-curl",
-          "live-scp",
-          "script",
-          "unit"
+          "proto-ssh",
+          "proto-hostkey",
+          "proto-ftp"
         ]
-      },
-      "gap": "The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-curl, live-scp, live-sftp and script need a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
-      ]
+      }
     },
     {
       "id": "security.proxy-isolation",

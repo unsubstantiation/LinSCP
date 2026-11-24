@@ -105,6 +105,9 @@ CASE_SOURCES = {
     # The WebDAV helpers the protocol is built from: the RFC 4918 If-header
     # and entity-tag forms, the lock-token and dead-property XML.
     "proto-webdav": "crates/linscp-proto/src/webdav.rs",
+    # The protocol library's own cases: the host-key policy that refuses a
+    # wildcard and tells a tunnel challenge from a destination one.
+    "proto-hostkey": "crates/linscp-proto/src/lib.rs",
     # The script interpreter end to end against the mock server: the
     # live-sftp cases ported to Rust, plus the change-guards that pin the
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
@@ -376,7 +379,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh", "proto-ftp",
-                               "proto-dav-s3", "proto-webdav", "engine-sftp",
+                               "proto-dav-s3", "proto-webdav", "proto-hostkey", "engine-sftp",
                                "engine-editor", "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking

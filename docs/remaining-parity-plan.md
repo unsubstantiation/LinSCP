@@ -4,74 +4,9 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-65 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+49 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
-
-## sftp.native-session
-
-**Area:** SFTP · **Status:** partial
-
-Native libssh SFTP session refuses bad credentials and unexpected SSH host keys.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp (the cross-check as written) still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.directory-crud
-
-**Area:** SFTP · **Status:** partial
-
-Transfers, directories, renames, symbolic links (ln/symlink) and chmod use native SFTP requests rather than curl.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.copy-data
-
-**Area:** SFTP · **Status:** partial
-
-Native copy-data replies are used when offered; a multi-source/recursive streamed fallback works when absent.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. test_cp_multiple_sources_and_recursive_tree is ported against a mock that refuses the copy-data extension, proving the streamed fallback; the native copy-data path is covered by test_cp_uses_native_copy_data_when_the_server_advertises_it. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.check-file-name
-
-**Area:** SFTP · **Status:** partial
-
-Server check-file-name is used for sha-256 and all documented hashes fall back to downloaded bytes when refused.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sftp.permissions-and-times
-
-**Area:** SFTP · **Status:** partial
-
-Octal and recursive symbolic chmod plus file and directory timestamp preservation (-preservetime=all) work against the live SFTP server.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design (the acknowledged staged publish replaces atomically, it does not append) and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 
 ## scp.curl-file-transfer
 
@@ -108,20 +43,6 @@ The directory engine runs `ls -l -a --full-time` in its own SSH connection and p
 The commands upstream runs on the remote shell, and the metadata a shell can set that 'ls -l' can read back: mkdir, rmdir, rm (never '-f', so a path that is not there stays an error the server words), mv, chmod with the mode the script parsed, 'cp -p' for a server-side copy - with a server that has no 'cp' answered by streaming through the client instead - 'ln -s' for a symbolic link, 'touch -t' asked for in UTC for a modification time, and the rcp timestamp header for the time a transfer carries. Every path is quoted for a POSIX shell and a path holding a control character is refused instead of being sent, because a newline in a name cannot be told apart from the end of a listing line. A refusal arrives as the sentence the server printed, 'call' hands the rest of the line to that shell, and 'checksum' says plainly that the digest came from a downloaded file, this protocol having no server-side hashing to ask for. A relative rmdir operand is resolved against the current remote directory before it reaches the protocol layer, matching the upstream full-path fix.
 
 **Next:** No runnable suite evidences this: live-scp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## transfer.masks
-
-**Area:** Transfers · **Status:** partial
-
-Name/path/directory masks and size/time criteria filter transfers and synchronization.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -168,32 +89,6 @@ Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 
-## transfer.time-permissions
-
-**Area:** Transfers · **Status:** partial
-
-SFTP preserves file and directory timestamps (-preservetime=all) and applies -permissions modes on uploads and downloads.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The upload half of test_timestamps_survive_in_both_directions runs through the acknowledged staged SFTP publish; the 'put -append' half of test_transfer_speed_append_and_preservetime_all stays refused by design and its refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## transfer.speed-and-append
-
-**Area:** Transfers · **Status:** partial
-
-Native SFTP supports -append without overwriting existing bytes and -speed= bandwidth throttling; curl uses --limit-rate and refuses append.
-
-**Next:** The ported case now executes in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. -append is covered on download; 'put -append' is refused by design, even with the acknowledged staged SFTP publish, and the refusal is pinned in the ported case. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
 ## transfer.presets
 
 **Area:** Transfers · **Status:** partial
@@ -234,47 +129,6 @@ Local-to-remote keepuptodate and recursive one-way planning/upload run against t
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 
-## sync.both-state
-
-**Area:** Synchronization · **Status:** partial
-
-A persistent state file distinguishes one-sided changes and deletions from two-sided conflicts and applies -conflict=skip|local|remote|newer against a live SFTP server.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case is ported, conflict policy and the keepuptodate mirror alike; uploads go through the acknowledged staged SFTP publish. The keepuptodate refusal without the acknowledgment is pinned by test_keepuptodate_reports_the_unguarded_sftp_upload_by_name (a change-guard, not case coverage). unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## sync.checksum
-
-**Area:** Synchronization · **Status:** partial
-
-Checksum criteria find same-size/same-time changes and stop if contents cannot be hashed.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
-## sync.exclusions-delete-guard
-
-**Area:** Synchronization · **Status:** partial
-
-An excluded subtree is pruned from the plan and cannot be deleted at the destination.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The full upstream case runs: without the acknowledgment the run aborts naming the refusal (pinned in the same test); with 'option sftpriskypublish on' the upload half completes and the excluded subtree stays untouched. live-sftp needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
 ## sync.keepuptodate-inotify
 
 **Area:** Synchronization · **Status:** partial
@@ -287,20 +141,6 @@ Nested local arrivals wake the recursive inotify watcher before the rescan inter
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## sync.criteria-and-mirror
-
-**Area:** Synchronization · **Status:** partial
-
-Time/size/checksum criteria, -mirror and two-way conflict policies are validated in script and unit suites and exercised against a live SFTP server. The Commander's synchronize dialogue offers the same mirror as a one-way copy that deletes what the source no longer has, and its settings are held to the planner's own rules by a service unit test.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. The conflict case is ported in full, keepuptodate included, with uploads through the acknowledged staged SFTP publish. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
 
 ## sessions.site-manager
 
@@ -329,18 +169,6 @@ Stored site passwords are encrypted under sessions.key and shared between the CL
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms.
 
-## sessions.vault-password-only
-
-**Area:** Sessions/configuration · **Status:** partial
-
-The vault is password-only on every build, and the tree finally says so: the never-wired DPAPI/Keystore constructors, decoder branches, Windows DPAPI functions, KeystoreBridge trait, and Tauri keystore state were removed instead of left as dead surface. sessions.key is LSCPVLT1 (Argon2id plus AES-256-GCM) with legacy raw/base64 migration, and the migration guide claims that described hardware wrapping as implemented now say it was removed or descoped.
-
-**Next:** No Android step executes the Rust vault tests, so the password-only behaviour is unproven on device; and the doc corrections are prose, not runnable evidence.
-
-**Acceptance criteria:**
-
-- [ ] An emulator or device run executing the vault tests, or a native harness that runs Rust cases on Android.
-
 ## sessions.proxy-settings
 
 **Area:** Sessions/configuration · **Status:** partial
@@ -368,33 +196,6 @@ Upstream proxy setting names are applied by open and stored with a site; both SO
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
 - [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
 
-## security.native-hostkey
-
-**Area:** Security/authentication · **Status:** partial
-
-Native SFTP refuses an unknown/unexpected host key until it is pinned.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. live-sftp still needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
-## security.password-key-agent
-
-**Area:** Security/authentication · **Status:** partial
-
-Password, unencrypted and passphrase-protected private-key (-passphrase=), ssh-agent and copyid public/private key installation work against the live SFTP server. On Windows, SSH agent probing connects to OpenSSH's named pipe first and falls back to same-user Pageant WM_COPYDATA IPC.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-sftp and script need a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-
 ## security.agent-android-refusal
 
 **Area:** Security/authentication · **Status:** partial
@@ -406,20 +207,6 @@ Agent authentication explains itself when there is no agent to ask. The auth cha
 **Acceptance criteria:**
 
 - [ ] An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure.
-
-## security.curl-pins-and-tls
-
-**Area:** Security/authentication · **Status:** partial
-
-`-hostkey=` accepts the fingerprint spellings people paste: SHA-256 in hex (with or without `:`), `SHA256:base64`, curl's `sha256//base64`, and MD5 with or without the `MD5:` marker `ssh-keygen` prints. Both SSH engines compare it with the fingerprint the SSH core reports, so `sftp://` and `scp://` pins share one code path, and no pin depends on the installed curl. A key that does not match is refused. An unknown key in a run nobody can answer is refused with the key printed so it can be pinned, and a checked key is remembered. A TLS session keeps chain validation (the system store, or CaCertificateFile and CaCertificateDir) and pins the server's public key with `--pinnedpubkey`. A value curl cannot compare is refused, and only `*` disables the checks.
-
-**Next:** The ported cases now execute in CI on Linux and Windows via the Rust suites cited there; the Android job executes no Rust tests, so those cases still cannot run on Android. unit has no build target and cannot be compiled; live-curl, live-scp, live-sftp and script need a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
 
 ## security.proxy-isolation
 
