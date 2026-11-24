@@ -1328,22 +1328,53 @@ impl RemoteSession for FtpSession {
                 "Remote FTP file '{remote_path}' changed before resume verification."
             )));
         }
-        let mut remote_bytes = Vec::with_capacity(expected_size.min(16 * 1024 * 1024) as usize);
-        self.download(remote_path, TransferRequest::default(), &mut remote_bytes, None).await?;
-        if (remote_bytes.len() as u64) < prefix_len {
-            return Err(ProtoError::Transport(
-                "Remote FTP file ended early during resume verification.".to_string(),
-            ));
+        // FTP has no bounded range read. Drain the complete RETR to keep the
+        // control connection synchronized, comparing only the prefix as it
+        // arrives. The bounded pipe prevents large files from being buffered
+        // in memory, and continues draining even after a mismatch.
+        let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
+        let download = async {
+            let result = self.download(remote_path, TransferRequest::default(), &mut writer, None).await;
+            drop(writer);
+            result
+        };
+        let compare = async {
+            let mut remote = vec![0u8; 32 * 1024];
+            let mut local = vec![0u8; 32 * 1024];
+            let mut compared = 0u64;
+            let mut failure: Option<String> = None;
+            loop {
+                let n = reader.read(&mut remote).await
+                    .map_err(|e| ProtoError::Transport(format!("FTP prefix stream failed: {e}")))?;
+                if n == 0 { break; }
+                let want = (prefix_len - compared).min(n as u64) as usize;
+                if want > 0 {
+                    if failure.is_none() {
+                        if let Err(e) = prefix.read_exact(&mut local[..want]).await {
+                            failure = Some(format!("Reading local partial failed: {e}"));
+                        } else if local[..want] != remote[..want] {
+                            failure = Some("Existing partial file bytes do not match the remote FTP file.".to_string());
+                        }
+                    }
+                    compared += want as u64;
+                }
+            }
+            if let Some(message) = failure { return Err(ProtoError::Transport(message)); }
+            if compared != prefix_len {
+                return Err(ProtoError::Transport("Remote FTP file ended early during resume verification.".to_string()));
+            }
+            Ok::<(), ProtoError>(())
+        };
+        let (downloaded, compared) = tokio::join!(download, compare);
+        let downloaded = downloaded?;
+        compared?;
+        if downloaded != total_len {
+            return Err(ProtoError::Transport("Remote FTP file length changed during resume verification.".to_string()));
         }
-        let mut local_prefix = vec![0u8; prefix_len as usize];
-        prefix
-            .read_exact(&mut local_prefix)
-            .await
-            .map_err(|e| ProtoError::Transport(format!("Reading local partial failed: {e}")))?;
-        if local_prefix.as_slice() != &remote_bytes[..prefix_len as usize] {
-            return Err(ProtoError::Transport(
-                "Existing partial file bytes do not match the remote FTP file.".to_string(),
-            ));
+        let after = self.stat(remote_path).await?
+            .ok_or_else(|| ProtoError::Transport(format!("Remote FTP file '{remote_path}' disappeared during resume verification.")))?;
+        if after.is_dir || after.is_symlink || after.size != expected_size || after.mtime != expected_mtime {
+            return Err(ProtoError::Transport(format!("Remote FTP file '{remote_path}' changed during resume verification.")));
         }
         Ok(())
     }

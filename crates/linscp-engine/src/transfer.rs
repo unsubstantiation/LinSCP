@@ -630,12 +630,11 @@ pub async fn download_single_file(
         return Err("Safe no-overwrite downloads require a fresh staging file.".to_string());
     }
     let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
-    // Ordinary SFTP resumes previously trusted a local prefix solely because
-    // its length fit. Compare it with the remote bytes before moving or
-    // opening either local path for writing. The size/mtime identity is a
-    // best-effort guard, not a server-side atomic snapshot.
-    let mut sftp_resume_identity = None;
-    if flags.resume && session.scheme() == ProtocolScheme::Sftp {
+    // Compare FTP/SFTP resume prefixes before moving or opening either local
+    // path for writing. Their size/mtime identity is a best-effort guard, not
+    // a server-side atomic snapshot.
+    let mut resume_identity = None;
+    if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) {
         let candidate = if let Some(stage) = stage_opt.as_ref() {
             let stage_info = stat_local_path(stage);
             if stage_info.exists {
@@ -656,13 +655,14 @@ pub async fn download_single_file(
         if let Some((partial, size)) = candidate {
             let input = linscp_platform::open_private_file_no_follow(partial)
                 .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
-            let token = format!("\"sftp:{}:{}\"", info.size, info.mtime);
+            let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
+            let token = format!("\"{protocol}:{}:{}\"", info.size, info.mtime);
             if size > 0 {
                 let input = tokio::fs::File::from_std(input);
                 let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
                 session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader).await
                     .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
-                sftp_resume_identity = Some(token);
+                resume_identity = Some(token);
             }
         }
     }
@@ -736,7 +736,7 @@ pub async fn download_single_file(
     };
     let dl_res = {
         let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-        if let Some(etag) = flags.source_etag.as_deref().or(sftp_resume_identity.as_deref()) {
+        if let Some(etag) = flags.source_etag.as_deref().or(resume_identity.as_deref()) {
             session.download_if_match(remote_path, etag, req, &mut writer, progress).await
         } else {
             session.download(remote_path, req, &mut writer, progress).await
@@ -759,7 +759,7 @@ pub async fn download_single_file(
         logger.record_transfer(false, remote_path, &dest_label, None, Err(&msg));
         return Err(msg);
     }
-    if (flags.source_etag.is_some() || sftp_resume_identity.is_some()) && bytes != info.size {
+    if (flags.source_etag.is_some() || resume_identity.is_some()) && bytes != info.size {
         return Err("Conditional download length does not match the source metadata; the source was not deleted.".to_string());
     }
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
