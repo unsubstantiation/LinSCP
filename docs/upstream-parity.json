@@ -127,7 +127,8 @@
           "unit": "source/linux/tests/UnitTest.cpp - checks of the parts that need no I/O: permission and mode parsing, masks, path handling, the transfer and synchronization planners (every word and list '-criteria=' takes, the ones it refuses, a plan refused over a file nobody could hash, and '-conflict=skip|local|remote|newer' two-way resolution), the proxy session settings, the FTP engine and TLS policy settings, the S3 object write settings and multipart upload resume state sidecar, the SSH private-key passphrase option and XML action log elements, the host-key pin spellings, the native SCP engine's connection-free parts (the shell quoting a remote path needs, the paths it refuses to send, one 'ls -l' line as an entry including a symbolic link's own name, the exact date columns of '--full-time' with the offset they are in, the rcp header lines read and written byte for byte, header names that cannot traverse directories, and the 'touch -t' stamp), the WebDAV lock-token and dead-property XML, parameter and timestamp expansion, the stored-session file and folder hierarchy helpers, the editor content-comparison and EOL normalization helpers, the file-hash and HMAC helpers, and AWS Signature Version 4 signing. Includes English/Spanish help, security messages, named-placeholder safety, locale fallback and plural-count messages.",
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
-          "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only."
+          "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only.",
+          "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Windows CI."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -2357,16 +2358,17 @@
         ],
         "windows": [
           "engine-sftp",
-          "live-dav"
+          "live-dav",
+          "engine-dav-ascii"
         ],
         "android": [
           "engine-sftp",
           "live-dav"
         ]
       },
-      "gap": "Linux CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Windows and the Android host suite have not yet run the new cases; live upstream WebDAV tests also require a CLI binary this GUI-only build does not ship.",
+      "gap": "Linux and Windows CI exercised the new SFTP exclusive-create and WebDAV conditional ASCII upload cases, including stale ETag refusal. Android-device behavior has not been exercised; live upstream WebDAV tests require a CLI binary this GUI-only build does not ship.",
       "acceptance": [
-        "Run the new SFTP and WebDAV upload cases in CI on Windows and in the Android host suite.",
+        "Exercise Android-device behavior where applicable.",
         "Cover any remaining desired live-server behavior without depending on the removed CLI."
       ]
     },
