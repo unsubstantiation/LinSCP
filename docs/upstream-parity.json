@@ -2384,7 +2384,7 @@
       "id": "transfer.filepart-resume",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy.",
+      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2399,7 +2399,8 @@
         "engine-sftp": [
           "test_staged_resume_continues_the_staging_file_not_the_old_final",
           "test_a_staged_download_publishes_only_the_whole_file",
-          "test_interrupted_staged_download_resumes_its_partial"
+          "test_interrupted_staged_download_resumes_its_partial",
+          "test_verified_resume_refuses_a_changed_sftp_prefix"
         ]
       },
       "verified_on": {
@@ -2416,9 +2417,9 @@
           "engine-sftp"
         ]
       },
-      "gap": "Linux and Windows CI exercise a real interrupted and resumed download against a mock SFTP server. This does not verify the remote content is unchanged between interruption and resume. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified. The upstream live suite needs a CLI binary that is not shipped.",
+      "gap": "Linux and Windows CI exercise both an interrupted ordinary SFTP download and the GUI verified-resume engine path. The latter rejects a stale prefix even if size and timestamp match, but SFTP size/mtime checks are not an atomic snapshot against concurrent same-metadata changes. The older ordinary resume path does not verify its prefix. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.",
       "acceptance": [
-        "Verify the remote representation or prefix before resuming an interrupted download so a changed source cannot silently produce a mixed file.",
+        "Protect the ordinary resume path against stale prefixes; explicitly handle protocols without a strong remote version.",
         "Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.",
         "Exercise Android-device and relevant live-server behavior without the removed CLI."
       ]
