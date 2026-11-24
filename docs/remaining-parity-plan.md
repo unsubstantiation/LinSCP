@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-47 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+46 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -24,14 +24,15 @@ The id is the row's history: an scp:// transfer is not curl's any more. The byte
 
 **Area:** Transfers · **Status:** partial
 
-ASCII conversion is byte-checked through a live upload; automatic mode selects text files by mask.
+The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise.
 
-**Next:** No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.
+**Next:** The upload direction is still unevidenced: live-dav needs a `linscp` binary this repo does not build, and every protocol this build guards refuses an ASCII upload (a guarded or staged upload has to be binary), so only the curl-backed protocols could show it. Runnable residue: engine-sftp, which checks the download direction.
 
 **Acceptance criteria:**
 
 - [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
 - [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Cover the upload direction over a protocol that accepts an ASCII upload.
 
 ## transfer.filepart-resume
 
@@ -50,9 +51,9 @@ Interrupted uploads/downloads stage in .filepart and continue there rather than 
 
 **Area:** Transfers · **Status:** partial
 
-Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging.
+Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging. The interpreter offers the three modes, refuses a value outside them, and refuses to resume an ASCII transfer because the byte offsets would not survive the line-ending conversion.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the modes the interpreter offers and the refusal to resume an ASCII transfer.
 
 **Acceptance criteria:**
 
@@ -65,7 +66,7 @@ Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers 
 
 Named, per-site and rule-selected presets change live transfer settings.
 
-**Next:** No runnable suite evidences this: live-dav and script need a `linscp` binary this repo does not build.
+**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the preset store, the rules that match a session or a file mask, and the preset a site stores with itself.
 
 **Acceptance criteria:**
 
@@ -118,7 +119,7 @@ Nested local arrivals wake the recursive inotify watcher before the rescan inter
 
 Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
+**Next:** The rename path and the site's own cleanup still rest on the service suite, which no Android step executes. Runnable residue: engine-script (the store, the folders, the export and the import), the service suite and the GUI suite on Linux and Windows.
 
 **Acceptance criteria:**
 
@@ -158,7 +159,7 @@ Upstream proxy setting names are applied by open and stored with a site; both SO
 
 'open' and 'savesession' take '-rawsettings' with upstream's names: the proxy settings (ProxyMethod, ProxyHost, ProxyPort, ProxyUsername, ProxyPassword, ProxyTelnetCommand, ProxyLocalCommand, ProxyDNS, ProxyLocalhost, ProxyExcludeList), the FTP engine's policy (FtpPasvMode, FtpForcePasvIp, FtpUseMlsd, FtpAccount) and the TLS policy (Ftps, MinTlsVersion, MaxTlsVersion, TlsCertificateFile, TlsCertificateKeyFile, CaCertificateFile, CaCertificateDir, PinnedPublicKey). A name or value outside that set is refused by name before any connection, so a setting is never stored and then dropped at open time, and 'savesession' writes what it applied under the keys a saved site reads back.
 
-**Next:** No runnable suite evidences this: live-curl and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The live half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which refuses an unknown setting by name, validates every value, and reads the stored settings back.
 
 **Acceptance criteria:**
 
@@ -210,7 +211,7 @@ There is no local HTTP API and therefore no bearer token to steal or leak. Upstr
 
 Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.
 
-**Next:** Production-KDC validation (Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md.
+**Next:** The live half is still unevidenced: live-tunnel and live-sftp need a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which keeps the jump-host and Kerberos settings a site stores and refuses a jump host that is not named.
 
 **Acceptance criteria:**
 
@@ -272,19 +273,6 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 - [ ] No restoration is planned for the GUI-only distribution.
 
-## automation.parameter-and-timestamp
-
-**Area:** Automation · **Status:** partial
-
-%1%..%9%, timestamp formats and environment expansion follow tested script behavior.
-
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-
 ## automation.literal-gui-command
 
 **Area:** Automation · **Status:** missing
@@ -303,7 +291,7 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The operation elements of a real session (upload, download, ls, ...) are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the group and failure structure, the masking of the secrets and the shipped fixtures.
 
 **Acceptance criteria:**
 
@@ -461,7 +449,7 @@ The Linux platform layer supplies temporary directories, home/config lookup and 
 
 Linux command-line parsing, terminal-facing configuration and the native console entry point are built from the Linux sources. Which terminal 'terminal' starts depends on the display server the session runs on; that behavior is its own row, desktop.wayland-session.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The Linux build targets themselves are still unevidenced: unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the command list and each command's own help.
 
 **Acceptance criteria:**
 
@@ -548,9 +536,9 @@ CLI editing supports explicit legacy-encoding selection via iconv (ISO-8859-1, W
 
 **Area:** Automation · **Status:** partial
 
-The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns="http://winscp.net/schema/session/1.0" name="user@host"|site|nosession start="...Z">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success="true|false">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The script suite validates the shipped fixtures (fixtures/xml/) and freshly produced logs against that schema with xmlschema - including a masked-password failure - and reads operations back the way an upstream-style consumer does; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.
+The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns="http://winscp.net/schema/session/1.0" name="user@host"|site|nosession start="...Z">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success="true|false">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The engine-script suite reads the shipped fixtures (fixtures/xml/) and a freshly produced log back the way an upstream-style consumer does - the namespace, the groups, the failure and the masked-password failure - and holds the log to the operation elements the fixtures show; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.
 
-**Next:** No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
+**Next:** The XSD validation with xmlschema and the operation elements of a real session are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which reads the shipped fixtures and a produced log back as an upstream-style consumer does.
 
 **Acceptance criteria:**
 
@@ -589,7 +577,7 @@ The panes' delete runs on the session: each selected name is validated as a leaf
 
 Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` proves Linux→Windows→Android round-trip with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.
 
-**Next:** No runnable suite evidences this on Android: script needs a `linscp` binary this repo does not build. Runnable residue: backup on Linux and Windows.
+**Next:** The script-level export and import path is evidenced by engine-script; the backup bundle itself is evidenced by the backup suite on all three platforms.
 
 **Acceptance criteria:**
 

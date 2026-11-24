@@ -121,6 +121,13 @@ CASE_SOURCES = {
     # ported to Rust - the directory engine, the shell commands, the
     # transfers and the refusals.
     "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs",
+    # The script interpreter's own cases: the parameter and timestamp
+    # expansion, the transfer presets and the resume modes, the stored
+    # sessions and their export, the raw session settings, and the XML
+    # action log. The retired Python suite drove a `linscp` binary this
+    # repository does not build, so these cases drive the same behaviour
+    # through the engine instead.
+    "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs",
     # The engine's own editor workflow: the monitored save and the refusal
     # to overwrite a file the server changed meanwhile, both driven against
     # the engine's local session. The editor double is a shell command, so
@@ -388,7 +395,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh", "proto-ftp",
                                "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
-                               "engine-sftp", "engine-scp", "engine-editor",
+                               "engine-sftp", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking

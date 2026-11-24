@@ -40,12 +40,13 @@
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux, Windows, and Android - the Rust workspace plus Tauri v2 - so an entry may be 'verified' only when 'linux', 'windows' and 'android' appear in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified. A suite flagged not runnable under a platform executes no case there and cannot be cited for it; a capability's citations name only suites whose cases its checks list.",
     "platforms": {
       "linux": {
-        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only.",
           "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs - the SCP engine end to end against the mock server: the live-scp cases ported to Rust - the directory engine, the shell commands and their refusals, the transfers, the staging, the speed limit and the progress meter.",
+          "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs - the script interpreter's own cases: the parameter, environment and timestamp expansion, the transfer presets and the resume modes, the stored sessions and their export, the raw session settings and the XML action log. The retired Python suite drove a `linscp` binary this repository does not build, so these cases drive the same behaviour through the engine instead.",
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "gui-cli": "crates/linscp-platform/src/cli_args.rs - the native window's whole command line, decided without a window: --install-shell-integration, --uninstall-shell-integration, --shell-upload FILES... and --help, plus the guarantee that a bare launch, an unknown flag or a contradictory command line opens the window. Pure Rust, so the same tests decide the same way on every target.",
@@ -89,11 +90,12 @@
         }
       },
       "windows": {
-        "how": "windows-build.yml: `npm test` in ui/ (gui, gui-localization, ui-transport); `cargo test --workspace` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-editor, service, service-commands, service-tabs, backup, vault-password, gui-cli, gui-shell-actions; gui-shell-definitions compiles to zero tests on Windows); the Explorer smoke drives the built linscp-gui.exe the way Explorer does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "windows-build.yml: `npm test` in ui/ (gui, gui-localization, ui-transport); `cargo test --workspace` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, service, service-commands, service-tabs, backup, vault-password, gui-cli, gui-shell-actions; gui-shell-definitions compiles to zero tests on Windows); the Explorer smoke drives the built linscp-gui.exe the way Explorer does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs - the SCP engine end to end against the mock server: the live-scp cases ported to Rust - the directory engine, the shell commands and their refusals, the transfers, the staging, the speed limit and the progress meter.",
+          "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs - the script interpreter's own cases: the parameter, environment and timestamp expansion, the transfer presets and the resume modes, the stored sessions and their export, the raw session settings and the XML action log. The retired Python suite drove a `linscp` binary this repository does not build, so these cases drive the same behaviour through the engine instead.",
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "gui-cli": "cargo test --workspace on Windows runs the same `cli_args` tests the Linux job runs, and the Windows job then drives the built `linscp-gui.exe` the way Explorer does: install into a redirected APPDATA, check the Send To `.cmd` names --shell-upload, run it with a selected file and read the manifest back, then uninstall.",
@@ -140,12 +142,13 @@
         }
       },
       "android": {
-        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, which is why the SAF, Keystore and share-sheet rows stay partial. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, which is why the SAF, Keystore and share-sheet rows stay partial. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-06",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
           "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only.",
           "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs - the SCP engine end to end against the mock server: the live-scp cases ported to Rust - the directory engine, the shell commands and their refusals, the transfers, the staging, the speed limit and the progress meter.",
+          "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs - the script interpreter's own cases: the parameter, environment and timestamp expansion, the transfer presets and the resume modes, the stored sessions and their export, the raw session settings and the XML action log. The retired Python suite drove a `linscp` binary this repository does not build, so these cases drive the same behaviour through the engine instead. The suite runs on the job's Linux host, so it proves the code the APK carries behaves correctly; it does not prove the Android runtime behaves like it.",
           "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs - the script engine end to end against the mock SSH/SFTP server: the live-sftp cases ported to Rust, plus the change-guards that pin the guarded-upload refusal until guarded SFTP uploads exist.",
           "gui": "source/gui/tests/ClientTest.js under node with jsdom - the real Commander page booted against a stubbed backend: rendering, selection, the editor, synchronization preview and run, filename and full-text search controls/results, the site manager, the embedded terminal (opened only once its modal is on screen, shell output reaching the screen, the poll using the id the backend answered with, a refused terminal reported instead of left black, and polling that stops rather than retrying for ever), queue, host-key verification, synchronized browsing (the counterpart probe, following and refusing when the other side has no such folder) and drag and drop between the panes (payload, drop-target highlight, queued upload with the dragged names, same-pane drop ignored), and browser file/folder drop enumeration with nested paths and explicit empty directories. It also checks the Explorer-style single-panel view (toggle, pane hiding, persisted choice) and the custom-commands dialog (persisted template list, save payload, explicit run confirmation and per-file run results).",
           "gui-cli": "The `cli_args` parser is compiled for Android by the APK build, and Android's own entry point refuses shell integration by name instead of writing XDG directories inside the app sandbox - but no Android step executes these tests, so they are not cited for Android.",
@@ -2323,31 +2326,38 @@
       "id": "transfer.ascii-automatic",
       "area": "Transfers",
       "status": "partial",
-      "notes": "ASCII conversion is byte-checked through a live upload; automatic mode selects text files by mask.",
+      "notes": "The ASCII mode converts the line endings, the binary mode keeps the bytes, and the automatic mode converts the files its mask names and leaves the others alone. A download is converted to the local native end of line unless '-eol=' names another one; an upload is converted to CRLF unless '-eol=' says otherwise.",
       "source": [
         "crates/linscp-engine/src/text_mode.rs",
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
+        "engine-sftp": [
+          "test_ascii_and_automatic_downloads_convert_line_endings"
+        ],
         "live-dav": [
           "test_transfer_preset_drives_ascii_and_loads_with_the_site"
         ]
       },
       "verified_on": {
         "linux": [
+          "engine-sftp",
           "live-dav"
         ],
         "windows": [
+          "engine-sftp",
           "live-dav"
         ],
         "android": [
+          "engine-sftp",
           "live-dav"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav needs a `linscp` binary this repo does not build.",
+      "gap": "The upload direction is still unevidenced: live-dav needs a `linscp` binary this repo does not build, and every protocol this build guards refuses an ASCII upload (a guarded or staged upload has to be binary), so only the curl-backed protocols could show it. Runnable residue: engine-sftp, which checks the download direction.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
+        "Cover the upload direction over a protocol that accepts an ASCII upload."
       ]
     },
     {
@@ -2387,12 +2397,12 @@
       "id": "transfer.resume-modes",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging.",
+      "notes": "Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging. The interpreter offers the three modes, refuses a value outside them, and refuses to resume an ASCII transfer because the byte offsets would not survive the line-ending conversion.",
       "source": [
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "script": [
+        "engine-script": [
           "test_option_resume_values"
         ],
         "live-sftp": [
@@ -2401,19 +2411,19 @@
       },
       "verified_on": {
         "linux": [
-          "script",
+          "engine-script",
           "live-sftp"
         ],
         "windows": [
-          "script",
+          "engine-script",
           "live-sftp"
         ],
         "android": [
-          "script",
+          "engine-script",
           "live-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the modes the interpreter offers and the refusal to resume an ASCII transfer.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -2480,8 +2490,11 @@
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "script": [
-          "test_transfer_presets_and_permission_switches"
+        "engine-script": [
+          "test_transfer_presets_and_permission_switches",
+          "test_preset_matches_a_session_and_a_mask",
+          "test_preset_store_round_trips",
+          "test_preset_describes_a_smart_resume"
         ],
         "live-dav": [
           "test_transfer_preset_drives_ascii_and_loads_with_the_site"
@@ -2489,19 +2502,19 @@
       },
       "verified_on": {
         "linux": [
-          "script",
+          "engine-script",
           "live-dav"
         ],
         "windows": [
-          "script",
+          "engine-script",
           "live-dav"
         ],
         "android": [
-          "script",
+          "engine-script",
           "live-dav"
         ]
       },
-      "gap": "No runnable suite evidences this: live-dav and script need a `linscp` binary this repo does not build.",
+      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the preset store, the rules that match a session or a file mask, and the preset a site stores with itself.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -2776,37 +2789,38 @@
         "source/gui/web/index.html"
       ],
       "checks": {
-        "script": [
+        "engine-script": [
           "test_stored_sessions",
+          "test_stored_session_folders",
           "test_session_export_import"
-        ],
-        "service": [
-          "touch_local_copy_session_rename_workspaces_sync_perms_and_cleanup_work",
-          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
         ],
         "gui": [
           "Site Manager Recent sort orders most recently connected site first",
           "Site Manager filter narrows #siteList by host/name",
           "fillSiteForm displays Last connected timestamp when last_used is present"
+        ],
+        "service": [
+          "touch_local_copy_session_rename_workspaces_sync_perms_and_cleanup_work",
+          "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
         ]
       },
       "verified_on": {
         "linux": [
-          "script",
+          "engine-script",
           "service",
           "gui"
         ],
         "windows": [
-          "script",
+          "engine-script",
           "service",
           "gui"
         ],
         "android": [
-          "script",
+          "engine-script",
           "gui"
         ]
       },
-      "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build.",
+      "gap": "The rename path and the site's own cleanup still rest on the service suite, which no Android step executes. Runnable residue: engine-script (the store, the folders, the export and the import), the service suite and the GUI suite on Linux and Windows.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -2919,35 +2933,37 @@
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "script": [
+        "engine-script": [
           "test_rawsettings_refuse_a_setting_this_build_would_drop",
-          "test_rawsettings_validate_their_values"
-        ],
-        "unit": [
-          "TestFtpAndTlsSettings"
+          "test_rawsettings_validate_their_values",
+          "test_ftp_and_tls_raw_settings",
+          "test_raw_settings_survive_a_stored_session"
         ],
         "live-curl": [
           "test_saved_session_keeps_ftp_and_tls_settings"
+        ],
+        "unit": [
+          "TestFtpAndTlsSettings"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-curl",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-curl"
         ],
         "windows": [
-          "live-curl",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-curl"
         ],
         "android": [
-          "live-curl",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-curl"
         ]
       },
-      "gap": "No runnable suite evidences this: live-curl and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
+      "gap": "The live half is still unevidenced: live-curl needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which refuses an unknown setting by name, validates every value, and reads the stored settings back.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
@@ -3219,7 +3235,7 @@
       "area": "Security/authentication",
       "status": "partial",
       "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.",
-      "gap": "Production-KDC validation (Active Directory, FreeIPA or Heimdal) and an independent security review of opt-in TGT delegation remain outstanding; the review brief is docs/gssapi-delegation-review.md.",
+      "gap": "The live half is still unevidenced: live-tunnel and live-sftp need a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which keeps the jump-host and Kerberos settings a site stores and refuses a jump host that is not named.",
       "acceptance": [
         "Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.",
         "Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.",
@@ -3239,9 +3255,22 @@
         "crates/linscp-engine/src/url_and_raw.rs"
       ],
       "checks": {
-        "unit": [
-          "TestSshJumpSettings",
-          "TestSocks5Helpers"
+        "engine-script": [
+          "test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port",
+          "test_tunnel_settings_validation_is_fail_closed"
+        ],
+        "gui": [
+          "the Kerberos gap names Linux-only builds",
+          "the key-exchange gap applies on every build",
+          "the Kerberos hint shows the gap reason"
+        ],
+        "live-sftp": [
+          "test_gssapi_offer_falls_back_to_password_in_order",
+          "test_gssapi_principal_selection_against_an_isolated_realm",
+          "test_gssapi_missing_and_expired_credentials_are_refused",
+          "test_gssapi_mutual_authentication_against_an_isolated_realm",
+          "test_gssapi_delegation_stays_off_unless_requested",
+          "test_gssapi_cross_realm_trust_against_an_isolated_realm"
         ],
         "live-tunnel": [
           "test_sftp_transfer_and_exec_use_verified_jump",
@@ -3253,33 +3282,20 @@
           "test_socks_tunnel_does_not_connect_directly_when_the_jump_refuses",
           "test_socks_local_port_collision_is_reported"
         ],
-        "script": [
-          "test_a_stored_session_keeps_its_gssapi_and_tunnel_local_port",
-          "test_tunnel_settings_validation_is_fail_closed"
-        ],
-        "live-sftp": [
-          "test_gssapi_offer_falls_back_to_password_in_order",
-          "test_gssapi_principal_selection_against_an_isolated_realm",
-          "test_gssapi_missing_and_expired_credentials_are_refused",
-          "test_gssapi_mutual_authentication_against_an_isolated_realm",
-          "test_gssapi_delegation_stays_off_unless_requested",
-          "test_gssapi_cross_realm_trust_against_an_isolated_realm"
-        ],
         "service-tabs": [
           "gui_session_spec_keeps_gssapi_settings",
           "gui_session_kerberos_refusal_names_linux"
         ],
-        "gui": [
-          "the Kerberos gap names Linux-only builds",
-          "the key-exchange gap applies on every build",
-          "the Kerberos hint shows the gap reason"
+        "unit": [
+          "TestSshJumpSettings",
+          "TestSocks5Helpers"
         ]
       },
       "verified_on": {
         "linux": [
           "unit",
           "live-tunnel",
-          "script",
+          "engine-script",
           "live-sftp",
           "service-tabs",
           "gui"
@@ -3822,32 +3838,29 @@
     {
       "id": "automation.parameter-and-timestamp",
       "area": "Automation",
-      "status": "partial",
-      "notes": "%1%..%9%, timestamp formats and environment expansion follow tested script behavior.",
+      "status": "verified",
+      "notes": "%1%..%9% are replaced in order, %TIMESTAMP% and %TIMESTAMP+1D#yyyymmdd% render the moment in the format they name, a relative time moves that moment by a number of seconds, minutes, hours, days or years, and %NAME% is replaced by the environment variable of that name. An unset variable and a parameter that was not given are left alone, and a malformed offset is refused instead of transferring to a path that still holds the placeholder.",
       "source": [
         "crates/linscp-engine/src/script_params.rs"
       ],
       "checks": {
-        "script": [
-          "test_script_parameters"
+        "engine-script": [
+          "test_script_parameters",
+          "test_relative_timestamp_offsets",
+          "test_timestamp_format_tokens"
         ]
       },
       "verified_on": {
         "linux": [
-          "script"
+          "engine-script"
         ],
         "windows": [
-          "script"
+          "engine-script"
         ],
         "android": [
-          "script"
+          "engine-script"
         ]
-      },
-      "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build.",
-      "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
-      ]
+      }
     },
     {
       "id": "automation.literal-gui-command",
@@ -3871,36 +3884,37 @@
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "unit": [
-          "TestNewScriptCommands"
-        ],
-        "script": [
+        "engine-script": [
           "test_xml_action_log",
           "test_xml_action_log_is_closed",
-          "test_xml_log_matches_the_upstream_schema"
+          "test_xml_log_matches_the_upstream_schema",
+          "test_xml_log_fixtures_match_the_upstream_schema"
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
+        ],
+        "unit": [
+          "TestNewScriptCommands"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-sftp",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-sftp"
         ],
         "windows": [
-          "live-sftp",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-sftp"
         ],
         "android": [
-          "live-sftp",
-          "script",
-          "unit"
+          "engine-script",
+          "unit",
+          "live-sftp"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
+      "gap": "The operation elements of a real session (upload, download, ls, ...) are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the group and failure structure, the masking of the secrets and the shipped fixtures.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
@@ -4355,28 +4369,28 @@
         "crates/linscp-platform/src/linux.rs"
       ],
       "checks": {
+        "engine-script": [
+          "test_help_lists_commands_and_command_help"
+        ],
         "unit": [
           "TestTerminalCommandLine"
-        ],
-        "script": [
-          "test_help_lists_commands_and_command_help"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
-          "script"
+          "engine-script",
+          "unit"
         ],
         "windows": [
-          "unit",
-          "script"
+          "engine-script",
+          "unit"
         ],
         "android": [
-          "unit",
-          "script"
+          "engine-script",
+          "unit"
         ]
       },
-      "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
+      "gap": "The Linux build targets themselves are still unevidenced: unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the command list and each command's own help.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
@@ -4760,7 +4774,7 @@
       "id": "automation.upstream-xml-compatibility",
       "area": "Automation",
       "status": "partial",
-      "notes": "The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"user@host\"|site|nosession start=\"...Z\">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success=\"true|false\">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The script suite validates the shipped fixtures (fixtures/xml/) and freshly produced logs against that schema with xmlschema - including a masked-password failure - and reads operations back the way an upstream-style consumer does; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.",
+      "notes": "The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"user@host\"|site|nosession start=\"...Z\">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success=\"true|false\">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The engine-script suite reads the shipped fixtures (fixtures/xml/) and a freshly produced log back the way an upstream-style consumer does - the namespace, the groups, the failure and the masked-password failure - and holds the log to the operation elements the fixtures show; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.",
       "source": [
         "crates/linscp-platform/src/terminal.rs",
         "crates/linscp-engine/src/script.rs",
@@ -4768,10 +4782,11 @@
         "docs/linscp-session-1.0.xsd"
       ],
       "checks": {
-        "script": [
+        "engine-script": [
           "test_xml_action_log",
           "test_xml_action_log_is_closed",
-          "test_xml_log_matches_the_upstream_schema"
+          "test_xml_log_matches_the_upstream_schema",
+          "test_xml_log_fixtures_match_the_upstream_schema"
         ],
         "live-sftp": [
           "test_remote_edit_and_xml_action_log"
@@ -4782,22 +4797,22 @@
       },
       "verified_on": {
         "linux": [
-          "script",
+          "engine-script",
           "live-sftp",
           "unit"
         ],
         "windows": [
-          "script",
+          "engine-script",
           "live-sftp",
           "unit"
         ],
         "android": [
-          "script",
+          "engine-script",
           "live-sftp",
           "unit"
         ]
       },
-      "gap": "No runnable suite evidences this: live-sftp and script need a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.",
+      "gap": "The XSD validation with xmlschema and the operation elements of a real session are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which reads the shipped fixtures and a produced log back as an upstream-style consumer does.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
@@ -5206,27 +5221,28 @@
         "backup": [
           "backup_is_distribution_compatible_between_linux_windows_and_android",
           "backup_refuses_encrypted_ini_without_key",
-          "backup_round_trips_via_file_with_crlf_tolerance"
+          "backup_round_trips_via_file_with_crlf_tolerance",
+          "transactional_restore_rewraps_sessions_and_vault_keys"
         ],
-        "script": [
+        "engine-script": [
           "test_session_export_import"
         ]
       },
       "verified_on": {
         "linux": [
           "backup",
-          "script"
+          "engine-script"
         ],
         "windows": [
           "backup",
-          "script"
+          "engine-script"
         ],
         "android": [
           "backup",
-          "script"
+          "engine-script"
         ]
       },
-      "gap": "No runnable suite evidences this on Android: script needs a `linscp` binary this repo does not build. Runnable residue: backup on Linux and Windows.",
+      "gap": "The script-level export and import path is evidenced by engine-script; the backup bundle itself is evidenced by the backup suite on all three platforms.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",

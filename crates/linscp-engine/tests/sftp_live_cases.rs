@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use filetime::FileTime;
 use linscp_engine::filemask::mode_from_permissions_str;
+use linscp_engine::text_mode::EolStyle;
 use linscp_engine::script::{BatchMode, ScriptInterpreter, ScriptRunConfig};
 use linscp_engine::url_and_raw::ParsedSiteSpec;
 use linscp_engine::xml_log::SessionLogger;
@@ -436,6 +437,71 @@ async fn test_transfer_speed_append_and_preservetime_all() {
         .await
         .unwrap();
     assert_eq!(remote_log, b"head\n", "the refused append left the remote alone");
+
+    sftp.close().await.unwrap();
+}
+
+/// The ASCII mode converts the line endings on the way down and the binary
+/// mode leaves the bytes alone; the automatic mode converts the files its
+/// mask names and leaves the others alone.
+///
+/// The target is the local native end of line, so the expectation is spelled
+/// out rather than assumed: a build that runs on Linux ends the lines with
+/// LF, one that runs on Windows with CRLF.
+#[tokio::test]
+async fn test_ascii_and_automatic_downloads_convert_line_endings() {
+    let tmp = tempfile::tempdir().expect("temp dir");
+    let (sftp, _fp) = connect_mock(0x6b, 0x6c).await;
+    seed_remote(&sftp, "/crlf.txt", b"a\r\nb\r\n", None).await;
+    seed_remote(&sftp, "/payload.dat", b"a\r\nb\r\n", None).await;
+
+    let expected = match EolStyle::local_native() {
+        EolStyle::Lf => b"a\nb\n".to_vec(),
+        EolStyle::Crlf => b"a\r\nb\r\n".to_vec(),
+        EolStyle::Cr => b"a\rb\r".to_vec(),
+    };
+
+    let ascii_out = tmp.path().join("ascii.txt");
+    let binary_out = tmp.path().join("binary.out");
+    let automatic_out = tmp.path().join("automatic.txt");
+    let automatic_other_out = tmp.path().join("automatic.out");
+
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+
+    let script = format!(
+        "get -transfer=ascii /crlf.txt {}\n\
+         get -transfer=binary /crlf.txt {}\n\
+         get -transfer=automatic /crlf.txt {}\n\
+         get -transfer=automatic /payload.dat {}",
+        ascii_out.display(),
+        binary_out.display(),
+        automatic_out.display(),
+        automatic_other_out.display()
+    );
+    let (ok, out) = run_script(&mut interp, &script).await;
+    assert!(ok, "the downloads run: {out}");
+
+    assert_eq!(
+        fs::read(&ascii_out).unwrap(),
+        expected,
+        "the ASCII download converts the line endings"
+    );
+    assert_eq!(
+        fs::read(&binary_out).unwrap(),
+        b"a\r\nb\r\n",
+        "the binary download keeps the bytes as they are"
+    );
+    assert_eq!(
+        fs::read(&automatic_out).unwrap(),
+        expected,
+        "the automatic mode converts a file its mask names"
+    );
+    assert_eq!(
+        fs::read(&automatic_other_out).unwrap(),
+        b"a\r\nb\r\n",
+        "the automatic mode leaves a file its mask does not name alone"
+    );
 
     sftp.close().await.unwrap();
 }
