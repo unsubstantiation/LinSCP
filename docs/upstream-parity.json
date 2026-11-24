@@ -1499,6 +1499,31 @@
       "commands": [
         "backup"
       ]
+    },
+    {
+      "name": "lmkdir / find",
+      "status": "verified",
+      "notes": "Console-panel local directory creation (`lmkdir [-parents] <dir>...`) and bounded recursive file search (`find [-local] [<dir>] [<mask>]`) for the GUI's CLI panel, covered by gui.",
+      "source": [
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-service/src/lib.rs",
+        "source/gui/web/index.html"
+      ],
+      "verified_on": {
+        "linux": [
+          "gui"
+        ],
+        "windows": [
+          "gui"
+        ],
+        "android": [
+          "gui"
+        ]
+      },
+      "commands": [
+        "lmkdir",
+        "find"
+      ]
     }
   ],
   "capabilities": [

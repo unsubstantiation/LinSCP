@@ -183,7 +183,13 @@ pub fn filter_excluded_sync_items(
 // The staged tree is on the destination filesystem. Publication uses atomic
 // create-if-absent hard links; never delete entries already merged on failure,
 // since another actor may have replaced them in the meantime.
-fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, depth: usize) -> Result<(), String> {
+fn merge_staged_local_tree(
+    stage: &Path,
+    target: &Path,
+    preserve_time_dirs: bool,
+    cancel: &AtomicBool,
+    depth: usize,
+) -> Result<(), String> {
     if depth > 64 { return Err("Directory nesting limit exceeded.".to_string()); }
     if cancel.load(Ordering::SeqCst) { return Err("Transfer cancelled during merge publication.".to_string()); }
     let target_meta = std::fs::symlink_metadata(target).map_err(|e| format!("Cannot inspect merge directory '{}': {e}", target.display()))?;
@@ -203,13 +209,20 @@ fn merge_staged_local_tree(stage: &Path, target: &Path, cancel: &AtomicBool, dep
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {},
                 Err(error) => return Err(format!("Cannot create merge directory '{}': {error}", dst.display())),
             }
-            merge_staged_local_tree(&src, &dst, cancel, depth + 1)?;
+            merge_staged_local_tree(&src, &dst, preserve_time_dirs, cancel, depth + 1)?;
         } else if meta.is_file() {
             // Publication is atomic and never replaces an existing file, on
             // every platform: the platform crate picks the primitive.
             linscp_platform::publish_no_replace(&src, &dst)
                 .map_err(|e| format!("Cannot publish merge file '{}': {e}", dst.display()))?;
         } else { return Err("Refusing a staged non-file.".to_string()); }
+    }
+    if preserve_time_dirs {
+        if let Ok(ext) = linscp_platform::gui_os::stat_extended(stage) {
+            if ext.mtime_secs > 0 {
+                let _ = set_local_file_times(target, ext.mtime_secs, ext.mtime_secs);
+            }
+        }
     }
     Ok(())
 }
@@ -294,6 +307,9 @@ async fn download_staged_remote_tree(
                 }
             }
         }
+    }
+    if flags.preserve_time && flags.preserve_time_dirs && entry.mtime > 0 {
+        let _ = set_local_file_times(local, entry.mtime, entry.mtime);
     }
     Ok(())
 }
@@ -415,6 +431,13 @@ async fn upload_new_remote_tree(
             upload_staged_or_binary_file(session, &from, &to, flags, logger, progress).await?;
         } else { return Err("Refusing to transfer a non-file.".to_string()); }
     }
+    if flags.preserve_time && flags.preserve_time_dirs {
+        if let Ok(ext) = linscp_platform::gui_os::stat_extended(local) {
+            if ext.mtime_secs > 0 {
+                let _ = session.set_mtime(remote, ext.mtime_secs).await;
+            }
+        }
+    }
     Ok(())
 }
 
@@ -467,11 +490,19 @@ impl QueuedTransferTask {
         } else {
             (&self.destination, &self.source)
         };
+        let detail = if !self.label.is_empty() {
+            self.label.clone()
+        } else if !self.source.is_empty() || !self.destination.is_empty() {
+            format!("{} \u{2192} {}", self.source, self.destination)
+        } else {
+            self.direction.clone()
+        };
         json!({
             "id": self.id,
             "tab_id": self.tab_id,
             "direction": self.direction,
             "label": self.label,
+            "detail": detail,
             "source": self.source,
             "destination": self.destination,
             "local_path": local_path,
@@ -1074,7 +1105,13 @@ impl QueueManager {
                         download_staged_remote_tree(session.as_ref(), remote_path, &staged_tree, &stage_flags, &mut logger, Some(&*progress), 0).await?;
                         if task.cancel_flag.load(Ordering::SeqCst) { return Err("Transfer cancelled before publication.".to_string()); }
                         if f.merge_directories {
-                            merge_staged_local_tree(&staged_tree, local_dest, &task.cancel_flag, 0)?;
+                            merge_staged_local_tree(
+                                &staged_tree,
+                                local_dest,
+                                f.preserve_time && f.preserve_time_dirs,
+                                &task.cancel_flag,
+                                0,
+                            )?;
                         } else {
                             linscp_platform::gui_os::rename_no_replace(&staged_tree, local_dest)
                                 .map_err(|e| format!("Cannot publish downloaded directory '{}': {e}", local_dest.display()))?;
@@ -1691,6 +1728,13 @@ fn local_copy_recursive_with_flags(
             }
             let child_dst = target.join(child.file_name());
             local_copy_recursive_with_flags(&child_src, &child_dst, policy, flags, cancel, copied, total, progress)?;
+        }
+        if flags.preserve_time && flags.preserve_time_dirs {
+            if let Ok(src_ext) = linscp_platform::gui_os::stat_extended(source) {
+                if src_ext.mtime_secs > 0 {
+                    let _ = set_local_file_times(target, src_ext.mtime_secs, src_ext.mtime_secs);
+                }
+            }
         }
         return Ok(());
     }

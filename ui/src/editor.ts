@@ -47,6 +47,7 @@ import {
   HighlightStyle,
 } from '@codemirror/language';
 import {
+  gotoLine,
   searchKeymap,
   highlightSelectionMatches,
   openSearchPanel,
@@ -78,6 +79,13 @@ import { go } from '@codemirror/legacy-modes/mode/go';
 import { groovy } from '@codemirror/legacy-modes/mode/groovy';
 import { powerShell } from '@codemirror/legacy-modes/mode/powershell';
 
+export interface CursorPosition {
+  /** 1-based line number. */
+  line: number;
+  /** 1-based column offset within the line. */
+  column: number;
+}
+
 export interface MountOptions {
   /** The file's text. */
   value: string;
@@ -87,6 +95,8 @@ export interface MountOptions {
   languagePath?: string;
   /** Called with the full text whenever the document changes. */
   onDocChange?: (value: string) => void;
+  /** Called whenever the caret moves or document changes. */
+  onCursorChange?: (pos: CursorPosition) => void;
 }
 
 export interface MountedEditor {
@@ -98,6 +108,10 @@ export interface MountedEditor {
   focus(): void;
   /** Open the built-in Find / Replace search panel. */
   openSearch(): void;
+  /** Jump to a 1-based line number, or open the Go-to-line panel when omitted. */
+  goToLine(lineNumber?: number): void;
+  /** Return the current 1-based caret line and column. */
+  getCursor(): CursorPosition;
   get readOnly(): boolean;
   /** Detach the editor from the DOM and release its listeners. */
   destroy(): void;
@@ -289,9 +303,18 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
   const editable = new Compartment();
   const language = new Compartment();
 
+  const cursorPos = (state: EditorState): CursorPosition => {
+    const head = state.selection.main.head;
+    const lineObj = state.doc.lineAt(head);
+    return { line: lineObj.number, column: head - lineObj.from + 1 };
+  };
+
   const updateListener = EditorView.updateListener.of(update => {
     if (update.docChanged && options.onDocChange) {
       options.onDocChange(update.state.doc.toString());
+    }
+    if ((update.selectionSet || update.docChanged) && options.onCursorChange) {
+      options.onCursorChange(cursorPos(update.state));
     }
   });
 
@@ -330,11 +353,16 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
           indentWithTab,
           { key: 'Mod-/', run: toggleComment },
           { key: 'Mod-f', run: openSearchPanel, preventDefault: true },
+          { key: 'Mod-g', run: gotoLine, preventDefault: true },
         ]),
         updateListener,
       ],
     }),
   });
+
+  if (options.onCursorChange) {
+    options.onCursorChange(cursorPos(view.state));
+  }
 
   return {
     getValue: () => view.state.doc.toString(),
@@ -348,6 +376,21 @@ export function mount(host: HTMLElement, options: MountOptions): MountedEditor {
       view.focus();
       openSearchPanel(view);
     },
+    goToLine: (lineNumber?: number) => {
+      view.focus();
+      if (typeof lineNumber === 'number' && Number.isFinite(lineNumber) && lineNumber >= 1) {
+        const total = Math.max(1, view.state.doc.lines);
+        const target = Math.min(Math.floor(lineNumber), total);
+        const lineInfo = view.state.doc.line(target);
+        view.dispatch({
+          selection: { anchor: lineInfo.from },
+          scrollIntoView: true,
+        });
+        return;
+      }
+      gotoLine(view);
+    },
+    getCursor: () => cursorPos(view.state),
     get readOnly() { return view.state.readOnly; },
     destroy: () => { view.destroy(); },
   };
