@@ -125,6 +125,7 @@ CASE_SOURCES = {
     "engine-dav-ascii": "crates/linscp-engine/tests/conditional_ascii_upload.rs",
     # FTP STOU publication of converted text through the engine and protocol.
     "engine-ftp-ascii": "crates/linscp-engine/tests/ftp_staged_ascii.rs",
+    "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs",
     # The SCP engine end to end against the mock server: the live-scp cases
     # ported to Rust - the directory engine, the shell commands, the
     # transfers and the refusals.
@@ -403,7 +404,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "platform-linux", "proto-ssh", "proto-ftp",
                                "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
-                               "engine-sftp", "engine-dav-ascii", "engine-ftp-ascii", "engine-scp", "engine-script", "engine-editor",
+                               "engine-sftp", "engine-dav-ascii", "engine-ftp-ascii", "engine-conditional-resume", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking

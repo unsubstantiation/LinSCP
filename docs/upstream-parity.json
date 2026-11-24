@@ -78,7 +78,8 @@
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Linux host tests cover private filesystem helpers and configuration directory lookup.",
           "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Linux CI.",
-          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards."
+          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards.",
+          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -130,7 +131,8 @@
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only.",
           "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Windows CI.",
-          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards."
+          "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards.",
+          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -2384,11 +2386,13 @@
       "id": "transfer.filepart-resume",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch.",
+      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch. Ordinary WebDAV and current-object S3 resumes compare the prefix under a strong ETag and use the same condition for the remaining download; versioned S3 partial resumes fail closed.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
         "crates/linscp-engine/src/script.rs",
-        "crates/linscp-engine/src/transfer.rs"
+        "crates/linscp-engine/src/transfer.rs",
+        "crates/linscp-proto/src/webdav.rs",
+        "crates/linscp-proto/src/s3.rs"
       ],
       "checks": {
         "live-sftp": [
@@ -2405,27 +2409,31 @@
         ],
         "engine-ftp-ascii": [
           "ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable"
+        ],
+        "engine-conditional-resume": [
+          "webdav_and_s3_ordinary_resume_pin_and_compare"
         ]
       },
       "verified_on": {
         "linux": [
           "live-sftp",
           "engine-sftp",
-          "engine-ftp-ascii"
+          "engine-ftp-ascii",
+          "engine-conditional-resume"
         ],
         "windows": [
           "live-sftp",
           "engine-sftp",
-          "engine-ftp-ascii"
+          "engine-ftp-ascii",
+          "engine-conditional-resume"
         ],
         "android": [
           "live-sftp",
           "engine-sftp"
         ]
       },
-      "gap": "Linux and Windows loopback CI exercise interrupted SFTP downloads and stale SFTP/FTP prefix refusals. FTP and SFTP size/mtime checks are not atomic snapshots: a remote or local file can still change concurrently, including with unchanged metadata. Ordinary WebDAV/S3 resume paths do not yet verify prefixes. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.",
+      "gap": "Linux and Windows loopback CI exercise stale FTP/SFTP/WebDAV/S3 prefixes and conditional WebDAV/S3 source changes. FTP and SFTP size/mtime checks are not atomic snapshots: a remote or local file can still change concurrently, including with unchanged metadata. WebDAV/S3 conditional behavior requires a conforming server, and versioned S3 partial resumes are refused. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.",
       "acceptance": [
-        "Protect ordinary WebDAV and S3 resumes against stale prefixes using strong server-side version checks.",
         "Address concurrent local and remote modification during FTP/SFTP resume without claiming size/mtime is an atomic snapshot.",
         "Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.",
         "Exercise Android-device and relevant live-server behavior without the removed CLI."
