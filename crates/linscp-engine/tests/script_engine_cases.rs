@@ -1326,7 +1326,7 @@ async fn test_xml_log_fixtures_match_the_upstream_schema() {
         .find(|n| n.is_element() && n.tag_name().name() == "result")
         .expect("the upload has a result");
     assert_eq!(
-        result.attribute("success").map(String::as_str),
+        result.attribute("success"),
         Some("true"),
         "the result says the upload worked"
     );
