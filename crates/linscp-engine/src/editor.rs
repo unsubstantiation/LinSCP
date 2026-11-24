@@ -379,3 +379,120 @@ fn cleanup_temp(temp_path: &PathBuf, work_dir: &PathBuf, keep: bool) {
         let _ = std::fs::remove_dir_all(work_dir);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_planner::LocalSyncSession;
+    use linscp_platform::NativeLocalFs;
+    use std::sync::Arc;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("linscp-edit-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("scratch directory");
+        dir.canonicalize().expect("canonical scratch directory")
+    }
+
+    /// The remote side of the editor tests is a directory on disk that the
+    /// engine's own local session serves. The file's timestamp is fixed, so
+    /// "the server changed the file while it was being edited" is a fact the
+    /// test creates rather than a race it hopes for.
+    fn remote_file(root: &Path, name: &str, content: &[u8]) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, content).expect("remote file");
+        filetime::set_file_mtime(&path, filetime::FileTime::from_unix_time(1_600_000_000, 0))
+            .expect("fixed timestamp");
+        path
+    }
+
+    fn session(root: &Path) -> LocalSyncSession {
+        LocalSyncSession::new(
+            root.to_string_lossy().into_owned(),
+            Arc::new(NativeLocalFs::new()),
+        )
+    }
+
+    fn logger() -> SessionLogger {
+        SessionLogger::open(None, 0, false, None, None, false, "").expect("session logger")
+    }
+
+    /// `-monitor` watches the temporary copy while the editor is open and
+    /// uploads every save. A save made after the editor started is uploaded,
+    /// and the upload is reported.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_monitor_uploads_a_save_made_while_the_editor_is_open() {
+        let root = scratch("monitor-upload");
+        let remote = remote_file(&root, "note.txt", b"original\n");
+        let opts = EditOptions {
+            // The editor writes the copy a moment after it starts and then
+            // stays open, so the save can only be seen by the monitor.
+            editor: "sh -c 'sleep 0.3; printf edited > \"$1\"; sleep 5' editor".to_string(),
+            monitor: true,
+            monitor_passes: 1,
+            monitor_interval_ms: 25,
+            ..EditOptions::default()
+        };
+        let mut messages: Vec<String> = Vec::new();
+        let result = edit_remote_file(
+            &session(&root),
+            "/note.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        assert!(result.is_ok(), "{result:?} {messages:?}");
+        assert_eq!(
+            std::fs::read_to_string(&remote).unwrap_or_default(),
+            "edited",
+            "the monitored save reached the remote file"
+        );
+        assert!(
+            messages.iter().any(|m| m.contains("Uploaded")),
+            "the upload was reported: {messages:?}"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// A file that changed on the server while it was being edited is never
+    /// overwritten: the local copy is kept and the refusal names the file.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn edit_monitor_refuses_to_overwrite_a_file_that_changed_on_the_server() {
+        let root = scratch("monitor-conflict");
+        let remote = remote_file(&root, "note.txt", b"original\n");
+        let editor = format!(
+            "sh -c 'sleep 0.3; printf edited > \"$1\"; printf concurrent > \"{}\"; sleep 5' editor",
+            remote.to_string_lossy()
+        );
+        let opts = EditOptions {
+            editor,
+            monitor: true,
+            monitor_passes: 1,
+            monitor_interval_ms: 25,
+            ..EditOptions::default()
+        };
+        let mut messages: Vec<String> = Vec::new();
+        let result = edit_remote_file(
+            &session(&root),
+            "/note.txt",
+            &opts,
+            &mut logger(),
+            |message| messages.push(message.to_string()),
+        )
+        .await;
+        let error = result.expect_err("the concurrent change must be refused");
+        assert!(
+            error.contains("changed on the server"),
+            "the refusal names the concurrent change: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&remote).unwrap_or_default(),
+            "concurrent",
+            "the remote file kept the content the server gave it"
+        );
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

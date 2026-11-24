@@ -99,6 +99,11 @@ CASE_SOURCES = {
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
     # no Rust tests, so Android rows cite other suites instead.
     "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs",
+    # The engine's own editor workflow: the monitored save and the refusal
+    # to overwrite a file the server changed meanwhile, both driven against
+    # the engine's local session. The editor double is a shell command, so
+    # these cases run on the Unix hosts only.
+    "engine-editor": "crates/linscp-engine/src/editor.rs",
     # The password-only vault: setup/unlock/lock and the retired prefixes.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "vault-password": "crates/linscp-platform/src/password_vault.rs",
@@ -360,7 +365,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "proto-ssh", "engine-sftp",
-                               "vault-password", "service-tabs"):
+                               "engine-editor", "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking
                     # arguments is not a case: `exercise_remote_delete` was

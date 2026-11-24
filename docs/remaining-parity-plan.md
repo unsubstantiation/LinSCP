@@ -4,7 +4,7 @@
 
 Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
 
-86 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+85 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -715,20 +715,6 @@ An operating-system drop in a native window arrives as paths, not as a File: `dr
 - [ ] Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).
 - [ ] Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.
 - [ ] Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop.
-
-## editing.monitor-local-changes
-
-**Area:** Editing/search · **Status:** partial
-
-'edit -monitor' watches the temporary local file while the external editor remains open and uploads each save after verifying the remote file was not modified concurrently.
-
-**Next:** No runnable suite evidences this: live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled.
-
-**Acceptance criteria:**
-
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
 
 ## editing.encoding-policy
 
