@@ -21,12 +21,12 @@ use linscp_proto::listing::{permissions_string, S_IFDIR, S_IFLNK, S_IFREG};
 use linscp_proto::sftp::{
     SftpPacketReader, SftpPacketWriter, SftpWireAttrs,
     SSH_FILEXFER_ATTR_ACMODTIME, SSH_FILEXFER_ATTR_PERMISSIONS, SSH_FILEXFER_ATTR_SIZE,
-    SSH_FXF_APPEND, SSH_FXF_CREAT, SSH_FXF_TRUNC, SSH_FXP_ATTRS, SSH_FXP_CLOSE,
+    SSH_FXF_APPEND, SSH_FXF_CREAT, SSH_FXF_EXCL, SSH_FXF_TRUNC, SSH_FXP_ATTRS, SSH_FXP_CLOSE,
     SSH_FXP_DATA, SSH_FXP_EXTENDED, SSH_FXP_EXTENDED_REPLY, SSH_FXP_HANDLE, SSH_FXP_INIT,
     SSH_FXP_LSTAT, SSH_FXP_MKDIR, SSH_FXP_NAME, SSH_FXP_OPEN, SSH_FXP_OPENDIR, SSH_FXP_READ,
     SSH_FXP_READDIR, SSH_FXP_READLINK, SSH_FXP_REALPATH, SSH_FXP_REMOVE, SSH_FXP_RENAME,
     SSH_FXP_RMDIR, SSH_FXP_SETSTAT, SSH_FXP_STAT, SSH_FXP_STATUS, SSH_FXP_SYMLINK,
-    SSH_FXP_VERSION, SSH_FXP_WRITE, SSH_FX_EOF, SSH_FX_NO_SUCH_FILE, SSH_FX_OK,
+    SSH_FXP_VERSION, SSH_FXP_WRITE, SSH_FX_EOF, SSH_FX_FAILURE, SSH_FX_NO_SUCH_FILE, SSH_FX_OK,
     SSH_FX_OP_UNSUPPORTED,
 };
 use linscp_proto::ssh::compute_ssh_fingerprints;
@@ -1448,6 +1448,15 @@ async fn serve_mock_sftp(
                 let norm = MemFs::normalize(&raw);
                 let mut guard = fs.lock().await;
                 let exists = guard.nodes.contains_key(&norm);
+                // SFTP v3 exclusive creation is atomic: an existing pathname,
+                // including a symlink or directory, must never be opened.
+                if exists && (pflags & SSH_FXF_CREAT) != 0 && (pflags & SSH_FXF_EXCL) != 0 {
+                    drop(guard);
+                    let pkt = sftp_status_packet(req_id, SSH_FX_FAILURE, "File already exists");
+                    stream.write_all(&pkt).await?;
+                    stream.flush().await?;
+                    continue;
+                }
                 if (pflags & SSH_FXF_CREAT) != 0 {
                     if !exists || (pflags & SSH_FXF_TRUNC) != 0 {
                         let mode = if (attrs.flags & SSH_FILEXFER_ATTR_PERMISSIONS) != 0 {
