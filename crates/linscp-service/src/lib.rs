@@ -20599,6 +20599,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// A granted folder has no native watcher. A mutation made after the
+    /// initial snapshot must be picked up by the next timed pass, not merely
+    /// by the initial catch-up pass (which the older one-pass test covered).
+    #[tokio::test]
+    async fn saf_keep_up_to_date_rechecks_after_poll_interval() {
+        use std::time::Duration;
+        use linscp_engine::keepuptodate::{run_keep_up_to_date, KeepUpToDateOptions};
+        let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let session = MockSession::new();
+        let opts = KeepUpToDateOptions { interval_ms: 400, max_passes: 2, install_signal_handlers: false, ..Default::default() };
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+        let mut pass_one = None;
+        let mut statuses = Vec::new();
+        let count = run_keep_up_to_date(&session, Path::new(SAF_GRANTED_DIR), "/", Some(&fs), &opts, &mut logger, |status| {
+            statuses.push(status.to_string());
+            if status.starts_with("Pass 1:") {
+                assert_eq!(session.bytes_of("/first.txt").as_deref(), Some(b"first".as_slice()));
+                pass_one = Some(std::time::Instant::now());
+                bridge.add_file(&MockBridge::doc_uri("later.txt"), b"arrived after the first pass");
+            }
+        }).await.unwrap();
+        assert!(pass_one.unwrap().elapsed() >= Duration::from_millis(350), "the no-watcher path must wait for its poll interval");
+        assert!(statuses.iter().any(|s| s.starts_with("Pass 2:")), "{statuses:?}");
+        assert!(count >= 2, "both passes must apply their upload");
+        assert_eq!(session.bytes_of("/later.txt").as_deref(), Some(b"arrived after the first pass".as_slice()));
+    }
+
+    /// The same no-watcher wait remains cancellable promptly even when its
+    /// rescan interval is long; the queued task must not perform another pass.
+    #[tokio::test]
+    async fn saf_keep_up_to_date_cancels_during_poll_wait() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let reply = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/keepuptodate".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "interval": 60, "count": 0}) }).await;
+        assert_eq!(reply.status, 200, "{}", reply.payload);
+        let task_id = reply.payload["task_id"].as_u64().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while session.bytes_of("/first.txt").is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "initial synchronization did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bridge.add_file(&MockBridge::doc_uri("late.txt"), b"too late");
+        let cancel = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/queue/cancel".into(), body: json!({"task_id": task_id}) });
+        assert_eq!(cancel.status, 200, "{}", cancel.payload);
+        let task = wait_for_task(&svc, "Cancelled").await;
+        assert_eq!(task["id"].as_u64(), Some(task_id));
+        assert!(session.bytes_of("/late.txt").is_none());
+    }
+
     /// Link creation validates before it touches the filesystem, on every
     /// platform: the two names must differ and be single leaves, the link
     /// name must be free, and a granted folder gets the limitation's name.
