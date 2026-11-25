@@ -2386,7 +2386,7 @@
       "id": "transfer.filepart-resume",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch. Ordinary WebDAV and current-object S3 resumes compare the prefix under a strong ETag and use the same condition for the remaining download; versioned S3 partial resumes fail closed. FTP/SFTP partial reuse is refused unless the user explicitly accepts best-effort resume for that transfer. The GUI warns that concurrent changes can corrupt the result, and the engine independently enforces the opt-in. A staged partial selected after verification must match the path and length that were checked.",
+      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch. Ordinary WebDAV and S3 resumes compare the prefix under a strong ETag and use the same condition for the remaining download. Versioned S3 resumes additionally send the version ID and require the server to confirm it on HEAD and each conditional GET; versioned source deletion is refused. FTP/SFTP partial reuse is refused unless the user explicitly accepts best-effort resume for that transfer. The GUI warns that concurrent changes can corrupt the result, and the engine independently enforces the opt-in. A staged partial selected after verification must match the path and length that were checked.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2413,7 +2413,8 @@
           "ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable"
         ],
         "engine-conditional-resume": [
-          "webdav_and_s3_ordinary_resume_pin_and_compare"
+          "webdav_and_s3_ordinary_resume_pin_and_compare",
+          "s3_versioned_resume_pins_version_and_preserves_partials_on_failure"
         ],
         "service": [
           "sftp_resume_requires_explicit_per_request_risk_approval"
@@ -2444,7 +2445,7 @@
           "engine-sftp"
         ]
       },
-      "gap": "Linux and Windows loopback CI exercise stale FTP/SFTP/WebDAV/S3 prefixes and conditional WebDAV/S3 source changes. FTP/SFTP resume is best-effort only with explicit per-transfer approval: size/mtime checks cannot pin an atomic snapshot, and concurrent remote or local modifications can still corrupt a result. WebDAV/S3 conditional behavior requires a conforming server, and versioned S3 partial resumes are refused. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.",
+      "gap": "Linux and Windows loopback CI exercise stale FTP/SFTP/WebDAV/S3 prefixes and conditional WebDAV/S3 source changes. FTP/SFTP resume is best-effort only with explicit per-transfer approval: size/mtime checks cannot pin an atomic snapshot, and concurrent remote or local modifications can still corrupt a result. WebDAV/S3 conditional behavior requires a conforming server; versioned S3 partial resume is available through the engine but not yet exposed in the GUI version-download workflow. Guarded SFTP/FTP uploads still cannot resume; Android-device and live third-party server behavior remain unverified.",
       "acceptance": [
         "Consider stronger protections for concurrent local and remote changes; FTP/SFTP cannot provide atomic snapshots and best-effort resume requires explicit consent.",
         "Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.",
