@@ -513,7 +513,7 @@ pub fn mask_url_credentials_inline(text: &str) -> String {
         let authority_start = pos + relative + 3;
         out.push_str(&text[pos..authority_start]);
         let authority_end = text[authority_start..]
-            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | '<' | '>' | '(' | ')' | ',' | ';'))
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | '<' | '>'))
             .map(|i| authority_start + i)
             .unwrap_or(text.len());
         let authority = &text[authority_start..authority_end];
@@ -546,6 +546,7 @@ mod tests {
         assert_eq!(got, "failed sftp://a:***@one and ftp://b:***@two/path; see https://public.example and ftps://c:***@three?foo=bar");
         assert_eq!(mask_url_credentials_inline("sftp://example.com contact a:b@example.com"), "sftp://example.com contact a:b@example.com");
         assert_eq!(mask_url_credentials_inline("(sftp://u:p%40ss@[::1]:22/x)"), "(sftp://u:***@[::1]:22/x)");
+        assert_eq!(mask_url_credentials_inline("sftp://u:pass,semi;paren)@host/path"), "sftp://u:***@host/path");
         assert_eq!(censored_for_log("open sftp://a:first-secret@one ftp://b:second-secret@two"), "open sftp://a:***@one ftp://b:***@two");
     }
 
