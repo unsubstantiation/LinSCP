@@ -40,7 +40,7 @@
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux, Windows, and Android - the Rust workspace plus Tauri v2 - so an entry may be 'verified' only when 'linux', 'windows' and 'android' appear in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified. A suite flagged not runnable under a platform executes no case there and cannot be cited for it; a capability's citations name only suites whose cases its checks list.",
     "platforms": {
       "linux": {
-        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-watcher, engine-scp, engine-script, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -79,7 +79,8 @@
           "platform-linux": "Linux host tests cover private filesystem helpers and configuration directory lookup.",
           "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Linux CI.",
           "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards.",
-          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal."
+          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal.",
+          "engine-watcher": "crates/linscp-engine/src/keepuptodate.rs - native watcher installation failure injected into the engine and timed fallback synchronization against a local destination."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -94,7 +95,7 @@
         }
       },
       "windows": {
-        "how": "windows-build.yml: `npm test` in ui/ (gui, gui-localization, ui-transport); `cargo test --workspace` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, service, service-commands, service-tabs, backup, vault-password, gui-cli, gui-shell-actions; gui-shell-definitions compiles to zero tests on Windows); the Explorer smoke drives the built linscp-gui.exe the way Explorer does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "windows-build.yml: `npm test` in ui/ (gui, gui-localization, ui-transport); `cargo test --workspace` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-watcher, engine-scp, engine-script, engine-editor, service, service-commands, service-tabs, backup, vault-password, gui-cli, gui-shell-actions; gui-shell-definitions compiles to zero tests on Windows); the Explorer smoke drives the built linscp-gui.exe the way Explorer does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -132,7 +133,8 @@
           "platform-linux": "crates/linscp-platform/src/linux.rs - the POSIX platform layer. A Windows build compiles none of these cases: the file is Linux-only.",
           "engine-dav-ascii": "Conditional ASCII upload via engine and loopback WebDAV, including stale ETag refusal; exercised in Windows CI.",
           "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards.",
-          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal."
+          "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal.",
+          "engine-watcher": "crates/linscp-engine/src/keepuptodate.rs - native watcher installation failure injected into the engine and timed fallback synchronization against a local destination."
         },
         "not_runnable": {
           "gui-shell-definitions": "the four cases are #[cfg(target_os = \"linux\")]; a Windows `cargo test` run executes none of them",
@@ -4529,8 +4531,8 @@
       "status": "partial",
       "notes": "The synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.",
       "source": [
-        "crates/linscp-engine/src/sync_planner.rs",
-        "crates/linscp-platform/src/linux.rs"
+        "crates/linscp-engine/src/keepuptodate.rs",
+        "crates/linscp-platform/src/watcher.rs"
       ],
       "checks": {
         "live-dav": [
@@ -4539,23 +4541,28 @@
         ],
         "engine-sftp": [
           "test_keepuptodate_wakes_on_a_local_change"
+        ],
+        "engine-watcher": [
+          "failed_native_watch_falls_back_to_polling_changes"
         ]
       },
       "verified_on": {
         "linux": [
           "live-dav",
-          "engine-sftp"
+          "engine-sftp",
+          "engine-watcher"
         ],
         "windows": [
           "live-dav",
-          "engine-sftp"
+          "engine-sftp",
+          "engine-watcher"
         ],
         "android": [
           "live-dav",
           "engine-sftp"
         ]
       },
-      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the watcher ending the wait on a change rather than on the interval; the fallback polling for a root that cannot be watched stays unevidenced.",
+      "gap": "Native watcher wakeup and injected watcher-install failure followed by timed polling are covered on Linux and Windows hosts. Actual OS resource-exhaustion behavior, real third-party server behavior, and Android device behavior remain unverified; the live-dav suite requires a binary this repo does not build.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -5479,7 +5486,9 @@
         "service": [
           "saf_sync_preview_and_run_moves_bytes_both_ways",
           "saf_sync_checksum_criteria_reads_through_the_bridge",
-          "saf_keep_up_to_date_polls_a_granted_folder"
+          "saf_keep_up_to_date_polls_a_granted_folder",
+          "saf_keep_up_to_date_rechecks_after_poll_interval",
+          "saf_keep_up_to_date_cancels_during_poll_wait"
         ],
         "gui": [
           "a granted folder is offered synchronization",
@@ -5499,7 +5508,7 @@
           "gui"
         ]
       },
-      "gap": "The bridge and both remotes are in-memory mocks: no suite has planned against or published into a real DocumentsProvider, so provider behaviour (mtime fidelity after a publish, nested document URIs, large-tree walk time, polling cadence with no watcher) is unproven on a device.",
+      "gap": "Host-side mock-bridge tests cover a second timed polling pass and cancellation, but no suite has planned against or published into a real DocumentsProvider. Provider behavior (mtime fidelity after a publish, nested document URIs, large-tree walk time, and polling cadence) remains unproven on a device.",
       "acceptance": [
         "Synchronize both directions with delete against a granted folder on an Android device or emulator, covering a checksum comparison, the over-cap refusal and one keep-up-to-date pass."
       ]

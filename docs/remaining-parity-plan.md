@@ -460,7 +460,7 @@ Linux command-line parsing, terminal-facing configuration and the native console
 
 The synchronization watcher uses filesystem events and retains interval polling as a safety net when a watch cannot be installed.
 
-**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the watcher ending the wait on a change rather than on the interval; the fallback polling for a root that cannot be watched stays unevidenced.
+**Next:** Native watcher wakeup and injected watcher-install failure followed by timed polling are covered on Linux and Windows hosts. Actual OS resource-exhaustion behavior, real third-party server behavior, and Android device behavior remain unverified; the live-dav suite requires a binary this repo does not build.
 
 **Acceptance criteria:**
 
@@ -604,7 +604,7 @@ RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-de
 
 Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders.
 
-**Next:** The bridge and both remotes are in-memory mocks: no suite has planned against or published into a real DocumentsProvider, so provider behaviour (mtime fidelity after a publish, nested document URIs, large-tree walk time, polling cadence with no watcher) is unproven on a device.
+**Next:** Host-side mock-bridge tests cover a second timed polling pass and cancellation, but no suite has planned against or published into a real DocumentsProvider. Provider behavior (mtime fidelity after a publish, nested document URIs, large-tree walk time, and polling cadence) remains unproven on a device.
 
 **Acceptance criteria:**
 
