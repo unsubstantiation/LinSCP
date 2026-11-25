@@ -133,6 +133,13 @@ mod tests {
     }
 
     #[test]
+    fn startup_session_url_is_not_a_registered_action() {
+        for url in ["sftp://example.com/path%20name", "ftp://example.com/", "ftps://example.com/", "ftpes://example.com/"] {
+            assert_eq!(parse(&[url]), Action::OpenWindow);
+        }
+    }
+
+    #[test]
     fn the_shell_actions_are_reachable() {
         assert_eq!(parse(&[INSTALL]), Action::InstallShellIntegration);
         assert_eq!(parse(&[UNINSTALL]), Action::UninstallShellIntegration);

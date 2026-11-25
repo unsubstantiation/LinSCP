@@ -13823,6 +13823,17 @@ mod tests {
     }
 
     #[test]
+    fn pasted_url_errors_do_not_expose_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        for url in ["sftp://alice:distinct-secret@example.com:bad/", "sftp://alice:distinct-secret%@example.com/"] {
+            let reply = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/session/url".into(), body: json!({"url":url}) });
+            assert_eq!(reply.status, 400);
+            assert!(!reply.payload.to_string().contains("distinct-secret"), "{}", reply.payload);
+        }
+    }
+
+    #[test]
     fn corrupt_bookmarks_and_workspaces_are_not_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
