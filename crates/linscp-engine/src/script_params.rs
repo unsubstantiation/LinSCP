@@ -504,33 +504,50 @@ fn censor_single_token(tok: &str) -> String {
     }
 }
 
+/// Mask each URL authority independently. Stop at URL delimiters rather than
+/// searching through a following sentence for an unrelated `@`.
 pub fn mask_url_credentials_inline(text: &str) -> String {
-    let Some(scheme_pos) = text.find("://") else {
-        return text.to_string();
-    };
-    let after_scheme = scheme_pos + 3;
-    let authority_end = text[after_scheme..]
-        .find('/')
-        .map(|i| after_scheme + i)
-        .unwrap_or(text.len());
-    let authority = &text[after_scheme..authority_end];
-    let Some(at_rel) = authority.rfind('@') else {
-        return text.to_string();
-    };
-    let userinfo = &authority[..at_rel];
-    let Some(colon_rel) = userinfo.find(':') else {
-        return text.to_string();
-    };
-    format!(
-        "{}:***@{}",
-        &text[..after_scheme + colon_rel],
-        &authority[at_rel + 1..]
-    ) + &text[authority_end..]
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(relative) = text[pos..].find("://") {
+        let authority_start = pos + relative + 3;
+        out.push_str(&text[pos..authority_start]);
+        let authority_end = text[authority_start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | '<' | '>' | '(' | ')' | ',' | ';'))
+            .map(|i| authority_start + i)
+            .unwrap_or(text.len());
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            let userinfo = &authority[..at];
+            if let Some(colon) = userinfo.find(':') {
+                out.push_str(&authority[..colon + 1]);
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            } else {
+                out.push_str(authority);
+            }
+        } else {
+            out.push_str(authority);
+        }
+        pos = authority_end;
+    }
+    out.push_str(&text[pos..]);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_each_url_in_diagnostics_independently() {
+        let input = "failed sftp://a:first-secret@one and ftp://b:second-secret@two/path; see https://public.example and ftps://c:third-secret@three?foo=bar";
+        let got = mask_url_credentials_inline(input);
+        assert_eq!(got, "failed sftp://a:***@one and ftp://b:***@two/path; see https://public.example and ftps://c:***@three?foo=bar");
+        assert_eq!(mask_url_credentials_inline("sftp://example.com contact a:b@example.com"), "sftp://example.com contact a:b@example.com");
+        assert_eq!(mask_url_credentials_inline("(sftp://u:p%40ss@[::1]:22/x)"), "(sftp://u:***@[::1]:22/x)");
+        assert_eq!(censored_for_log("open sftp://a:first-secret@one ftp://b:second-secret@two"), "open sftp://a:***@one ftp://b:***@two");
+    }
 
     #[test]
     fn parameter_expansion_and_log_censoring_match_script_rules() {

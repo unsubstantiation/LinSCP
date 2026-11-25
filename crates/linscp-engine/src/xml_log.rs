@@ -789,6 +789,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn text_and_xml_logs_redact_multiple_urls_in_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "failed sftp://a:first-secret@one and ftp://b:second-secret@two/path";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("open sftp://a:first-secret@one ftp://b:second-secret@two");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            assert!(!log.contains("first-secret"), "{log}");
+            assert!(!log.contains("second-secret"), "{log}");
+            assert!(log.contains("a:***@one"), "{log}");
+            assert!(log.contains("b:***@two"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert!(xml.contains("<failure>"));
+        assert!(xml.contains("<result success=\"false\">"));
+    }
+
+    #[test]
     fn xml_log_writes_valid_root_groups_and_escapes_multiline_output() {
         let tmp = std::env::temp_dir().join(format!(
             "linscp_xmllog_test_{}.xml",
