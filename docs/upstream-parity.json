@@ -2522,21 +2522,38 @@
       "id": "transfer.speed-and-append",
       "area": "Transfers",
       "status": "verified",
-      "notes": "The native SFTP transfer supports -append without overwriting the bytes already there and -speed= bandwidth throttling.",
+      "notes": "The native SFTP transfer supports -append without overwriting the bytes already there and -speed= bandwidth throttling. Conditional S3 downloads and FTP/SFTP/WebDAV/S3 resume-prefix verification also honor configured speed limits; the shared limiter accounts for the first chunk. FTP prefix verification drains and throttles the entire remote file.",
       "source": [
-        "crates/linscp-engine/tests/sftp_live_cases.rs"
+        "crates/linscp-engine/tests/sftp_live_cases.rs",
+        "crates/linscp-proto/src/lib.rs",
+        "crates/linscp-proto/src/ftp.rs",
+        "crates/linscp-proto/src/sftp.rs",
+        "crates/linscp-proto/src/webdav.rs",
+        "crates/linscp-proto/src/s3.rs"
       ],
       "checks": {
         "engine-sftp": [
-          "test_transfer_speed_append_and_preservetime_all"
+          "test_transfer_speed_append_and_preservetime_all",
+          "sftp_resume_prefix_verification_obeys_speed_limit"
+        ],
+        "engine-ftp-ascii": [
+          "ftp_resume_verification_rate_limits_the_full_retr"
+        ],
+        "engine-conditional-resume": [
+          "conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume",
+          "http_resume_prefix_verification_obeys_speed_limit"
         ]
       },
       "verified_on": {
         "linux": [
-          "engine-sftp"
+          "engine-sftp",
+          "engine-ftp-ascii",
+          "engine-conditional-resume"
         ],
         "windows": [
-          "engine-sftp"
+          "engine-sftp",
+          "engine-ftp-ascii",
+          "engine-conditional-resume"
         ],
         "android": [
           "engine-sftp"
