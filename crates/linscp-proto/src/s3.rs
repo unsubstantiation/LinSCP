@@ -2146,10 +2146,15 @@ impl RemoteSession for S3Session {
         }
         let total = opts.resume_offset.saturating_add(response.content_length().unwrap_or(0));
         let mut transferred = 0u64;
+        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 download stream failed: {e}")))? {
             sink.write_all(&chunk).await.map_err(|e| ProtoError::Transport(format!("S3 sink write failed: {e}")))?;
             transferred = transferred.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 download length overflow.".to_string()))?;
             if let Some(cb) = progress { cb(opts.resume_offset.saturating_add(transferred), total); }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
+            }
+            limiter.consume(chunk.len()).await;
         }
         sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
         Ok(transferred)

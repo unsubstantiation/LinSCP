@@ -163,3 +163,29 @@ async fn s3_version_verified_resume_uses_version_scoped_checkpoint() {
     assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
     server.abort();
 }
+
+#[tokio::test]
+async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() {
+    use linscp_proto::TransferRequest;
+    use std::time::{Duration, Instant};
+    let payload = vec![42u8; 16 * 1024];
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(resource).with_state(state);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s3 = S3Session::connect(S3ConnectConfig { use_https: false, host: "127.0.0.1".into(), port, region: Some("us-east-1".into()), access_key_id: "key".into(), secret_access_key: Zeroizing::new("secret".into()), path_style: true, ..Default::default() }, None, 0).await.unwrap();
+    // A complete response may arrive as just one chunk, which previously
+    // escaped limiting entirely. Also cover a version-pinned range request.
+    for (offset, version, minimum) in [(0, None, 220), (4096, Some("ver-1"), 165)] {
+        let mut output = Vec::new();
+        let request = TransferRequest { resume_offset: offset, speed_kbytes_per_sec: 64, version_id: version.map(str::to_string), ..Default::default() };
+        let start = Instant::now();
+        let count = s3.download_if_match("/bucket/file.bin", "\"v1\"", request, &mut output, None).await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(minimum), "conditional transfer ignored speed limit: {elapsed:?}");
+        assert_eq!(count as usize, payload.len() - offset as usize);
+        assert_eq!(output, payload[offset as usize..]);
+    }
+    server.abort();
+}
