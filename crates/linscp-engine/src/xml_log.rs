@@ -10,7 +10,7 @@ use linscp_platform::terminal::utc_ymdhms;
 use linscp_types::FileEntry;
 
 use crate::filemask::{format_permissions_9, mode_from_permissions_str};
-use crate::script_params::{censored_for_log, mask_url_credentials_inline};
+use crate::script_params::{censored_for_log, mask_url_credentials_inline, redact_diagnostic_secrets};
 
 /// Upstream XML session log namespace preserved intentionally for automation consumers.
 pub const SESSION_XML_NAMESPACE: &str = "http://winscp.net/schema/session/1.0";
@@ -364,7 +364,7 @@ impl SessionLogger {
         let line_body = if self.text_log_sensitive {
             message.to_string()
         } else {
-            censored_for_log(message)
+            censored_for_log(&redact_diagnostic_secrets(message))
         };
         let ts = now_utc_iso();
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
@@ -403,7 +403,7 @@ impl SessionLogger {
             any = true;
             buf.push_str(&format!(
                 "{indent}  <message>{}</message>\n",
-                xml_escape_text(&mask_url_credentials_inline(line))
+                xml_escape_text(&redact_diagnostic_secrets(line))
             ));
         }
         if !any {
@@ -456,7 +456,7 @@ impl SessionLogger {
                     any = true;
                     buf.push_str(&format!(
                         "{indent}    <message>{}</message>\n",
-                        xml_escape_text(&mask_url_credentials_inline(line))
+                        xml_escape_text(&redact_diagnostic_secrets(line))
                     ));
                 }
                 if !any {
@@ -787,6 +787,29 @@ fn rotate_if_needed(path: &Path, policy: LogRotationPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn text_and_xml_failures_redact_recognized_secret_switches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "connection failed (-password=\"two word secret\") ProxyPassword=proxy-secret S3SessionToken=token-secret";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("test");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            for secret in ["two word secret", "proxy-secret", "token-secret"] { assert!(!log.contains(secret), "{log}"); }
+            assert!(log.contains("ProxyPassword=***"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert_eq!(xml.matches("ProxyPassword=***").count(), 2);
+        assert!(xml.contains("<failure>"));
+        assert!(xml.contains("<result success=\"false\">"));
+    }
 
     #[test]
     fn text_and_xml_logs_redact_multiple_urls_in_failures() {
