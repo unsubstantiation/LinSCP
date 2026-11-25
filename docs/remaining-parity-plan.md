@@ -428,14 +428,14 @@ An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
 
 **Area:** Packaging/platforms · **Status:** partial
 
-Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from the upstream POSIX runtime services; the host tests cover only filesystem and configuration behavior.
+Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from upstream POSIX runtime services and does not use the retired curl subprocess. Linux and Windows host tests exercise bounded SSH exec capture over a mock server, including interleaved stdout/stderr, a combined limit, timeout, and connection reuse; that is not a local child-process test.
 
-**Next:** The upstream unit suite has no build target. Host-side platform-linux tests cover private directories and files and configuration lookup, but do not exercise signal handling, concurrent child output capture, or Android runtime behavior.
+**Next:** The upstream unit suite has no build target. Host tests cover platform filesystem/configuration and bounded mock-SSH exec output, but do not exercise local child stdout/stderr capture, process-wide signal handling, real SSH servers, or Android runtime behavior.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Capture a child's stdout and stderr at the same time, the way the curl progress meter needs it.
+- [ ] If local child output capture remains a supported requirement, test the actual child-process path with simultaneous stdout and stderr output.
+- [ ] Test signal handling in an isolated process and validate relevant runtime behavior on an Android device.
 
 ## platform.terminal-and-console
 
