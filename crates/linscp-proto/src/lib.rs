@@ -361,7 +361,7 @@ pub trait RemoteSession: Send + Sync {
     /// Compare a local prefix against an ETag-pinned remote representation.
     async fn verify_prefix_if_match(
         &self, _remote_path: &str, _etag: &str, _prefix_len: u64, _total_len: u64,
-        _prefix: &mut (dyn AsyncRead + Unpin + Send),
+        _prefix: &mut (dyn AsyncRead + Unpin + Send), _version_id: Option<&str>,
     ) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
     }
@@ -442,6 +442,10 @@ pub trait RemoteSession: Send + Sync {
         Err(ProtoError::UnsupportedCapability("dav_lock", self.scheme()))
     }
     /// Return the current S3 object's ETag, or None if it does not exist.
+    /// Obtain an ETag for exactly the requested S3 version.
+    async fn s3_get_version_etag(&self, _remote_path: &str, _version_id: &str) -> Result<Option<String>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("s3 version ETag", self.scheme()))
+    }
     async fn s3_get_etag(&self, _remote_path: &str) -> Result<Option<String>, ProtoError> {
         Err(ProtoError::UnsupportedCapability("s3_etag", self.scheme()))
     }

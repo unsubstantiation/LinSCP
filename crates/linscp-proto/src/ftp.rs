@@ -1314,7 +1314,9 @@ impl RemoteSession for FtpSession {
         prefix_len: u64,
         total_len: u64,
         prefix: &mut (dyn AsyncRead + Unpin + Send),
+        version_id: Option<&str>,
     ) -> Result<(), ProtoError> {
+        if version_id.is_some() { return Err(ProtoError::Transport("Version-specific prefix verification is unsupported for this protocol.".to_string())); }
         let (expected_size, expected_mtime) = parse_ftp_etag(etag)?;
         if expected_size != total_len || prefix_len > total_len {
             return Err(ProtoError::Transport("FTP resume prefix metadata mismatch.".to_string()));

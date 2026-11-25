@@ -285,6 +285,9 @@ fn validate_protocol_transfer_flags(
         if is_upload {
             return Err("'-versionid' cannot be used with 'put'.".to_string());
         }
+        if flags.delete_source {
+            return Err("Cannot delete a versioned download source without a conditional version delete.".to_string());
+        }
     }
     if flags.append {
         if !is_upload {
@@ -347,7 +350,7 @@ pub async fn download_verified_resume(
             }
             file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| e.to_string())?;
             let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader).await.map_err(|e| e.to_string())?;
+            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader, None).await.map_err(|e| e.to_string())?;
         }
         file.seek(std::io::SeekFrom::End(0)).await.map_err(|e| e.to_string())?;
     }
@@ -434,6 +437,9 @@ pub async fn download_single_file(
     logger: &mut SessionLogger,
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
+    if flags.version_id.is_some() && flags.delete_source {
+        return Err("Cannot delete a versioned download source without a conditional version delete.".to_string());
+    }
     if flags.source_etag.is_some() && (flags.delete_source || flags.append || flags.resume || local_dest == Path::new("-")) {
         return Err("Conditional downloads require a fresh staged file and separate conditional deletion.".to_string());
     }
@@ -674,18 +680,19 @@ pub async fn download_single_file(
                     }
                     etag.ok_or("Cannot resume without a strong source ETag.")?
                 } else if session.scheme() == ProtocolScheme::S3 {
-                    if flags.version_id.is_some() {
-                        return Err("Cannot safely resume a versioned S3 download; start a fresh download instead.".to_string());
-                    }
-                    session.s3_get_etag(remote_path).await.map_err(|e| e.to_string())?
-                        .ok_or("Cannot resume without a strong source ETag.")?
+                    let etag = if let Some(version) = flags.version_id.as_deref() {
+                        session.s3_get_version_etag(remote_path, version).await
+                    } else {
+                        session.s3_get_etag(remote_path).await
+                    };
+                    etag.map_err(|e| e.to_string())?.ok_or("Cannot resume without a strong source ETag.")?
                 } else {
                     let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
                     format!("\"{protocol}:{}:{}\"", info.size, info.mtime)
                 };
                 let input = tokio::fs::File::from_std(input);
                 let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
-                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader).await
+                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader, flags.version_id.as_deref()).await
                     .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
                 resume_identity = Some(token);
                 verified_partial = Some((partial.to_path_buf(), size));

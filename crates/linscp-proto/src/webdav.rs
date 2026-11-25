@@ -1706,8 +1706,9 @@ impl RemoteSession for WebDavSession {
 
     async fn verify_prefix_if_match(
         &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
-        prefix: &mut (dyn AsyncRead + Unpin + Send),
+        prefix: &mut (dyn AsyncRead + Unpin + Send), version_id: Option<&str>,
     ) -> Result<(), ProtoError> {
+        if version_id.is_some() { return Err(ProtoError::Transport("Version-specific prefix verification is unsupported for WebDAV.".to_string())); }
         if !valid_strong_etag(etag) || prefix_len == 0 || prefix_len > total_len {
             return Err(ProtoError::Transport("Invalid verified-resume prefix or ETag.".to_string()));
         }
