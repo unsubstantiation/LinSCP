@@ -2162,7 +2162,7 @@ impl RemoteSession for S3Session {
 
     async fn verify_prefix_if_match(
         &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
-        prefix: &mut (dyn AsyncRead + Unpin + Send), version_id: Option<&str>,
+        prefix: &mut (dyn AsyncRead + Unpin + Send), version_id: Option<&str>, speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
         if version_id.is_some_and(str::is_empty) { return Err(ProtoError::Transport("Invalid S3 version ID.".to_string())); }
         if !valid_strong_s3_etag(etag) || prefix_len == 0 || prefix_len > total_len {
@@ -2191,7 +2191,9 @@ impl RemoteSession for S3Session {
             return Err(ProtoError::Transport("S3 prefix verification returned a missing or different ETag.".to_string()));
         }
         let mut compared = 0u64;
+        let mut limiter = RateLimiter::new(speed_kbytes_per_sec);
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 prefix stream failed: {e}")))? {
+            limiter.consume(chunk.len()).await;
             compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 prefix length overflow.".to_string()))?;
             if compared > prefix_len { return Err(ProtoError::Transport("S3 returned too much prefix data.".to_string())); }
             let mut local = vec![0u8; chunk.len()];

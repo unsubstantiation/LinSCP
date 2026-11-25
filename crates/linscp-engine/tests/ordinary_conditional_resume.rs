@@ -189,3 +189,24 @@ async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() 
     }
     server.abort();
 }
+
+#[tokio::test]
+async fn http_resume_prefix_verification_obeys_speed_limit() {
+    use std::time::{Duration, Instant};
+    let payload = vec![71u8; 16 * 1024];
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(resource).with_state(state);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dav = WebDavSession::connect(WebDavConnectConfig { scheme: ProtocolScheme::Dav, host: "127.0.0.1".into(), port, base_path: "/dav".into(), ..Default::default() }, None, 0).await.unwrap();
+    let s3 = S3Session::connect(S3ConnectConfig { use_https: false, host: "127.0.0.1".into(), port, region: Some("us-east-1".into()), access_key_id: "key".into(), secret_access_key: Zeroizing::new("secret".into()), path_style: true, ..Default::default() }, None, 0).await.unwrap();
+    for (session, path, version) in [(&dav as &dyn RemoteSession, "file.bin", None), (&s3 as &dyn RemoteSession, "/bucket/file.bin", Some("ver-1"))] {
+        let mut prefix = payload.as_slice();
+        let start = Instant::now();
+        session.verify_prefix_if_match(path, "\"v1\"", payload.len() as u64, payload.len() as u64, &mut prefix, version, 64).await.unwrap();
+        assert!(start.elapsed() >= Duration::from_millis(220), "prefix verification ignored speed limit");
+        assert!(prefix.is_empty());
+    }
+    server.abort();
+}

@@ -1371,3 +1371,19 @@ async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
     assert_eq!(fs::read(&dest).unwrap(), b"old final");
     sftp.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn sftp_resume_prefix_verification_obeys_speed_limit() {
+    use std::time::{Duration, Instant};
+    let (sftp, _) = connect_mock(0x83, 0x84).await;
+    let payload = vec![73u8; 16 * 1024];
+    seed_remote(&sftp, "/limited.bin", &payload, None).await;
+    let info = sftp.stat("/limited.bin").await.unwrap().unwrap();
+    let token = format!("\"sftp:{}:{}\"", info.size, info.mtime);
+    let mut prefix = payload.as_slice();
+    let start = Instant::now();
+    sftp.verify_prefix_if_match("/limited.bin", &token, info.size, info.size, &mut prefix, None, 64).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(220), "SFTP prefix verification ignored speed limit");
+    assert!(prefix.is_empty());
+    sftp.close().await.unwrap();
+}

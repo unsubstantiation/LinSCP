@@ -354,7 +354,7 @@ pub async fn download_verified_resume(
             }
             file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| e.to_string())?;
             let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader, flags.version_id.as_deref()).await.map_err(|e| e.to_string())?;
+            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader, flags.version_id.as_deref(), speed_u32(flags.speed_kbytes_per_sec)).await.map_err(|e| e.to_string())?;
         }
         file.seek(std::io::SeekFrom::End(0)).await.map_err(|e| e.to_string())?;
     }
@@ -696,7 +696,7 @@ pub async fn download_single_file(
                 };
                 let input = tokio::fs::File::from_std(input);
                 let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
-                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader, flags.version_id.as_deref()).await
+                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader, flags.version_id.as_deref(), speed_u32(flags.speed_kbytes_per_sec)).await
                     .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
                 resume_identity = Some(token);
                 verified_partial = Some((partial.to_path_buf(), size));

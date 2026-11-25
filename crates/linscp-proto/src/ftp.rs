@@ -1315,6 +1315,7 @@ impl RemoteSession for FtpSession {
         total_len: u64,
         prefix: &mut (dyn AsyncRead + Unpin + Send),
         version_id: Option<&str>,
+        speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
         if version_id.is_some() { return Err(ProtoError::Transport("Version-specific prefix verification is unsupported for this protocol.".to_string())); }
         let (expected_size, expected_mtime) = parse_ftp_etag(etag)?;
@@ -1336,7 +1337,7 @@ impl RemoteSession for FtpSession {
         // in memory, and continues draining even after a mismatch.
         let (mut writer, mut reader) = tokio::io::duplex(64 * 1024);
         let download = async {
-            let result = self.download(remote_path, TransferRequest::default(), &mut writer, None).await;
+            let result = self.download(remote_path, TransferRequest { speed_kbytes_per_sec, ..Default::default() }, &mut writer, None).await;
             drop(writer);
             result
         };

@@ -155,3 +155,21 @@ async fn ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable()
     ftp.close().await.unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn ftp_resume_verification_rate_limits_the_full_retr() {
+    use std::time::{Duration, Instant};
+    let (port, files, server) = ftp_fixture().await;
+    let ftp = FtpSession::connect(FtpConnectConfig { scheme: ProtocolScheme::Ftp, host: "127.0.0.1".into(), port, ..Default::default() }, None, 0).await.unwrap();
+    let payload = vec![91u8; 16 * 1024];
+    files.lock().await.insert("/limited.bin".into(), payload.clone());
+    let info = ftp.stat("/limited.bin").await.unwrap().unwrap();
+    let token = format!("\"ftp:{}:{}\"", info.size, info.mtime);
+    let mut prefix = &payload[..1024];
+    let start = Instant::now();
+    ftp.verify_prefix_if_match("/limited.bin", &token, 1024, info.size, &mut prefix, None, 64).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(220), "FTP verification must throttle the entire RETR");
+    assert!(ftp.stat("/limited.bin").await.unwrap().is_some());
+    ftp.close().await.unwrap();
+    server.await.unwrap();
+}

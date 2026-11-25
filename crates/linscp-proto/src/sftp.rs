@@ -1246,6 +1246,7 @@ impl RemoteSession for SftpClientSession {
         total_len: u64,
         prefix: &mut (dyn AsyncRead + Unpin + Send),
         version_id: Option<&str>,
+        speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
         if version_id.is_some() { return Err(ProtoError::Transport("Version-specific prefix verification is unsupported for this protocol.".to_string())); }
         let (expected_size, expected_mtime) = parse_sftp_etag(etag)?;

@@ -360,7 +360,7 @@ pub trait RemoteSession: Send + Sync {
     /// Compare a local prefix against an ETag-pinned remote representation.
     async fn verify_prefix_if_match(
         &self, _remote_path: &str, _etag: &str, _prefix_len: u64, _total_len: u64,
-        _prefix: &mut (dyn AsyncRead + Unpin + Send), _version_id: Option<&str>,
+        _prefix: &mut (dyn AsyncRead + Unpin + Send), _version_id: Option<&str>, _speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
     }
