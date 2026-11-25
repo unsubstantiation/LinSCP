@@ -599,6 +599,7 @@ async fn sftp_resume_support_off_and_size_threshold_control_staging() {
     let sentinel = b"someone else's partial";
     for (name, size, option, expect_direct) in [
         ("off.bin", 2048, "option resume off; get", true),
+        ("override.bin", 2048, "option resume on; get -resumesupport=off", true),
         ("below.bin", 1023, "get -resumesupport=1", true),
         ("boundary.bin", 1024, "get -resumesupport=1", false),
         ("forced.bin", 32, "get -resumesupport=on", false),
