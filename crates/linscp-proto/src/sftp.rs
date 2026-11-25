@@ -1272,6 +1272,7 @@ impl RemoteSession for SftpClientSession {
             .await?;
         let verify_res: Result<(), ProtoError> = async {
             let mut offset = 0u64;
+            let mut limiter = RateLimiter::new(speed_kbytes_per_sec);
             let mut local_buf = vec![0u8; SFTP_CHUNK_SIZE];
             while offset < prefix_len {
                 let want = ((prefix_len - offset) as usize).min(SFTP_CHUNK_SIZE);
@@ -1292,6 +1293,7 @@ impl RemoteSession for SftpClientSession {
                         "Remote SFTP file ended early during resume verification.".to_string(),
                     ));
                 }
+                limiter.consume(remote_chunk.len()).await;
                 let slice = &remote_chunk[..remote_chunk.len().min(want)];
                 prefix
                     .read_exact(&mut local_buf[..slice.len()])
