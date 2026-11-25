@@ -129,15 +129,14 @@ Stored sites can be saved, renamed (including nested folders), filtered, sorted 
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Stored site passwords are encrypted under sessions.key and shared between the CLI and GUI. On Windows the configuration directory carrying sessions.key is additionally owner-only: `ensure_private_dir` applies `D:P(A;OICI;FA;;;OW)`, and children created inside inherit the ACE, because bypass-traverse-checking makes the directory's own ACE insufficient protection for the files.
+The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format.
 
-**Next:** The encryption half has no runnable evidence: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: platform-windows-acl on Windows covers the configuration-directory DACL only.
+**Next:** Linux and Windows host tests cover vault sealing, reopen with the correct password, wrong-password refusal, tamper refusal and preservation, migration, and redaction. Android device behavior and compatibility with the retired Python/core clients are not established; the old live-sftp suite requires a CLI binary this distribution does not build.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Cover the encryption half (sessions.key sealing and opening) with a runnable suite on all three platforms.
+- [ ] Validate vault setup, lock, restart, unlock, tamper refusal and site-secret recovery on an Android device or emulator.
+- [ ] Only claim compatibility with historical Python/core clients if the actual current encrypted vault format is tested with them.
 
 ## sessions.proxy-settings
 
