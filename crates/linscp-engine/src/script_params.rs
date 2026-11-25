@@ -506,8 +506,8 @@ fn censor_single_token(tok: &str) -> String {
     }
 }
 
-/// Redact recognized secret switches embedded in diagnostic prose without
-/// changing its whitespace or quoting. This is deliberately conservative for
+/// Redact recognized secret switches embedded in diagnostic prose while
+/// preserving surrounding text. This is deliberately conservative for
 /// unterminated quoted values: the remainder of the line is not logged.
 pub fn redact_diagnostic_secrets(text: &str) -> String {
     let masked = mask_url_credentials_inline(text);
