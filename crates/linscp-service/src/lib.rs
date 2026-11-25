@@ -18491,6 +18491,47 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    /// Reopening in a fresh service tests the actual on-disk vault, not just
+    /// an already-unlocked in-memory key. A corrupt ciphertext must not be
+    /// interpreted as an empty store and overwritten by a subsequent save.
+    #[test]
+    fn saved_site_vault_reopens_and_rejects_wrong_password_and_tampering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let body = json!({"name":"secret-site", "session":{"protocol":"sftp", "host":"private.example", "username":"alice", "password":"unique-password-value"}});
+        let saved = service.dispatch(request("POST", "/api/sessions/save", body.clone()));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let encrypted = std::fs::read(tmp.path().join("sessions.ini")).unwrap();
+        assert!(encrypted.starts_with(b"LSCP-SESSION-VAULT-1$"));
+        for secret in ["secret-site", "private.example", "unique-password-value"] {
+            assert!(!encrypted.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
+        assert!(std::fs::read(tmp.path().join("sessions.key")).unwrap().starts_with(b"LSCPVLT1"));
+        drop(service);
+        let reopened = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        assert!(SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).is_err());
+        let wrong = reopened.dispatch(request("POST", "/api/vault/unlock", json!({"password":"not the right password"})));
+        assert_eq!(wrong.status, 400, "{}", wrong.payload);
+        assert_eq!(std::fs::read(tmp.path().join("sessions.ini")).unwrap(), encrypted);
+        unlock_for_test(&reopened);
+        let store = SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("secret-site").unwrap().password.as_deref(), Some("unique-password-value"));
+        let listed = reopened.dispatch(request("GET", "/api/sessions", json!({})));
+        assert_eq!(listed.status, 200);
+        assert!(!listed.payload.to_string().contains("unique-password-value"));
+
+        let mut tampered = encrypted.clone();
+        let i = tampered.len() / 2;
+        tampered[i] = if tampered[i] == b'A' { b'B' } else { b'A' };
+        std::fs::write(tmp.path().join("sessions.ini"), &tampered).unwrap();
+        assert!(SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).is_err());
+        let refused = reopened.dispatch(request("POST", "/api/sessions/save", body));
+        assert_ne!(refused.status, 200, "{}", refused.payload);
+        assert_eq!(std::fs::read(tmp.path().join("sessions.ini")).unwrap(), tampered);
+    }
+
     #[test]
     fn vault_migrates_and_encrypts_full_session_and_reconnect_state() {
         let tmp = tempfile::tempdir().unwrap();
