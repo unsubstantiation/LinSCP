@@ -586,6 +586,42 @@ async fn test_a_staged_download_publishes_only_the_whole_file() {
     sftp.close().await.unwrap();
 }
 
+/// The interpreter's resume-support setting must reach the actual download,
+/// not just the option display. An unrelated `.filepart` makes staging
+/// observable without interrupting a network operation: direct downloads leave
+/// it untouched; staged downloads must refuse it rather than clobber it.
+#[tokio::test]
+async fn sftp_resume_support_off_and_size_threshold_control_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x86, 0x87).await;
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+    let sentinel = b"someone else's partial";
+    for (name, size, option, expect_direct) in [
+        ("off.bin", 2048, "option resume off; get", true),
+        ("below.bin", 1023, "get -resumesupport=1", true),
+        ("boundary.bin", 1024, "get -resumesupport=1", false),
+        ("forced.bin", 32, "get -resumesupport=on", false),
+    ] {
+        let data = vec![b'x'; size];
+        let remote = format!("/{name}");
+        seed_remote(&sftp, &remote, &data, None).await;
+        let dest = tmp.path().join(name);
+        let stage = tmp.path().join(format!("{name}.filepart"));
+        fs::write(&stage, sentinel).unwrap();
+        let command = format!("{option} {remote} \"{}\"", dest.display());
+        let (ok, output) = run_script(&mut interp, &command).await;
+        assert_eq!(ok, expect_direct, "{name}: {output}");
+        assert_eq!(fs::read(&stage).unwrap(), sentinel, "existing checkpoint must remain untouched for {name}");
+        if expect_direct {
+            assert_eq!(fs::read(&dest).unwrap(), data);
+        } else {
+            assert!(!dest.exists(), "staging refusal must not publish a destination for {name}");
+        }
+    }
+    sftp.close().await.unwrap();
+}
+
 /// `-filemask=|skip/` prunes the excluded subtree in both the transfer and
 /// the delete phases: the preview lists the surviving file and neither of
 /// the excluded ones. Without the acknowledgment the run aborts naming the
