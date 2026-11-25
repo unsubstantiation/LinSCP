@@ -21,6 +21,7 @@ jobs:
         env:
           RUST_MIN_STACK: '16777216'
         run: |
+          cargo test -p linscp-engine --lib failed_native_watch_falls_back_to_polling_changes > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
           cargo test -p linscp-service saf_keep_up_to_date_ -- --test-threads=1 > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
           cargo test -p linscp-engine --test sftp_live_cases test_keepuptodate_wakes_on_a_local_change > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
           cargo test -p linscp-platform dir_watcher_observes_newly_written_file > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }

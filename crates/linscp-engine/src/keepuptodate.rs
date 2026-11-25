@@ -90,10 +90,29 @@ pub async fn run_keep_up_to_date<F>(
     local_fs: Option<&dyn LocalFs>,
     opts: &KeepUpToDateOptions,
     logger: &mut SessionLogger,
-    mut on_status: F,
+    on_status: F,
 ) -> Result<usize, String>
 where
     F: FnMut(&str),
+{
+    run_with_watcher_factory(session, local_root, remote_root, local_fs, opts, logger, on_status, LocalDirWatcher::watch).await
+}
+
+// Isolate watcher creation so its failure and fallback can be exercised without
+// depending on exhausting OS watches or changing process-wide limits.
+async fn run_with_watcher_factory<F, W>(
+    session: &dyn RemoteSession,
+    local_root: &Path,
+    remote_root: &str,
+    local_fs: Option<&dyn LocalFs>,
+    opts: &KeepUpToDateOptions,
+    logger: &mut SessionLogger,
+    mut on_status: F,
+    watch: W,
+) -> Result<usize, String>
+where
+    F: FnMut(&str),
+    W: FnOnce(&Path, bool) -> Result<LocalDirWatcher, linscp_platform::PlatformError>,
 {
     let saf_fs = local_fs.filter(|_| local_root.to_string_lossy().starts_with("content://"));
     if let Some(fs) = saf_fs {
@@ -145,7 +164,13 @@ where
     let watcher = if opts.max_passes == 1 || saf_fs.is_some() {
         None
     } else {
-        LocalDirWatcher::watch(local_root, true).ok()
+        match watch(local_root, true) {
+            Ok(watcher) => Some(watcher),
+            Err(_) => {
+                on_status("Filesystem notifications are unavailable; checking for changes at the polling interval.");
+                None
+            }
+        }
     };
     let _sig_guard = if !opts.install_signal_handlers || opts.max_passes == 1 {
         None
@@ -268,4 +293,40 @@ where
         return Err("Cancelled by user.".to_string());
     }
     Ok(total_applied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sync_planner::LocalSyncSession;
+    use linscp_platform::NativeLocalFs;
+
+    #[tokio::test]
+    async fn failed_native_watch_falls_back_to_polling_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("first.txt"), b"first").unwrap();
+        let fs = Arc::new(NativeLocalFs::new());
+        let session = LocalSyncSession::new(target.to_string_lossy().into_owned(), fs);
+        let opts = KeepUpToDateOptions { interval_ms: 400, max_passes: 2, install_signal_handlers: false, ..Default::default() };
+        let mut logger = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+        let mut statuses = Vec::new();
+        let mut first_pass = None;
+        let applied = run_with_watcher_factory(&session, &source, "/", None, &opts, &mut logger, |status| {
+            statuses.push(status.to_string());
+            if status.starts_with("Pass 1:") {
+                assert_eq!(std::fs::read(target.join("first.txt")).unwrap(), b"first");
+                first_pass = Some(std::time::Instant::now());
+                std::fs::write(source.join("later.txt"), b"later").unwrap();
+            }
+        }, |_path, _recursive| Err(linscp_platform::PlatformError::Watch("injected failure".into()))).await.unwrap();
+        assert!(first_pass.unwrap().elapsed() >= Duration::from_millis(350));
+        assert!(statuses.iter().any(|s| s.contains("notifications are unavailable")), "{statuses:?}");
+        assert!(statuses.iter().any(|s| s.starts_with("Pass 2:")), "{statuses:?}");
+        assert!(applied >= 2);
+        assert_eq!(std::fs::read(target.join("later.txt")).unwrap(), b"later");
+    }
 }
