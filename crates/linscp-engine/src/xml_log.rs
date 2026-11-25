@@ -399,11 +399,14 @@ impl SessionLogger {
         let indent = self.op_indent();
         let mut buf = format!("{indent}<failure>\n");
         let mut any = false;
-        for line in message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Redact the whole diagnostic before splitting it: a quoted secret
+        // may span lines, including when its closing quote is missing.
+        let safe_message = redact_diagnostic_secrets(message);
+        for line in safe_message.lines().map(str::trim).filter(|l| !l.is_empty()) {
             any = true;
             buf.push_str(&format!(
                 "{indent}  <message>{}</message>\n",
-                xml_escape_text(&redact_diagnostic_secrets(line))
+                xml_escape_text(line)
             ));
         }
         if !any {
@@ -452,11 +455,12 @@ impl SessionLogger {
             Err(err) => {
                 buf.push_str(&format!("{indent}  <result success=\"false\">\n"));
                 let mut any = false;
-                for line in err.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let safe_error = redact_diagnostic_secrets(err);
+                for line in safe_error.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     any = true;
                     buf.push_str(&format!(
                         "{indent}    <message>{}</message>\n",
-                        xml_escape_text(&redact_diagnostic_secrets(line))
+                        xml_escape_text(line)
                     ));
                 }
                 if !any {
@@ -787,6 +791,34 @@ fn rotate_if_needed(path: &Path, policy: LogRotationPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "Failure -password=\"first-secret\nsecond-secret\" remaining detail\nnext detail";
+        let unterminated = "Failure -passphrase=\"third-secret\nfourth-secret";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("test");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+            logger.record_group_failure(unterminated);
+            logger.record_transfer(false, "file", "dest", None, Err(unterminated));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            for secret in ["first-secret", "second-secret", "third-secret", "fourth-secret"] {
+                assert!(!log.contains(secret), "{log}");
+            }
+            assert!(log.contains("-password=***"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert_eq!(xml.matches("-password=*** remaining detail").count(), 2);
+        assert_eq!(xml.matches("next detail").count(), 2);
+        assert_eq!(xml.matches("-passphrase=***").count(), 2);
+    }
 
     #[test]
     fn text_and_xml_failures_redact_recognized_secret_switches() {

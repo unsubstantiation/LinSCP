@@ -1,0 +1,27 @@
+name: Multiline diagnostic redaction validation
+on:
+  push:
+    branches: [arena/cf506e43-linscp]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+      - name: Test redaction and XML logging
+        shell: bash
+        env:
+          RUST_MIN_STACK: '16777216'
+        run: |
+          for test in multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting text_and_xml_failures_redact_recognized_secret_switches text_and_xml_logs_redact_multiple_urls_in_failures redacts_secret_switches_in_diagnostics_without_destroying_prose; do
+            cargo test -p linscp-engine --lib "$test" > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
+          done
+          cargo test -p linscp-engine --test script_engine_cases test_xml_ > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
