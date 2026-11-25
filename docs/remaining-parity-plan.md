@@ -51,14 +51,13 @@ Downloads can stage in a `.filepart` file beside the destination and resume from
 
 **Area:** Transfers · **Status:** partial
 
-Automatic/on/off and -resumesupport thresholds are parsed; resume-off transfers without staging. The interpreter offers the three modes, refuses a value outside them, and refuses to resume an ASCII transfer because the byte offsets would not survive the line-ending conversion.
+The internal interpreter parses automatic/on/off and per-transfer -resumesupport thresholds. Mock SFTP tests drive the interpreter through resume-off, a per-transfer off override, below/at-threshold staging, and an on-mode refusal when an existing unapproved checkpoint is present. They also verify an existing checkpoint is never altered. FTP/SFTP continuation without an atomic snapshot is refused by default; explicit per-transfer best-effort approval is required where exposed. The GUI-only distribution does not expose the historical script CLI.
 
-**Next:** The live half is still unevidenced: live-sftp needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the modes the interpreter offers and the refusal to resume an ASCII transfer.
+**Next:** Linux and Windows host tests exercise option propagation and checkpoint preservation against a mock SFTP server; they do not prove real-server behavior or Android device behavior. The historical live-sftp suite requires a CLI binary this distribution does not build.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Validate the supported GUI workflows and safety behavior on Android and against real servers; do not claim the removed CLI interface is shipped.
 
 ## transfer.presets
 
