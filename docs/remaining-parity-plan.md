@@ -222,14 +222,13 @@ Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/W
 
 **Area:** Security/authentication · **Status:** partial
 
-Optional account login isolates each signed-in user at the application layer: PBKDF2 password hashes, session expiry, per-login CSRF tokens and login throttling, plus per-user tabs, transfer queues, logs, terminals, sessions.ini/workspaces and a home_dir jail for every local filesystem and command-execution route. This is a LinSCP server-deployment extension, not a feature of the upstream desktop client. The process still runs as one OS user; mutually hostile callers should use separate OS accounts. Negative authorization tests cover every API route, not just login.
+The shipped native service is single-user and does not implement account login, per-user isolation, CSRF sessions, or a home-directory jail. GET /api/login reports accounts disabled, POST /api/login refuses, and logout is a compatibility no-op, even if a legacy accounts.ini is present. The backup preserves that file but does not enable accounts. Do not expose this dispatcher as a multi-user server or rely on it to isolate mutually untrusted users; use separate OS accounts and an appropriate security boundary.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The former server-deployment account system is not shipped. Host tests establish the native compatibility responses and lack of an account authorization gate; they do not test a server, per-route isolation, or Android device behavior.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
+- [ ] If multi-user server deployment is desired, first define its security boundary and restore or replace account authentication and authorization, including per-route negative tests and isolation. Otherwise retain the explicit single-user limitation.
 
 ## gui.native-path-drop
 

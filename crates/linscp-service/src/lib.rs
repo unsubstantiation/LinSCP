@@ -536,8 +536,8 @@ impl CommanderService {
         let query = parse_query(query_str);
         match (method.as_str(), raw_path) {
             ("GET", "/api/status") => self.handle_status(),
-            // The optional account layer is a server deployment feature; the
-            // native app has no account server, so it answers as signed out
+            // This native service has no account server or account isolation;
+            // it answers as signed out
             // and signing out succeeds. The page offers the entry on every
             // host, and an unrouted answer there was a 404 the person saw as a
             // broken menu item.
@@ -13785,6 +13785,42 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    /// The native dispatcher is single-user, even if a legacy accounts file
+    /// exists. These compatibility endpoints must not imply authentication
+    /// or a per-account filesystem jail is active.
+    #[tokio::test]
+    async fn native_account_endpoints_do_not_enable_account_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("accounts.ini"), "[alice]\nhash=legacy\n").unwrap();
+        let svc = CommanderService::new(config, Arc::new(NativeLocalFs::new()));
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        for async_dispatch in [false, true] {
+            let login = request("POST", "/api/login", json!({"username": "alice", "password": "secret"}));
+            let reply = if async_dispatch { svc.dispatch_async(login).await } else { svc.dispatch(login) };
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.payload["accounts_enabled"], false);
+            assert_eq!(reply.payload["success"], false);
+            assert!(!reply.payload.to_string().contains("secret"));
+            let status = request("GET", "/api/login", json!({}));
+            let reply = if async_dispatch { svc.dispatch_async(status).await } else { svc.dispatch(status) };
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.payload["accounts_enabled"], false);
+            assert_eq!(reply.payload["logged_in"], false);
+            assert_eq!(reply.payload["csrf_token"], "");
+        }
+        let logout = svc.dispatch(request("POST", "/api/logout", json!({})));
+        assert_eq!(logout.status, 200);
+        assert_eq!(logout.payload["accounts_enabled"], false);
+        // A normal local endpoint works without login: consumers must not
+        // mistake the compatibility responses for an authorization boundary.
+        svc.state.lock().unwrap().current_local_dir = Some(tmp.path().to_string_lossy().into_owned());
+        let list = svc.dispatch(request("GET", "/api/local/list", json!({})));
+        assert_eq!(list.status, 200, "{}", list.payload);
+        assert_eq!(list.payload["success"], true);
+    }
 
     #[test]
     fn corrupt_bookmarks_and_workspaces_are_not_overwritten() {

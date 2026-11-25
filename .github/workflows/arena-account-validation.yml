@@ -1,0 +1,24 @@
+name: Native account boundary validation
+on:
+  push:
+    branches: [arena/cf506e43-linscp]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libkrb5-dev
+      - name: Test account boundary
+        shell: bash
+        env:
+          RUST_MIN_STACK: '16777216'
+        run: |
+          cargo test -p linscp-service native_account_endpoints_do_not_enable_account_isolation > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
