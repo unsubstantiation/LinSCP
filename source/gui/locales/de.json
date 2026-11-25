@@ -1145,6 +1145,7 @@
   "Resume": "Fortsetzen",
   "Resume a part-transferred file": "Eine teilweise übertragene Datei fortsetzen",
   "Resume a partial file": "Eine teilweise übertragene Datei fortsetzen",
+  "Resume a partial version download (requires a new local destination)": "Teilweisen Versionsdownload fortsetzen (erfordert ein neues lokales Ziel)",
   "Resume above a size": "Ab einer Größe fortsetzen",
   "Resume above:": "Fortsetzen ab:",
   "Resume monitoring": "Überwachung fortsetzen",

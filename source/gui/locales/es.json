@@ -1145,6 +1145,7 @@
   "Resume": "Reanudar",
   "Resume a part-transferred file": "Reanudar un archivo transferido en parte",
   "Resume a partial file": "Reanudar un archivo parcial",
+  "Resume a partial version download (requires a new local destination)": "Reanudar una descarga parcial de versión (requiere un destino local nuevo)",
   "Resume above a size": "Reanudar por encima de un tamaño",
   "Resume above:": "Reanudar por encima de:",
   "Resume monitoring": "Reanudar supervisión",

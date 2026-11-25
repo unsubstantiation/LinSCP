@@ -1145,6 +1145,7 @@
   "Resume": "Reprendre",
   "Resume a part-transferred file": "Reprendre un fichier partiellement transféré",
   "Resume a partial file": "Reprendre un fichier partiel",
+  "Resume a partial version download (requires a new local destination)": "Reprendre le téléchargement partiel de la version (nécessite une nouvelle destination locale)",
   "Resume above a size": "Reprendre au-delà d’une taille",
   "Resume above:": "Reprendre au-delà de :",
   "Resume monitoring": "Reprendre la surveillance",

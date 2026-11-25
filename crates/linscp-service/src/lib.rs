@@ -1856,12 +1856,28 @@ impl CommanderService {
         } else {
             std::fs::symlink_metadata(&local_dest).is_ok()
         };
+        let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+        if resume && is_saf_path(&local_dest.to_string_lossy()) {
+            return api_error(400, "Verified resume is not supported for granted folders.");
+        }
+        if resume && exists {
+            return api_error(400, "Verified resume requires a new local destination; choose another name or start a fresh download.");
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if exists && overwrite != "overwrite" {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
         }
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.version_id = Some(version_id.clone());
+        flags.resume = resume;
+        if resume {
+            let tag = match session.s3_get_version_etag(&remote_path, &version_id).await {
+                Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                Ok(_) => return api_error(400, "Version resume requires a strong source ETag."),
+                Err(error) => return api_error(400, error.to_string()),
+            };
+            flags.source_etag = Some(tag);
+        }
         flags.preserve_time = true;
         let dest_str = local_dest.to_string_lossy().into_owned();
         let job = queue::QueueJob::RemoteDownload {
@@ -15546,6 +15562,59 @@ mod tests {
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        // The versions dialog queues a version-scoped verified resume and
+        // never adopts another version's partial or overwrites a destination.
+        let version_bytes = b"original version payload";
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/versioned-resume.bin", version_bytes, Default::default()).await.unwrap();
+        let versions = session.s3_list_versions("/photos/versioned-resume.bin").await.unwrap();
+        let version_id = versions.iter().find(|v| v.is_latest && !v.is_delete_marker).unwrap().version_id.clone();
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/versioned-resume.bin", b"newest version payload!!", Default::default()).await.unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().remote_dir = "/photos".into();
+        let target = local.join("versioned-copy.bin");
+        let checkpoint = linscp_engine::transfer::local_stage_path(&target, Some(&version_id)).unwrap();
+        let other_checkpoint = linscp_engine::transfer::local_stage_path(&target, Some("unrelated-version")).unwrap();
+        std::fs::write(&checkpoint, &version_bytes[..8]).unwrap();
+        std::fs::write(&other_checkpoint, b"other version").unwrap();
+        let body = json!({"tab": id, "name": "versioned-resume.bin", "version_id": version_id, "local_dir": local, "target_name": "versioned-copy.bin", "resume": true});
+        std::fs::write(&target, b"existing destination").unwrap();
+        let refusal = svc.dispatch_async(request("/api/s3/version-download", body.clone())).await;
+        assert_eq!(refusal.status, 400, "{}", refusal.payload);
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing destination");
+        std::fs::remove_file(&target).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/s3/version-download", body.clone())).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut complete = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            match tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                Some("Completed") => { complete = true; break; }
+                Some("Failed") => panic!("version resume failed: {:?}", tasks[idx]),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(&target).unwrap(), version_bytes);
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), &version_bytes[..8]);
+        assert_eq!(std::fs::read(&other_checkpoint).unwrap(), b"other version");
+        // A changed checkpoint is rejected without publishing a destination.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&checkpoint, b"stale").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/s3/version-download", body)).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            match tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                Some("Failed") => { failed = true; break; }
+                Some("Completed") => panic!("stale version checkpoint was published"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        assert!(failed);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), b"stale");
         let bytes = b"verified S3 resume payload";
         for (name, partial, succeeds) in [
             ("resume-ok.bin", Some(&bytes[..8]), true),

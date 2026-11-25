@@ -324,7 +324,10 @@ pub async fn download_verified_resume(
     if !flags.no_clobber || flags.append || flags.delete_source || flags.transfer_mode != TransferMode::Binary {
         return Err("Verified resume requires a fresh binary, no-overwrite download.".to_string());
     }
-    let checkpoint = local_stage_path(local_dest, None).ok_or("Cannot construct a safe partial-file name.")?;
+    if flags.version_id.is_some() && session.scheme() != ProtocolScheme::S3 {
+        return Err("Version-specific resume is available only for S3.".to_string());
+    }
+    let checkpoint = local_stage_path(local_dest, flags.version_id.as_deref()).ok_or("Cannot construct a safe partial-file name.")?;
     let existing = match std::fs::symlink_metadata(&checkpoint) {
         Ok(meta) if meta.is_file() && !meta.file_type().is_symlink() => true,
         Ok(_) => return Err("Resume partial must be a regular file, not a symlink or directory.".to_string()),
@@ -338,7 +341,8 @@ pub async fn download_verified_resume(
     let mut file = tokio::fs::File::from_std(std_file);
     let mut offset = 0u64;
     if existing {
-        let input = tokio::fs::File::open(&checkpoint).await.map_err(|e| format!("Cannot open resume partial: {e}"))?;
+        let input = linscp_platform::open_private_file_no_follow(&checkpoint).map_err(|e| format!("Cannot safely open resume partial: {e}"))?;
+        let input = tokio::fs::File::from_std(input);
         let reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let mut reader = reader.take(info.size.saturating_add(1));
         offset = tokio::io::copy(&mut reader, &mut file).await.map_err(|e| format!("Cannot copy resume partial: {e}"))?;
@@ -350,12 +354,12 @@ pub async fn download_verified_resume(
             }
             file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| e.to_string())?;
             let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader, None).await.map_err(|e| e.to_string())?;
+            session.verify_prefix_if_match(remote_path, etag, offset, info.size, &mut reader, flags.version_id.as_deref()).await.map_err(|e| e.to_string())?;
         }
         file.seek(std::io::SeekFrom::End(0)).await.map_err(|e| e.to_string())?;
     }
     let result = if offset < info.size || info.size == 0 {
-        let request = TransferRequest { resume_offset: offset, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: None };
+        let request = TransferRequest { resume_offset: offset, append: false, preserve_time: false, mtime: None, permissions: None, speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: flags.version_id.clone() };
         let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
         session.download_if_match(remote_path, etag, request, &mut writer, progress).await.map_err(|e| e.to_string())
     } else { Ok(0) };

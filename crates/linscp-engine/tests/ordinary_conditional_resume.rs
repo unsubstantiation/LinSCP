@@ -22,6 +22,11 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri
     }
     if method == Method::GET {
         if headers.get("if-match").and_then(|x| x.to_str().ok()) != Some(r.etag.as_str()) { return StatusCode::PRECONDITION_FAILED.into_response(); }
+        if headers.get("range").is_none() {
+            let mut response = Response::builder().status(StatusCode::OK).header("etag", &r.etag);
+            if versioned { response = response.header("x-amz-version-id", if r.wrong_version_at == Some("tail") { "other" } else { "ver-1" }); }
+            return response.body(Body::from(r.data.clone())).unwrap();
+        }
         let range = headers.get("range").unwrap().to_str().unwrap().strip_prefix("bytes=").unwrap();
         let (start, end) = range.split_once('-').unwrap();
         let start: usize = start.parse().unwrap();
@@ -120,5 +125,41 @@ async fn s3_versioned_resume_pins_version_and_preserves_partials_on_failure() {
     let deleting = TransferFlags { delete_source: true, ..flags };
     let error = download_single_file(&s3, "/bucket/file.bin", Some(&entry), &dest, &deleting, &mut log, None).await.unwrap_err();
     assert!(error.contains("conditional version delete"), "{error}");
+    server.abort();
+}
+
+#[tokio::test]
+async fn s3_version_verified_resume_uses_version_scoped_checkpoint() {
+    use linscp_engine::transfer::{download_verified_resume, local_stage_path};
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(resource).with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let s3 = S3Session::connect(S3ConnectConfig { use_https: false, host: "127.0.0.1".into(), port, region: Some("us-east-1".into()), access_key_id: "key".into(), secret_access_key: Zeroizing::new("secret".into()), path_style: true, ..Default::default() }, None, 0).await.unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let dest = temp.path().join("version.bin");
+    let partial = local_stage_path(&dest, Some("ver-1")).unwrap();
+    let unrelated = local_stage_path(&dest, Some("other")).unwrap();
+    let entry = FileEntry { name: "version.bin".into(), size: 10, is_dir: false, is_symlink: false, broken_link: false, date: String::new(), mtime: 0, permissions: String::new(), owner: None, group: None };
+    let flags = TransferFlags { resume: true, no_clobber: true, version_id: Some("ver-1".into()), source_etag: Some("\"v1\"".into()), preserve_time: false, ..Default::default() };
+    let mut log = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+    std::fs::write(&partial, b"wrong").unwrap();
+    std::fs::write(&unrelated, b"unrelated").unwrap();
+    assert!(download_verified_resume(&s3, "/bucket/file.bin", &entry, &dest, &flags, &mut log, None).await.is_err());
+    assert_eq!(std::fs::read(&partial).unwrap(), b"wrong");
+    assert!(!dest.exists());
+    std::fs::write(&partial, b"01234").unwrap();
+    state.lock().unwrap().wrong_version_at = Some("tail");
+    assert!(download_verified_resume(&s3, "/bucket/file.bin", &entry, &dest, &flags, &mut log, None).await.is_err());
+    assert_eq!(std::fs::read(&partial).unwrap(), b"01234");
+    assert!(!dest.exists());
+    state.lock().unwrap().wrong_version_at = None;
+    download_verified_resume(&s3, "/bucket/file.bin", &entry, &dest, &flags, &mut log, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    assert_eq!(std::fs::read(&partial).unwrap(), b"01234");
+    assert_eq!(std::fs::read(&unrelated).unwrap(), b"unrelated");
+    assert!(download_verified_resume(&s3, "/bucket/file.bin", &entry, &dest, &flags, &mut log, None).await.is_err());
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
     server.abort();
 }

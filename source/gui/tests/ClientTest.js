@@ -4188,6 +4188,13 @@ function options(id) {
     const s3DlCall = calls.filter(call => call.path === '/api/s3/version-download').pop();
     check('S3 version download queues the selected version_id',
       !!s3DlCall && JSON.parse(s3DlCall.options.body).version_id === 'ver-1');
+    check('S3 version resume is opt-in by default', !doc.getElementById('s3VersionResume').checked && JSON.parse(s3DlCall.options.body).resume === false);
+    doc.getElementById('s3VersionResume').checked = true;
+    await window.downloadS3Version('report.csv', 'ver-1');
+    const resumedVersion = JSON.parse(calls.filter(call => call.path === '/api/s3/version-download').pop().options.body);
+    check('S3 version resume sends the selected version and explicit flag', resumedVersion.resume === true && resumedVersion.version_id === 'ver-1');
+    await window.openS3Versions();
+    check('S3 version resume approval is not persisted across dialogs', !doc.getElementById('s3VersionResume').checked);
     await window.deleteS3Version('report.csv', 'ver-1');
     const s3DelCall = calls.filter(call => call.path === '/api/s3/version-delete').pop();
     check('S3 version delete posts the selected version_id',

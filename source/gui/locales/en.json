@@ -1145,6 +1145,7 @@
   "Resume": "Resume",
   "Resume a part-transferred file": "Resume a part-transferred file",
   "Resume a partial file": "Resume a partial file",
+  "Resume a partial version download (requires a new local destination)": "Resume a partial version download (requires a new local destination)",
   "Resume above a size": "Resume above a size",
   "Resume above:": "Resume above:",
   "Resume monitoring": "Resume monitoring",
