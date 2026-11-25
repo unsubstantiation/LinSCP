@@ -582,7 +582,7 @@ mod tests {
 
     #[test]
     fn redacts_secret_switches_in_diagnostics_without_destroying_prose() {
-        let message = "échec (-Password="two word secret") ProxyPassword=proxy-secret /passphrase:key-secret S3SessionToken=token-secret end";
+        let message = r#"échec (-Password="two word secret") ProxyPassword=proxy-secret /passphrase:key-secret S3SessionToken=token-secret end"#;
         let safe = redact_diagnostic_secrets(message);
         assert_eq!(safe, "échec (-Password=***) ProxyPassword=*** /passphrase:*** S3SessionToken=*** end");
         assert_eq!(redact_diagnostic_secrets("failed -password=\"unfinished secret"), "failed -password=***");
