@@ -26,5 +26,6 @@ jobs:
         shell: bash
         env:
           LSCP_LIVE_WEBDAV: '1'
+          RUST_MIN_STACK: '16777216'
         run: |
           cargo test -p linscp-service live_webdav_gui_upload_download > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }
