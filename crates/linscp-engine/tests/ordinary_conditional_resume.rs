@@ -6,7 +6,7 @@ use linscp_proto::{s3::{S3ConnectConfig, S3Session}, webdav::{WebDavConnectConfi
 use linscp_types::{FileEntry, ProtocolScheme};
 use zeroize::Zeroizing;
 
-struct Resource { data: Vec<u8>, etag: String, change_after_prefix: bool, wrong_version_at: Option<&'static str>, version_requests: Vec<String> }
+struct Resource { data: Vec<u8>, etag: String, change_after_prefix: bool, wrong_version_at: Option<&'static str>, bad_etag_at: Option<(&'static str, bool)>, version_requests: Vec<String> }
 async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let mut r = state.lock().unwrap();
     if method.as_str() == "PROPFIND" {
@@ -23,7 +23,10 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri
     if method == Method::GET {
         if headers.get("if-match").and_then(|x| x.to_str().ok()) != Some(r.etag.as_str()) { return StatusCode::PRECONDITION_FAILED.into_response(); }
         if headers.get("range").is_none() {
-            let mut response = Response::builder().status(StatusCode::OK).header("etag", &r.etag);
+            let mut response = Response::builder().status(StatusCode::OK);
+            if let Some(("full", omit)) = r.bad_etag_at {
+                if !omit { response = response.header("etag", "\"other\""); }
+            } else { response = response.header("etag", &r.etag); }
             if versioned { response = response.header("x-amz-version-id", if r.wrong_version_at == Some("tail") { "other" } else { "ver-1" }); }
             return response.body(Body::from(r.data.clone())).unwrap();
         }
@@ -35,9 +38,13 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri
         let etag = r.etag.clone();
         let data = r.data[start..=end].to_vec();
         if start == 0 && r.change_after_prefix { r.etag = "\"v2\"".into(); }
-        let mut response = Response::builder().status(StatusCode::PARTIAL_CONTENT).header("content-range", content_range).header("etag", etag);
+        let phase = if start == 0 { "prefix" } else { "tail" };
+        let mut response = Response::builder().status(StatusCode::PARTIAL_CONTENT).header("content-range", content_range);
+        if let Some((fault_phase, omit)) = r.bad_etag_at.filter(|(fault_phase, _)| *fault_phase == phase) {
+            let _ = fault_phase;
+            if !omit { response = response.header("etag", "\"other\""); }
+        } else { response = response.header("etag", etag); }
         if versioned {
-            let phase = if start == 0 { "prefix" } else { "tail" };
             response = response.header("x-amz-version-id", if r.wrong_version_at == Some(phase) { "other" } else { "ver-1" });
         }
         return response.body(Body::from(data)).unwrap();
@@ -79,7 +86,7 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
 
 #[tokio::test]
 async fn webdav_and_s3_ordinary_resume_pin_and_compare() {
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -94,7 +101,7 @@ async fn webdav_and_s3_ordinary_resume_pin_and_compare() {
 #[tokio::test]
 async fn s3_versioned_resume_pins_version_and_preserves_partials_on_failure() {
     use linscp_engine::transfer::local_stage_path;
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -131,7 +138,7 @@ async fn s3_versioned_resume_pins_version_and_preserves_partials_on_failure() {
 #[tokio::test]
 async fn s3_version_verified_resume_uses_version_scoped_checkpoint() {
     use linscp_engine::transfer::{download_verified_resume, local_stage_path};
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -169,7 +176,7 @@ async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() 
     use linscp_proto::TransferRequest;
     use std::time::{Duration, Instant};
     let payload = vec![42u8; 16 * 1024];
-    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state);
@@ -194,7 +201,7 @@ async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() 
 async fn http_resume_prefix_verification_obeys_speed_limit() {
     use std::time::{Duration, Instant};
     let payload = vec![71u8; 16 * 1024];
-    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state);
@@ -208,5 +215,49 @@ async fn http_resume_prefix_verification_obeys_speed_limit() {
         assert!(start.elapsed() >= Duration::from_millis(220), "prefix verification ignored speed limit");
         assert!(prefix.is_empty());
     }
+    server.abort();
+}
+
+#[tokio::test]
+async fn webdav_conditional_downloads_reject_unconfirmed_response_etags() {
+    use linscp_engine::transfer::download_verified_resume;
+    use linscp_proto::TransferRequest;
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = Router::new().fallback(resource).with_state(state.clone());
+    let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let dav = WebDavSession::connect(WebDavConnectConfig { scheme: ProtocolScheme::Dav, host: "127.0.0.1".into(), port, base_path: "/dav".into(), ..Default::default() }, None, 0).await.unwrap();
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("file.bin");
+    let stage = tmp.path().join("file.bin.filepart");
+    let entry = FileEntry { name: "file.bin".into(), size: 10, is_dir: false, is_symlink: false, broken_link: false, date: String::new(), mtime: 0, permissions: String::new(), owner: None, group: None };
+    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+    let verified = TransferFlags { no_clobber: true, source_etag: Some("\"v1\"".into()), ..flags.clone() };
+    let mut logger = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+    std::fs::write(&stage, b"01234").unwrap();
+    for phase in ["prefix", "tail"] {
+        for omit in [true, false] {
+            state.lock().unwrap().bad_etag_at = Some((phase, omit));
+            let err = download_single_file(&dav, "file.bin", Some(&entry), &dest, &flags, &mut logger, None).await.unwrap_err();
+            assert!(err.contains("ETag"), "{phase} {omit}: {err}");
+            assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
+            assert!(!dest.exists());
+            let err = download_verified_resume(&dav, "file.bin", &entry, &dest, &verified, &mut logger, None).await.unwrap_err();
+            assert!(err.contains("ETag"), "{phase} {omit}: {err}");
+            assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
+            assert!(!dest.exists());
+        }
+    }
+    for omit in [true, false] {
+        state.lock().unwrap().bad_etag_at = Some(("full", omit));
+        let mut output = Vec::new();
+        let err = dav.download_if_match("file.bin", "\"v1\"", TransferRequest::default(), &mut output, None).await.unwrap_err();
+        assert!(err.to_string().contains("ETag"));
+        assert!(output.is_empty(), "unconfirmed bytes must not reach the sink");
+    }
+    state.lock().unwrap().bad_etag_at = None;
+    download_verified_resume(&dav, "file.bin", &entry, &dest, &verified, &mut logger, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
     server.abort();
 }
