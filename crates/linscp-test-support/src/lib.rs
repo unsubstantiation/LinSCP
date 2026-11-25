@@ -723,6 +723,19 @@ async fn handle_mock_exec(channel: Channel<Msg>, cmd: String, fs: Arc<Mutex<MemF
         tokio::time::sleep(Duration::from_secs(60)).await;
         let _ = channel.close().await;
         return;
+    } else if cmd == "__LINSCP_TEST_INTERLEAVED__" {
+        // Exceed typical pipe capacities on both logical streams and alternate
+        // frames so the client must consume both while the command runs.
+        let stdout_block = vec![b'O'; 4096];
+        let stderr_block = vec![b'E'; 4096];
+        for _ in 0..16 {
+            if channel.data(stdout_block.as_slice()).await.is_err() { return; }
+            if channel.extended_data(1, stderr_block.as_slice()).await.is_err() { return; }
+        }
+        let _ = channel.exit_status(7).await;
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+        return;
     } else if cmd == "__LINSCP_TEST_FLOOD__" {
         let block = vec![b'x'; 64 * 1024];
         for _ in 0..1024 {
