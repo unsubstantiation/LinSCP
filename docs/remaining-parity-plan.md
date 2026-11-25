@@ -322,14 +322,14 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 **Area:** Desktop integration · **Status:** partial
 
-The desktop entry and GUI parse sftp://, ftp://, ftps:// and ftpes:// startup URLs with escaped paths.
+The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Linux desktop entry does not register URI handlers or pass a URL, and the native launcher does not consume startup URLs.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** Manual URL parsing has host-side coverage, but desktop scheme registration and startup URL delivery are not implemented. Android deep-link behavior and real desktop integration are not tested.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
+- [ ] If startup URI handling is desired, design and implement registration and secure delivery on each intended platform, with tests for untrusted URLs, credential handling, explicit user confirmation, and host-key validation.
+- [ ] Test launching a registered URI through the actual desktop or device.
 
 ## desktop.launcher-prefix
 
