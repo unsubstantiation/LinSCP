@@ -100,6 +100,14 @@ fn run_action(action: Action) -> ActionOutcome {
             linscp_service::cli_actions::install_shell_integration(&launcher)
         }
         Action::UninstallShellIntegration => linscp_service::cli_actions::uninstall_shell_integration(),
+        Action::InstallUrlHandlers => {
+            let result = match std::env::current_exe() {
+                Ok(launcher) => linscp_platform::url_registration::install(&launcher),
+                Err(error) => Err(format!("Cannot find the application executable: {error}")),
+            };
+            url_registration_outcome(result)
+        }
+        Action::UninstallUrlHandlers => url_registration_outcome(linscp_platform::url_registration::uninstall()),
         Action::ShellUpload(files) => {
             // A file manager passes absolute paths; a script may not, and this
             // process's working directory is not necessarily where the user was.
@@ -117,5 +125,12 @@ fn run_action(action: Action) -> ActionOutcome {
             stdout: Vec::new(),
             stderr: Vec::new(),
         },
+    }
+}
+
+fn url_registration_outcome(result: Result<String, String>) -> ActionOutcome {
+    match result {
+        Ok(message) => ActionOutcome { exit_code: 0, stdout: vec![message], stderr: Vec::new() },
+        Err(message) => ActionOutcome { exit_code: 1, stdout: Vec::new(), stderr: vec![message] },
     }
 }

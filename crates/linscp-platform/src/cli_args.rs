@@ -34,6 +34,10 @@ pub enum Action {
     InstallShellIntegration,
     /// Remove the actions `InstallShellIntegration` wrote, and nothing else.
     UninstallShellIntegration,
+    /// Advertise URL handlers for this Windows user without changing defaults.
+    InstallUrlHandlers,
+    /// Remove LinSCP-owned Windows URL registration.
+    UninstallUrlHandlers,
     /// Record this selection as a pending upload and exit. The paths are what the
     /// file manager produced; they are validated when the manifest is written.
     ShellUpload(Vec<PathBuf>),
@@ -49,6 +53,8 @@ impl std::fmt::Debug for Action {
             Self::OpenSessionUrl(_) => f.write_str("OpenSessionUrl([redacted])"),
             Self::InstallShellIntegration => f.write_str("InstallShellIntegration"),
             Self::UninstallShellIntegration => f.write_str("UninstallShellIntegration"),
+            Self::InstallUrlHandlers => f.write_str("InstallUrlHandlers"),
+            Self::UninstallUrlHandlers => f.write_str("UninstallUrlHandlers"),
             Self::ShellUpload(files) => f.debug_tuple("ShellUpload").field(files).finish(),
             Self::Help => f.write_str("Help"),
         }
@@ -61,6 +67,8 @@ impl std::fmt::Debug for Action {
 /// opening windows: adding one here is how a new action becomes reachable.
 const INSTALL: &str = "--install-shell-integration";
 const UNINSTALL: &str = "--uninstall-shell-integration";
+const INSTALL_URLS: &str = "--install-url-handlers";
+const UNINSTALL_URLS: &str = "--uninstall-url-handlers";
 const SHELL_UPLOAD: &str = "--shell-upload";
 const HELP: &str = "--help";
 
@@ -76,6 +84,17 @@ const HELP: &str = "--help";
 pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
     let words: Vec<&str> = args.iter().map(|a| a.as_ref()).collect();
 
+    // A desktop URL is untrusted. If an operating system or launcher splits
+    // an unsafe URL into additional arguments, never interpret the remainder
+    // as privileged one-shot actions such as shell integration or upload.
+    if words.first().is_some_and(|word| has_session_url_scheme(word)) {
+        return if words.len() == 1 && is_session_url(words[0]) {
+            Action::OpenSessionUrl(words[0].to_string())
+        } else {
+            Action::OpenWindow
+        };
+    }
+
     if words.iter().any(|word| *word == HELP) {
         return Action::Help;
     }
@@ -83,15 +102,12 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
     // Every action flag is one-shot. If two are given the command line is
     // contradictory, so the window opens and the user sees something rather than
     // this code picking a winner.
-    let action_flags = [INSTALL, UNINSTALL, SHELL_UPLOAD];
+    let action_flags = [INSTALL, UNINSTALL, INSTALL_URLS, UNINSTALL_URLS, SHELL_UPLOAD];
     let present: Vec<&str> = action_flags
         .iter()
         .copied()
         .filter(|flag| words.contains(flag))
         .collect();
-    if present.is_empty() && words.len() == 1 && is_session_url(words[0]) {
-        return Action::OpenSessionUrl(words[0].to_string());
-    }
     if present.len() != 1 {
         return Action::OpenWindow;
     }
@@ -100,6 +116,8 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
     match flag {
         INSTALL => Action::InstallShellIntegration,
         UNINSTALL => Action::UninstallShellIntegration,
+        INSTALL_URLS => Action::InstallUrlHandlers,
+        UNINSTALL_URLS => Action::UninstallUrlHandlers,
         SHELL_UPLOAD => {
             let position = words.iter().position(|word| *word == SHELL_UPLOAD).unwrap_or(0);
             let files: Vec<PathBuf> = words[position + 1..].iter().map(PathBuf::from).collect();
@@ -120,9 +138,12 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
 /// Credentials may be present, so callers must not log the value.
 pub fn is_session_url(url: &str) -> bool {
     if url.len() > 8192 || url.bytes().any(|c| c.is_ascii_control()) { return false; }
-    let Some((scheme, rest)) = url.split_once("://") else { return false; };
-    !rest.is_empty() && ["sftp", "ssh", "scp", "ftp", "ftps", "ftpes", "dav", "davs", "webdav", "webdavs", "s3"]
-        .iter().any(|s| scheme.eq_ignore_ascii_case(s))
+    has_session_url_scheme(url) && url.split_once("://").is_some_and(|(_, rest)| !rest.is_empty())
+}
+
+fn has_session_url_scheme(url: &str) -> bool {
+    let Some((scheme, _)) = url.split_once("://") else { return false; };
+    crate::url_registration::SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
 /// The usage text `--help` prints. Kept next to the parser so the two cannot drift.
@@ -136,6 +157,9 @@ Usage:
                                               (Linux) or to the Explorer Send To menu
                                               (Windows), for this user only.
   linscp-gui --uninstall-shell-integration    Remove exactly what the install wrote.
+  linscp-gui --install-url-handlers           Register as an available Windows URL
+                                              handler; choose defaults in Settings.
+  linscp-gui --uninstall-url-handlers         Remove the per-user URL registration.
   linscp-gui --shell-upload FILE...           Stage FILE... as a pending upload for a
                                               running LinSCP window, then exit. This
                                               is what the installed actions run;
@@ -170,6 +194,10 @@ mod tests {
             assert_eq!(parse(&[url]), Action::OpenWindow);
         }
         assert_eq!(parse(&["sftp://example.com", "another"]), Action::OpenWindow);
+        for flag in [INSTALL, UNINSTALL, INSTALL_URLS, UNINSTALL_URLS, SHELL_UPLOAD, HELP] {
+            assert_eq!(parse(&["sftp://example.com/", flag, "file.txt"]), Action::OpenWindow);
+            assert_eq!(parse(&["sftp://", flag, "file.txt"]), Action::OpenWindow);
+        }
         assert!(!is_session_url(&format!("sftp://{}", "x".repeat(8192))));
         assert!(!format!("{:?}", parse(&["sftp://user:secret@example.com"])).contains("secret"));
     }
@@ -178,6 +206,8 @@ mod tests {
     fn the_shell_actions_are_reachable() {
         assert_eq!(parse(&[INSTALL]), Action::InstallShellIntegration);
         assert_eq!(parse(&[UNINSTALL]), Action::UninstallShellIntegration);
+        assert_eq!(parse(&[INSTALL_URLS]), Action::InstallUrlHandlers);
+        assert_eq!(parse(&[UNINSTALL_URLS]), Action::UninstallUrlHandlers);
         // `--ACTION=value` is not the documented form; do not guess at it.
         assert_eq!(parse(&["--install-shell-integration=yes"]), Action::OpenWindow);
     }
@@ -290,5 +320,7 @@ mod tests {
         assert!(USAGE.contains(INSTALL));
         assert!(USAGE.contains(UNINSTALL));
         assert!(USAGE.contains(SHELL_UPLOAD));
+        assert!(USAGE.contains(INSTALL_URLS));
+        assert!(USAGE.contains(UNINSTALL_URLS));
     }
 }

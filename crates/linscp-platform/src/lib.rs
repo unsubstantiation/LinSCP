@@ -17,6 +17,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod cli_args;
+pub mod url_registration;
 pub mod desktop;
 pub mod password_vault;
 pub mod gssapi_sys;
