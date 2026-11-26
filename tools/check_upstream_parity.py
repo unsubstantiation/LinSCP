@@ -59,6 +59,7 @@ CASE_SOURCES = {
     "dotnet": "automation/test_dotnet.py",
     "translation-tests": "tools/tests/test_translations.py",
     "platform-conversion": "tools/tests/test_platform_conversion.py",
+    "gui-distribution": "tools/tests/test_gui_distribution.py",
     "wayland-compatibility": "tools/tests/test_wayland_compatibility.py",
     "backup": "crates/linscp-engine/src/backup.rs",
     # The shared TypeScript bundle every host embeds: the touch shell, the dual

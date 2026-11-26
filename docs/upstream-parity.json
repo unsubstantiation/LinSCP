@@ -44,6 +44,7 @@
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
+          "gui-distribution": "tools/tests/test_gui_distribution.py runs in the Debian Linux test job and stages the Makefile install with a stub binary to check PREFIX, DESTDIR and installed assets without a build.",
           "engine-editor": "crates/linscp-engine/src/editor.rs - the engine's own editor workflow: the monitored save is uploaded while the editor stays open, and a file the server changed meanwhile is never overwritten. The editor double is a shell command, so these cases run on the Unix hosts only.",
           "engine-scp": "crates/linscp-engine/tests/scp_engine_cases.rs - the SCP engine end to end against the mock server: the live-scp cases ported to Rust - the directory engine, the shell commands and their refusals, the transfers, the staging, the speed limit and the progress meter.",
           "engine-script": "crates/linscp-engine/tests/script_engine_cases.rs - the script interpreter's own cases: the parameter, environment and timestamp expansion, the transfer presets and the resume modes, the stored sessions and their export, the raw session settings and the XML action log. The retired Python suite drove a `linscp` binary this repository does not build, so these cases drive the same behaviour through the engine instead.",
@@ -4469,30 +4470,25 @@
       "id": "platform.make-linux",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "source/linux/Makefile builds the native Linux/libssh client, refuses non-Linux hosts and provides an install target staged under DESTDIR/PREFIX.",
+      "notes": "source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. There is no CLI in this distribution.",
       "source": [
-        "Cargo.toml"
+        "source/linux/Makefile",
+        "tools/tests/test_gui_distribution.py"
       ],
       "checks": {
-        "script": [
-          "test_passphrase_redaction_and_build_packaging_smoke"
+        "gui-distribution": [
+          "test_make_install_honors_prefix_and_destdir"
         ]
       },
       "verified_on": {
         "linux": [
-          "script"
-        ],
-        "windows": [
-          "script"
-        ],
-        "android": [
-          "script"
+          "gui-distribution"
         ]
       },
-      "gap": "No runnable suite evidences this: script needs a `linscp` binary this repo does not build.",
+      "gap": "The install recipe is tested with a stub binary; a full Makefile build and installed GUI launch under a custom prefix have not been exercised. Custom-prefix desktop launch depends on the session PATH. The former console client is not shipped.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Build the native GUI through Make and launch it from a custom-prefix install on Linux.",
+        "Do not claim the retired console client is installed."
       ]
     },
     {

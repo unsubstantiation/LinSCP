@@ -1,6 +1,9 @@
 """Guard the native-only desktop distribution against CLI regressions."""
 import json
 import pathlib
+import shutil
+import subprocess
+import tempfile
 import tomllib
 import unittest
 
@@ -68,6 +71,35 @@ class GuiDistributionTests(unittest.TestCase):
         upload = windows[windows.index('Upload the portable application'):]
         self.assertEqual(upload.count('.exe'), 1, 'the artifact must be one app')
         self.assertIn('compression-level: 0', upload)
+
+    @unittest.skipUnless(shutil.which('make') and shutil.which('install'), 'make and install required')
+    def test_make_install_honors_prefix_and_destdir(self):
+        # Stage a fake build output in an isolated source tree. -o all tests
+        # the real install recipe without compiling or touching the checkout.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / 'source'
+            (root / 'source/linux').mkdir(parents=True)
+            (root / 'target/release').mkdir(parents=True)
+            (root / 'debian').mkdir()
+            shutil.copy(ROOT / 'source/linux/Makefile', root / 'source/linux/Makefile')
+            (root / 'target/release/linscp-gui').write_text('stub executable')
+            for asset in ['linscp.desktop', 'linscp.png', 'linscp.svg']:
+                shutil.copy(ROOT / 'debian' / asset, root / 'debian' / asset)
+            stage = pathlib.Path(tmp) / 'stage with spaces'
+            subprocess.run(['make', '-C', str(root / 'source/linux'), '-o', 'all', 'install',
+                            'PREFIX=/opt/linscp custom', 'DESTDIR=' + str(stage)], check=True, capture_output=True, text=True)
+            prefix = stage / 'opt/linscp custom'
+            binary = prefix / 'bin/linscp-gui'
+            self.assertEqual(binary.read_text(), 'stub executable')
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            for path in ['share/applications/linscp.desktop', 'share/pixmaps/linscp.png',
+                         'share/icons/hicolor/scalable/apps/linscp.svg']:
+                self.assertTrue((prefix / path).is_file(), path)
+            self.assertFalse((stage / 'usr').exists())
+            default_stage = pathlib.Path(tmp) / 'default stage'
+            subprocess.run(['make', '-C', str(root / 'source/linux'), '-o', 'all', 'install',
+                            'DESTDIR=' + str(default_stage)], check=True, capture_output=True, text=True)
+            self.assertTrue((default_stage / 'usr/bin/linscp-gui').is_file())
 
     def test_the_shared_page_reaches_the_native_bridge_only(self):
         # The page used to fall back to `fetch()` with a bearer token when no

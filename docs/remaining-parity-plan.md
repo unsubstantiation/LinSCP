@@ -364,14 +364,14 @@ English, Spanish, German and French catalogs cover the browser interface (menus,
 
 **Area:** Packaging/platforms · **Status:** partial
 
-source/linux/Makefile builds the native Linux/libssh client, refuses non-Linux hosts and provides an install target staged under DESTDIR/PREFIX.
+source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. There is no CLI in this distribution.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
+**Next:** The install recipe is tested with a stub binary; a full Makefile build and installed GUI launch under a custom prefix have not been exercised. Custom-prefix desktop launch depends on the session PATH. The former console client is not shipped.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Build the native GUI through Make and launch it from a custom-prefix install on Linux.
+- [ ] Do not claim the retired console client is installed.
 
 ## platform.cmake-linux
 
