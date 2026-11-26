@@ -115,9 +115,9 @@ A file that arrives in the watched tree wakes the watcher, so the next pass runs
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.
+Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported. A packaged Android emulator exercises nested folder and site rename, conflict refusal, reconnection with retained credentials, scoped site/folder deletion and persistence of deletions after restart against a WebDAV fixture.
 
-**Next:** The rename path and the site's own cleanup still rest on the service suite, which no Android step executes. Runnable residue: engine-script (the store, the folders, the export and the import), the service suite and the GUI suite on Linux and Windows.
+**Next:** Android emulator coverage now includes rename, connection and site/folder deletion through the packaged app, but not site import/export, filter/sort interaction or physical devices. Linux and Windows exercise the service and GUI with host tests.
 
 **Acceptance criteria:**
 

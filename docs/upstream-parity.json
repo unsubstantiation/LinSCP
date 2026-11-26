@@ -2904,11 +2904,12 @@
       "id": "sessions.site-manager",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported.",
+      "notes": "Stored sites can be saved, renamed (including nested folders), filtered, sorted by name or last-connected timestamp (last_used), opened, removed, exported and imported. A packaged Android emulator exercises nested folder and site rename, conflict refusal, reconnection with retained credentials, scoped site/folder deletion and persistence of deletions after restart against a WebDAV fixture.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-service/src/lib.rs",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "tools/android_emulator_smoke.mjs"
       ],
       "checks": {
         "engine-script": [
@@ -2924,6 +2925,10 @@
         "service": [
           "touch_local_copy_session_rename_workspaces_sync_perms_and_cleanup_work",
           "dual_local_sync_s3_restore_dav_property_remove_and_last_used_round_trip"
+        ],
+        "android-emulator": [
+          "verifyAndroidSiteManager",
+          "verifyAndroidVaultRestart"
         ]
       },
       "verified_on": {
@@ -2939,10 +2944,11 @@
         ],
         "android": [
           "engine-script",
-          "gui"
+          "gui",
+          "android-emulator"
         ]
       },
-      "gap": "The rename path and the site's own cleanup still rest on the service suite, which no Android step executes. Runnable residue: engine-script (the store, the folders, the export and the import), the service suite and the GUI suite on Linux and Windows.",
+      "gap": "Android emulator coverage now includes rename, connection and site/folder deletion through the packaged app, but not site import/export, filter/sort interaction or physical devices. Linux and Windows exercise the service and GUI with host tests.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
