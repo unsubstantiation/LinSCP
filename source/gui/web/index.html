@@ -6158,6 +6158,29 @@
     setTimeout(() => { if ($('pasteSessionUrlInput')) $('pasteSessionUrlInput').focus(); }, 30);
   }
 
+  // URLs arriving from a desktop launcher are untrusted. Show the existing
+  // review dialog; parsing and connecting both require a user action. Defer
+  // while another dialog is open so no credentials or choices are overwritten.
+  let takingLaunchUrl = false;
+  let deferredLaunchUrl = null;
+  async function checkNativeLaunchUrl() {
+    const caps = hostCaps();
+    if (!caps || caps.platform === 'android' || !caps.nativeIpc || takingLaunchUrl || document.querySelector('.modal-overlay.open')) return;
+    const invoke = window.LinSCPCore?.nativeInvoker(window);
+    if (!invoke) return;
+    takingLaunchUrl = true;
+    try {
+      const url = deferredLaunchUrl || await invoke.invoke('linscp_take_launch_url');
+      if (typeof url === 'string' && url) {
+        if (document.querySelector('.modal-overlay.open')) { deferredLaunchUrl = url; return; }
+        deferredLaunchUrl = null;
+        openPasteSessionUrl();
+        $('pasteSessionUrlInput').value = url;
+      }
+    } catch (_) { /* Older native hosts have no launch URL command. */ }
+    finally { takingLaunchUrl = false; }
+  }
+
   async function parseEnteredSessionUrl(rawUrl) {
     const trimmed = String(rawUrl || '').trim();
     if (!trimmed) {
@@ -9078,7 +9101,10 @@
       try { el.focus({ preventScroll: true }); } catch (_) { el.focus(); }
     }
   }
-  function closeModal(id) { $(id).classList.remove('open'); }
+  function closeModal(id) {
+    $(id).classList.remove('open');
+    if (id === 'sessionUrlModal' && $('pasteSessionUrlInput')) $('pasteSessionUrlInput').value = '';
+  }
   function showHelp() {
     // The build stamps its Alaska Standard Time version (VYYYY-MM-DD-HH-MM)
     // into the page; a page served without that stamp shows no version line
@@ -13351,6 +13377,8 @@
     refreshQueue();
     await restoreOpenInPageTerminal();
     checkShellPending();
+    void checkNativeLaunchUrl();
+    setInterval(checkNativeLaunchUrl, 1000);
     setInterval(checkShellPending, 15000);
     setInterval(refreshQueue, 2000);
     setInterval(refreshLogs, 4000);

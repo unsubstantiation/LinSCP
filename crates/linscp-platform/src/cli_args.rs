@@ -23,10 +23,12 @@
 use std::path::PathBuf;
 
 /// What the process was asked to do before (or instead of) opening a window.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Action {
     /// Start the window. The default, and what any unrecognised argument gets.
     OpenWindow,
+    /// Review an untrusted session URL in the window; never connect automatically.
+    OpenSessionUrl(String),
     /// Write the per-user file-manager actions (Dolphin, GNOME Files, Nemo on
     /// Linux; the Explorer *Send To* shortcut on Windows).
     InstallShellIntegration,
@@ -37,6 +39,20 @@ pub enum Action {
     ShellUpload(Vec<PathBuf>),
     /// Print the usage text and exit successfully.
     Help,
+}
+
+// URLs may carry credentials; even a diagnostic Debug print must not expose them.
+impl std::fmt::Debug for Action {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OpenWindow => f.write_str("OpenWindow"),
+            Self::OpenSessionUrl(_) => f.write_str("OpenSessionUrl([redacted])"),
+            Self::InstallShellIntegration => f.write_str("InstallShellIntegration"),
+            Self::UninstallShellIntegration => f.write_str("UninstallShellIntegration"),
+            Self::ShellUpload(files) => f.debug_tuple("ShellUpload").field(files).finish(),
+            Self::Help => f.write_str("Help"),
+        }
+    }
 }
 
 /// Arguments that mean "this copy is not the window".
@@ -73,6 +89,9 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
         .copied()
         .filter(|flag| words.contains(flag))
         .collect();
+    if present.is_empty() && words.len() == 1 && is_session_url(words[0]) {
+        return Action::OpenSessionUrl(words[0].to_string());
+    }
     if present.len() != 1 {
         return Action::OpenWindow;
     }
@@ -97,6 +116,15 @@ pub fn parse<S: AsRef<str>>(args: &[S]) -> Action {
     }
 }
 
+/// A conservative launch allowlist, not a replacement for the session parser.
+/// Credentials may be present, so callers must not log the value.
+pub fn is_session_url(url: &str) -> bool {
+    if url.len() > 8192 || url.bytes().any(|c| c.is_ascii_control()) { return false; }
+    let Some((scheme, rest)) = url.split_once("://") else { return false; };
+    !rest.is_empty() && ["sftp", "ssh", "scp", "ftp", "ftps", "ftpes", "dav", "davs", "webdav", "webdavs", "s3"]
+        .iter().any(|s| scheme.eq_ignore_ascii_case(s))
+}
+
 /// The usage text `--help` prints. Kept next to the parser so the two cannot drift.
 pub const USAGE: &str = "\
 LinSCP \u{2014} dual-pane file transfer client.
@@ -113,6 +141,7 @@ Usage:
                                               is what the installed actions run;
                                               nothing is transferred until the window
                                               confirms.
+  linscp-gui URL                              Review a session URL before connecting.
   linscp-gui --help                           Print this text.
 
 Any other argument, including none, opens the window.
@@ -133,10 +162,16 @@ mod tests {
     }
 
     #[test]
-    fn startup_session_url_is_not_a_registered_action() {
+    fn startup_session_url_is_reviewed_not_executed() {
         for url in ["sftp://example.com/path%20name", "ftp://example.com/", "ftps://example.com/", "ftpes://example.com/"] {
+            assert_eq!(parse(&[url]), Action::OpenSessionUrl(url.to_string()));
+        }
+        for url in ["javascript://example.com", "https://example.com", "sftp://", "sftp://host/\nsecret"] {
             assert_eq!(parse(&[url]), Action::OpenWindow);
         }
+        assert_eq!(parse(&["sftp://example.com", "another"]), Action::OpenWindow);
+        assert!(!is_session_url(&format!("sftp://{}", "x".repeat(8192))));
+        assert!(!format!("{:?}", parse(&["sftp://user:secret@example.com"])).contains("secret"));
     }
 
     #[test]

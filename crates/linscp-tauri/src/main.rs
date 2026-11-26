@@ -28,6 +28,7 @@ fn main() {
     let action = cli_args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
     match action {
         Action::OpenWindow => linscp_tauri::run_native_app(tauri::generate_context!()),
+        Action::OpenSessionUrl(url) => linscp_tauri::run_native_app_with_url(tauri::generate_context!(), Some(url)),
         Action::Help => {
             // `Help` is printed, not run: it must never depend on a running window.
             let mut out = Output::open();
@@ -111,7 +112,7 @@ fn run_action(action: Action) -> ActionOutcome {
         }
         // Already handled above; kept so this function cannot silently do nothing
         // if a future action is added without a branch here.
-        Action::OpenWindow | Action::Help => ActionOutcome {
+        Action::OpenWindow | Action::OpenSessionUrl(_) | Action::Help => ActionOutcome {
             exit_code: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),

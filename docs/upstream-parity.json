@@ -1144,7 +1144,7 @@
     {
       "name": "Desktop integration",
       "status": "partial",
-      "notes": "The GUI can parse a manually pasted session URL, but the desktop entry does not register URL handlers and the launcher does not consume startup URLs. Launcher/core lookup and live desktop behavior require separate validation. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in and, since the audit's A3 item, reachable: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, or the Explorer Send To shortcut on Windows, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything; the shipped binary now reads its own command line (it did not, so none of this could run), and both desktop CI jobs drive the built binary through install, upload and uninstall. Covered by the retired GUI harness, gui-shell, gui-cli, gui-shell-definitions, script, gui, the retired GUI harness, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
+      "notes": "The GUI can review pasted or desktop-launched session URLs. The Debian desktop entry advertises transfer URI handlers; the native launcher delivers a URL in memory to the primary window for explicit review. Launcher/core lookup and live desktop behavior require separate validation. Local and remote pane desktop drops are tested using browser API fixtures, and a display-session decision that ignores Wayland is refused by the compatibility check. File-manager integration is per-user opt-in and, since the audit's A3 item, reachable: 'linscp-gui --install-shell-integration' writes 'Upload with LinSCP' actions for Dolphin, GNOME Files and Nemo, or the Explorer Send To shortcut on Windows, which hold a validated selection for the Commander's confirmation dialog instead of transferring anything; the shipped binary now reads its own command line (it did not, so none of this could run), and both desktop CI jobs drive the built binary through install, upload and uninstall. Covered by the retired GUI harness, gui-shell, gui-cli, gui-shell-definitions, script, gui, the retired GUI harness, unit and wayland-compatibility; real browser/desktop combinations and a live compositor still need acceptance validation, which no fixture here certifies.",
       "verified_on": {
         "linux": [
           "gui-cli",
@@ -4139,7 +4139,7 @@
       "id": "desktop.scheme-handlers",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Linux desktop entry does not register URI handlers or pass a URL, and the native launcher does not consume startup URLs.",
+      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output.",
       "source": [
         "debian/linscp.desktop",
         "crates/linscp-platform/src/cli_args.rs",
@@ -4152,12 +4152,12 @@
           "hostkeys_session_url_paired_bookmarks_and_create_only_save_work"
         ],
         "gui-cli": [
-          "startup_session_url_is_not_a_registered_action"
+          "startup_session_url_is_reviewed_not_executed"
         ]
       },
-      "gap": "Manual URL parsing has host-side coverage, but desktop scheme registration and startup URL delivery are not implemented. Android deep-link behavior and real desktop integration are not tested.",
+      "gap": "The Debian entry declares transfer URI handlers and the native launcher offers URLs for review. Actual desktop registration and end-to-end launch, Windows registration, Android deep links, and untrusted-URL security validation remain unverified.",
       "acceptance": [
-        "If startup URI handling is desired, design and implement registration and secure delivery on each intended platform, with tests for untrusted URLs, credential handling, explicit user confirmation, and host-key validation.",
+        "Validate end-to-end URI delivery on real desktops, including untrusted URLs, credential handling, confirmation and host-key validation; implement registration on other intended platforms.",
         "Test launching a registered URI through the actual desktop or device."
       ],
       "verified_on": {

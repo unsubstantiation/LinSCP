@@ -55,7 +55,11 @@ class GuiDistributionTests(unittest.TestCase):
             self.assertIn('target/release/linscp-gui', text, name)
         desktop = (ROOT / 'debian/linscp.desktop').read_text()
         self.assertEqual(desktop.count('[Desktop Entry]'), 1)
-        self.assertIn('\nExec=linscp-gui\n', desktop)
+        self.assertIn('\nExec=linscp-gui %u\n', desktop)
+        handlers = next(line for line in desktop.splitlines() if line.startswith('MimeType='))
+        for scheme in ['sftp', 'scp', 'ftp', 'ftps', 'ftpes', 'dav', 'davs', 'webdav', 'webdavs', 's3']:
+            self.assertIn('x-scheme-handler/' + scheme + ';', handlers)
+        self.assertNotIn('x-scheme-handler/https;', handlers)
         windows = (ROOT / '.github/workflows/windows-build.yml').read_text()
         self.assertIn('target/release/linscp-gui.exe', windows)
         # Releases are managed by hand, so the artifact is only how the built
@@ -148,7 +152,7 @@ class GuiDistributionTests(unittest.TestCase):
             self.assertNotIn('linscp-cli', text, name)
             self.assertNotIn('target/release/linscp.exe', text, name)
         desktop = (ROOT / 'debian/linscp.desktop').read_text()
-        self.assertIn('\nExec=linscp-gui\n', desktop)
+        self.assertIn('\nExec=linscp-gui %u\n', desktop)
         self.assertNotIn('--open-browser', desktop)
 
     def test_the_shared_page_declares_no_name_twice(self):

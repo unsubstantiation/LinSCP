@@ -6199,6 +6199,28 @@ function options(id) {
     window.closeModal('siteModal');
     window.__TAURI_INTERNALS__.invoke = origInvokeHk;
 
+    // A native launch URL is offered for review, never connected implicitly.
+    let launchCalls = 0;
+    let pendingUrl = 'sftp://alice:launch-secret@example.test/path%20name';
+    const beforeLaunchInvoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_take_launch_url') { launchCalls++; const url = pendingUrl; pendingUrl = null; return url; }
+      return beforeLaunchInvoke(cmd, args);
+    };
+    // Ignore unrelated dialogs left by other fixture cases.
+    doc.querySelectorAll('.modal-overlay.open').forEach(el => el.classList.remove('open'));
+    window.openModal('helpModal');
+    await window.checkNativeLaunchUrl();
+    check('native launch URL waits while another dialog is open', launchCalls === 0);
+    window.closeModal('helpModal');
+    await window.checkNativeLaunchUrl();
+    check('native launch URL opens review without connecting',
+      launchCalls === 1 && doc.getElementById('sessionUrlModal').classList.contains('open') &&
+      doc.getElementById('pasteSessionUrlInput').value === 'sftp://alice:launch-secret@example.test/path%20name' &&
+      !doc.getElementById('siteModal').classList.contains('open'));
+    window.closeModal('sessionUrlModal');
+    window.__TAURI_INTERNALS__.invoke = beforeLaunchInvoke;
+
     // 14. New file (`newFilePrompt`) with `create_only: true` + Local `Save as` (`saveEditorFileAs`).
     const origInvokeEdit = window.__TAURI_INTERNALS__.invoke;
     let localSaveCalls = [];

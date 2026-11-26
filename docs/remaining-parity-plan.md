@@ -321,13 +321,13 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 **Area:** Desktop integration · **Status:** partial
 
-The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Linux desktop entry does not register URI handlers or pass a URL, and the native launcher does not consume startup URLs.
+The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output.
 
-**Next:** Manual URL parsing has host-side coverage, but desktop scheme registration and startup URL delivery are not implemented. Android deep-link behavior and real desktop integration are not tested.
+**Next:** The Debian entry declares transfer URI handlers and the native launcher offers URLs for review. Actual desktop registration and end-to-end launch, Windows registration, Android deep links, and untrusted-URL security validation remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] If startup URI handling is desired, design and implement registration and secure delivery on each intended platform, with tests for untrusted URLs, credential handling, explicit user confirmation, and host-key validation.
+- [ ] Validate end-to-end URI delivery on real desktops, including untrusted URLs, credential handling, confirmation and host-key validation; implement registration on other intended platforms.
 - [ ] Test launching a registered URI through the actual desktop or device.
 
 ## desktop.launcher-prefix
