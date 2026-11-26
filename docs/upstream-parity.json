@@ -2944,7 +2944,7 @@
       "id": "sessions.password-at-rest",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format. A packaged Android debug APK emulator test checks setup, Keystore envelope and sealed site metadata, explicit lock, process restart, wrong-password refusal and successful reconnection using recovered saved credentials.",
+      "notes": "The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format. A packaged Android debug APK emulator test checks setup, Keystore envelope and sealed site metadata, explicit lock, process restart, wrong-password refusal and successful reconnection using recovered saved credentials. The emulator also independently corrupts the Keystore-wrapped key and sealed site store, verifies unlock and save refusal, compares both on-disk files byte-for-byte after each failure, and reconnects after restoring the originals.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-platform/src/password_vault.rs",
@@ -2969,7 +2969,8 @@
           "vault_migrates_and_encrypts_full_session_and_reconnect_state"
         ],
         "android-emulator": [
-          "verifyAndroidVaultRestart"
+          "verifyAndroidVaultRestart",
+          "verifyAndroidVaultTampering"
         ]
       },
       "verified_on": {
@@ -2987,9 +2988,9 @@
           "android-emulator"
         ]
       },
-      "gap": "Linux and Windows host tests cover vault sealing, reopen, wrong-password and tamper refusal and preservation, migration, and redaction. The Android emulator covers setup, lock, restart, wrong-password refusal, Keystore wrapping and saved-site credential recovery; on-device tamper refusal, physical-device behavior, and compatibility with retired Python/core clients remain unverified. The old live-sftp suite requires a CLI binary this distribution does not build.",
+      "gap": "Linux and Windows host tests cover vault sealing, reopen, wrong-password and tamper refusal and preservation, migration, and redaction. The Android emulator covers setup, lock, restart, wrong-password refusal, Keystore wrapping, separate key and site-store corruption refusals with file preservation, and saved-site credential recovery. Physical-device behavior and compatibility with retired Python/core clients remain unverified; the old live-sftp suite requires a CLI binary this distribution does not build.",
       "acceptance": [
-        "Validate Android vault tamper refusal and preservation, and exercise the behavior on physical devices.",
+        "Exercise vault lifecycle and tamper refusal on physical Android devices, including different Keystore implementations.",
         "Only claim compatibility with historical Python/core clients if the actual current encrypted vault format is tested with them."
       ]
     },
