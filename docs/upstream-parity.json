@@ -156,7 +156,7 @@
         }
       },
       "android": {
-        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, which is why the SAF, Keystore and share-sheet rows stay partial. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, the emulator smoke separately exercises a Keystore-backed vault restart, but not the SAF or share-sheet flows. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-06",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -193,7 +193,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests Android Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -2944,12 +2944,15 @@
       "id": "sessions.password-at-rest",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format.",
+      "notes": "The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format. A packaged Android debug APK emulator test checks setup, Keystore envelope and sealed site metadata, explicit lock, process restart, wrong-password refusal and successful reconnection using recovered saved credentials.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-platform/src/password_vault.rs",
         "crates/linscp-service/src/lib.rs",
-        "crates/linscp-platform/src/windows.rs"
+        "crates/linscp-platform/src/windows.rs",
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt",
+        "tools/android_emulator_smoke.mjs",
+        "tools/android_emulator_smoke.sh"
       ],
       "checks": {
         "live-sftp": [
@@ -2964,6 +2967,9 @@
           "saved_site_vault_reopens_and_rejects_wrong_password_and_tampering",
           "sessions_save_round_trip_stores_and_reports_the_key_password",
           "vault_migrates_and_encrypts_full_session_and_reconnect_state"
+        ],
+        "android-emulator": [
+          "verifyAndroidVaultRestart"
         ]
       },
       "verified_on": {
@@ -2977,12 +2983,13 @@
           "service"
         ],
         "android": [
-          "live-sftp"
+          "live-sftp",
+          "android-emulator"
         ]
       },
-      "gap": "Linux and Windows host tests cover vault sealing, reopen with the correct password, wrong-password refusal, tamper refusal and preservation, migration, and redaction. Android device behavior and compatibility with the retired Python/core clients are not established; the old live-sftp suite requires a CLI binary this distribution does not build.",
+      "gap": "Linux and Windows host tests cover vault sealing, reopen, wrong-password and tamper refusal and preservation, migration, and redaction. The Android emulator covers setup, lock, restart, wrong-password refusal, Keystore wrapping and saved-site credential recovery; on-device tamper refusal, physical-device behavior, and compatibility with retired Python/core clients remain unverified. The old live-sftp suite requires a CLI binary this distribution does not build.",
       "acceptance": [
-        "Validate vault setup, lock, restart, unlock, tamper refusal and site-secret recovery on an Android device or emulator.",
+        "Validate Android vault tamper refusal and preservation, and exercise the behavior on physical devices.",
         "Only claim compatibility with historical Python/core clients if the actual current encrypted vault format is tested with them."
       ]
     },
@@ -5458,7 +5465,7 @@
       "id": "backup.full-export-import",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` proves Linux→Windows→Android round-trip with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.",
+      "notes": "Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.",
       "source": [
         "crates/linscp-engine/src/backup.rs",
         "crates/linscp-engine/src/script.rs",
@@ -5490,7 +5497,7 @@
           "engine-script"
         ]
       },
-      "gap": "The script-level export and import path is evidenced by engine-script; the backup bundle itself is evidenced by the backup suite on all three platforms.",
+      "gap": "The script and backup suites run on Linux and Windows; the Android build runs these Rust tests on its Linux host, not on Android. Actual Android runtime restore and cross-device portability remain unverified.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",

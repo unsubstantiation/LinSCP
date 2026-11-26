@@ -128,13 +128,13 @@ Stored sites can be saved, renamed (including nested folders), filtered, sorted 
 
 **Area:** Sessions/configuration · **Status:** partial
 
-The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format.
+The native service encrypts saved session metadata in an authenticated vault envelope and encrypts site secrets with a data key wrapped in sessions.key by the local password vault. A locked vault refuses access. On Windows the configuration directory is additionally owner-only: ensure_private_dir applies D:P(A;OICI;FA;;;OW), inherited by children. Legacy compatibility does not imply that the retired CLI or Python client can read the current vault format. A packaged Android debug APK emulator test checks setup, Keystore envelope and sealed site metadata, explicit lock, process restart, wrong-password refusal and successful reconnection using recovered saved credentials.
 
-**Next:** Linux and Windows host tests cover vault sealing, reopen with the correct password, wrong-password refusal, tamper refusal and preservation, migration, and redaction. Android device behavior and compatibility with the retired Python/core clients are not established; the old live-sftp suite requires a CLI binary this distribution does not build.
+**Next:** Linux and Windows host tests cover vault sealing, reopen, wrong-password and tamper refusal and preservation, migration, and redaction. The Android emulator covers setup, lock, restart, wrong-password refusal, Keystore wrapping and saved-site credential recovery; on-device tamper refusal, physical-device behavior, and compatibility with retired Python/core clients remain unverified. The old live-sftp suite requires a CLI binary this distribution does not build.
 
 **Acceptance criteria:**
 
-- [ ] Validate vault setup, lock, restart, unlock, tamper refusal and site-secret recovery on an Android device or emulator.
+- [ ] Validate Android vault tamper refusal and preservation, and exercise the behavior on physical devices.
 - [ ] Only claim compatibility with historical Python/core clients if the actual current encrypted vault format is tested with them.
 
 ## sessions.proxy-settings
@@ -570,9 +570,9 @@ Remote deletes walk the selected tree, unlink symlinks without following them, r
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` proves Linux→Windows→Android round-trip with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.
+Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.
 
-**Next:** The script-level export and import path is evidenced by engine-script; the backup bundle itself is evidenced by the backup suite on all three platforms.
+**Next:** The script and backup suites run on Linux and Windows; the Android build runs these Rust tests on its Linux host, not on Android. Actual Android runtime restore and cross-device portability remain unverified.
 
 **Acceptance criteria:**
 
