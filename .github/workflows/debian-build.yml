@@ -200,6 +200,29 @@ jobs:
             exit 1
           fi
 
+      - name: Build and smoke test a custom-prefix Make install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          make -C source/linux install PREFIX=/opt/linscp DESTDIR="$stage"
+          test -x "$stage/opt/linscp/bin/linscp-gui"
+          test -f "$stage/opt/linscp/share/applications/linscp.desktop"
+          export PATH="$stage/opt/linscp/bin:$PATH"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            linscp-gui >make-smoke.log 2>&1 & app=$!
+            trap "kill $app $wm 2>/dev/null || true" EXIT
+            for i in $(seq 1 120); do
+              if ! kill -0 "$app" 2>/dev/null; then cat make-smoke.log; exit 1; fi
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat make-smoke.log
+            exit 1
+          '
+
       - name: Smoke test the file-manager actions
         run: |
           set -euo pipefail

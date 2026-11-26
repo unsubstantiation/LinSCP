@@ -364,13 +364,13 @@ English, Spanish, German and French catalogs cover the browser interface (menus,
 
 **Area:** Packaging/platforms · **Status:** partial
 
-source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. There is no CLI in this distribution.
+source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. A Linux CI run built via Make, staged under a custom prefix and opened the resulting GUI under Xvfb; the Debian workflow repeats this smoke. There is no CLI in this distribution.
 
-**Next:** The install recipe is tested with a stub binary; a full Makefile build and installed GUI launch under a custom prefix have not been exercised. Custom-prefix desktop launch depends on the session PATH. The former console client is not shipped.
+**Next:** The supported Linux GUI build and staged launch are exercised, but actual desktop menu discovery and scheme-handler selection under a custom prefix are unverified; launcher lookup depends on the session PATH. The former console client is not shipped.
 
 **Acceptance criteria:**
 
-- [ ] Build the native GUI through Make and launch it from a custom-prefix install on Linux.
+- [ ] Validate desktop menu discovery and scheme-handler selection from a custom-prefix install.
 - [ ] Do not claim the retired console client is installed.
 
 ## platform.cmake-linux
