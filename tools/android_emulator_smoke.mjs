@@ -200,6 +200,50 @@ const expression = `
   // trusting the path string alone.
   const marker = await invoke('POST', '/api/local/save', {path: root + '/android-smoke-marker.txt', content: 'android-smoke'});
   if (!marker.success) throw new Error('Marker write failed: ' + JSON.stringify(marker));
+  async function verifyAndroidWebViewRendering() {
+    const guiState = window.eval('state');
+    const previousTabs = guiState.tabs, previousActive = guiState.activeTab;
+    const previousEntries = guiState.local.entries, previousSelection = guiState.local.selection;
+    const originalRequest = window.LinSCPTransport.request;
+    const hostileName = '<img src=x onerror=alert(1)>.txt';
+    const saved = await invoke('POST', '/api/local/save', {path: root + '/' + hostileName, content: 'rendering fixture'});
+    if (!saved.success) throw new Error('Cannot create rendering fixture');
+    try {
+      // A real app-private filename crosses the Rust IPC listing boundary.
+      const listing = await invoke('GET', '/api/local/list?path=' + encodeURIComponent(root));
+      if (!listing.entries?.some(entry => entry.name === hostileName)) throw new Error('Hostile-looking file missing from IPC listing');
+      guiState.local.entries = listing.entries;
+      guiState.local.selection = new Set();
+      window.renderPane('local');
+      const pane = document.getElementById('localFileList');
+      const hostileRow = Array.from(pane.querySelectorAll('tr')).find(row => row.dataset.name === hostileName);
+      if (!hostileRow || !hostileRow.textContent.includes(hostileName) || hostileRow.querySelector('img,svg,[onerror]')) throw new Error('Filename became executable WebView markup');
+      guiState.tabs = [{id: '1)\" onmouseover=\"window.__tabPwned=1', name: hostileName, connected: false}];
+      guiState.activeTab = null;
+      window.renderTabs();
+      const tabs = document.getElementById('tabStrip');
+      if (!tabs.textContent.includes(hostileName) || tabs.querySelector('img,svg,[onmouseover],[onerror]')) throw new Error('Tab data became executable WebView markup');
+      // The real service supplies numeric IDs; override just this response to
+      // test the frontend boundary against a malformed IPC payload.
+      window.LinSCPTransport.request = function(method, path, body) {
+        if (method === 'GET' && path === '/api/transfers') return Promise.resolve({paused: false, transfers: [
+          {id: '1)\" onmouseover=\"window.__queuePwned=1', status: 'Queued', type: 'Download'},
+          {id: 7, status: 'Running', type: hostileName, source: hostileName, bytes_total: 10, bytes_done: 1, percent: '0\" onmouseover=\"window.__queuePwned=1'}
+        ]});
+        return originalRequest.call(this, method, path, body);
+      };
+      await window.refreshQueue();
+      const queue = document.getElementById('queueList');
+      if (queue.children.length !== 1 || !queue.textContent.includes(hostileName) || queue.querySelector('img,svg,[onmouseover],[onerror]') || queue.querySelector('.progress-bar')?.style.width !== '0%') throw new Error('Malformed queue data became executable WebView markup');
+    } finally {
+      window.LinSCPTransport.request = originalRequest;
+      guiState.tabs = previousTabs; guiState.activeTab = previousActive;
+      guiState.local.entries = previousEntries; guiState.local.selection = previousSelection;
+      window.renderTabs(); window.renderPane('local');
+      await window.refreshQueue();
+    }
+  }
+  await verifyAndroidWebViewRendering();
   const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!opened.success || !opened.tab?.connected) throw new Error('WebDAV connect failed: ' + JSON.stringify(opened));
   const tab = opened.tab.id;
@@ -288,7 +332,7 @@ const expression = `
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
   const locked = await invoke('POST', '/api/vault/lock');
   if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true};
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {
