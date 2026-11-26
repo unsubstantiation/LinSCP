@@ -4841,14 +4841,15 @@
       "id": "platform.android-saf-local-copy-move",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge whole between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies keep the plain panes' refusal word for word. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) eliminates whole-file Base64/JSON heap spikes.",
+      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies walk nested files through the bridge. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) avoids whole-file Base64/JSON heap spikes. A packaged Android emulator exercises a real external-storage provider for a nested copy from a granted folder into app storage, a move from app storage into a grant, and an existing-destination move refusal that preserves both files.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/queue.rs",
         "ui/src/platform/capabilities.ts",
         "source/gui/web/index.html",
         "crates/linscp-platform/src/android.rs",
-        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt"
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt",
+        "tools/android_emulator_smoke.mjs"
       ],
       "checks": {
         "service": [
@@ -4858,6 +4859,9 @@
         "gui": [
           "a local tab offers transfers out of a granted folder",
           "a local tab offers moves out of a granted folder"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafLocalCopyMove"
         ]
       },
       "verified_on": {
@@ -4870,10 +4874,11 @@
           "gui"
         ],
         "android": [
-          "gui"
+          "gui",
+          "android-emulator"
         ]
       },
-      "gap": "No suite has touched a real DocumentsProvider: the bridge is an in-memory mock, so provider behaviour (nested document URIs, large-document memory pressure, concurrent-creator races on moves) is unproven on a device.",
+      "gap": "The emulator covers the external-storage DocumentsProvider in one granted tree, including nested copy and a move conflict. Two separate granted trees, document-cap refusal on the real provider, other providers, large-document memory pressure, concurrent-creator races and physical devices remain unverified.",
       "acceptance": [
         "Copy and move files between a granted folder and app storage and between two granted trees on an Android device or emulator, covering the document-cap refusal and a move onto an existing name."
       ]
