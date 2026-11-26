@@ -101,6 +101,34 @@ class GuiDistributionTests(unittest.TestCase):
                             'DESTDIR=' + str(default_stage)], check=True, capture_output=True, text=True)
             self.assertTrue((default_stage / 'usr/bin/linscp-gui').is_file())
 
+    @unittest.skipUnless(shutil.which('cmake'), 'cmake required')
+    def test_cmake_install_honors_prefix_and_destdir(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = pathlib.Path(tmp) / 'source'
+            root.mkdir()
+            (root / 'target/release').mkdir(parents=True)
+            (root / 'debian').mkdir()
+            shutil.copy(ROOT / 'CMakeLists.txt', root / 'CMakeLists.txt')
+            (root / 'target/release/linscp-gui').write_text('stub executable')
+            for asset in ['linscp.desktop', 'linscp.png', 'linscp.svg']:
+                shutil.copy(ROOT / 'debian' / asset, root / 'debian' / asset)
+            build = pathlib.Path(tmp) / 'build'
+            stage = pathlib.Path(tmp) / 'stage with spaces'
+            subprocess.run(['cmake', '-S', str(root), '-B', str(build),
+                            '-DCARGO=' + shutil.which('true'), '-DNPM=' + shutil.which('true'),
+                            '-DCMAKE_INSTALL_PREFIX=/opt/linscp custom'], check=True, capture_output=True, text=True)
+            import os
+            subprocess.run(['cmake', '--install', str(build)], env={**os.environ, 'DESTDIR': str(stage)},
+                           check=True, capture_output=True, text=True)
+            prefix = stage / 'opt/linscp custom'
+            binary = prefix / 'bin/linscp-gui'
+            self.assertEqual(binary.read_text(), 'stub executable')
+            self.assertEqual(binary.stat().st_mode & 0o777, 0o755)
+            for path in ['share/applications/linscp.desktop', 'share/pixmaps/linscp.png',
+                         'share/icons/hicolor/scalable/apps/linscp.svg']:
+                self.assertTrue((prefix / path).is_file(), path)
+            self.assertFalse((stage / 'usr').exists())
+
     def test_the_shared_page_reaches_the_native_bridge_only(self):
         # The page used to fall back to `fetch()` with a bearer token when no
         # `__TAURI_INTERNALS__` was present, because a browser server could
