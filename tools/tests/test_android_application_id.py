@@ -281,9 +281,9 @@ const fs = require('fs'), vm = require('vm');
 const source = fs.readFileSync('tools/android_emulator_smoke.mjs', 'utf8');
 const match = source.match(/const expression = (`[\s\S]*?`);\nlet nextId/);
 if (!match) throw new Error('Cannot find smoke expression');
-const build = Function('phase', 'portableBackup', 'application', 'port', 'return ' + match[1]);
+const build = Function('phase', 'portableBackup', 'application', 'port', 'sshPort', 'return ' + match[1]);
 for (const phase of ['initial', 'portable-import', 'portable-reopen']) {
-  new vm.Script(build(phase, {backupBase64: 'Zm9v', keyReference: 'vaultkey://abc'}, 'com.example.app', 8080));
+  new vm.Script(build(phase, {backupBase64: 'Zm9v', keyReference: 'vaultkey://abc'}, 'com.example.app', 8080, 2222));
 }
 """
         subprocess.run(['node', '-e', script], cwd=ROOT, check=True, capture_output=True, text=True)

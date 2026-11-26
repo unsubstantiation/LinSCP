@@ -321,13 +321,13 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 **Area:** Desktop integration · **Status:** partial
 
-The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output. Linux and Windows platform tests cover authenticated delivery, bad-token refusal and queue limits; jsdom covers modal deferral and review.
+The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output. Split URL arguments cannot invoke one-shot actions. Windows users can opt in to per-user URL registration without changing existing defaults; Windows Settings selects the handler. Registry tests use isolated keys, and Windows CI drives install and uninstall through the built binary. Linux and Windows platform tests cover authenticated delivery, bad-token refusal and queue limits; jsdom covers modal deferral and review.
 
-**Next:** The Debian entry declares transfer URI handlers and the native launcher offers URLs for review. Actual desktop registration and end-to-end launch, Windows registration, Android deep links, and untrusted-URL security validation remain unverified.
+**Next:** The Debian entry declares transfer URI handlers and the native launcher offers URLs for review. Actual selection and end-to-end launch through desktop defaults, Android deep links, and comprehensive untrusted-URL security validation remain unverified; Windows registration is opt-in rather than a default change.
 
 **Acceptance criteria:**
 
-- [ ] Validate end-to-end URI delivery on real desktops, including untrusted URLs, credential handling, confirmation and host-key validation; implement registration on other intended platforms.
+- [ ] Validate end-to-end URI delivery and default selection on real desktops, including untrusted URLs, credential handling, confirmation and host-key validation; implement registration on other intended platforms.
 - [ ] Test launching a registered URI through the actual desktop or device.
 
 ## desktop.launcher-prefix

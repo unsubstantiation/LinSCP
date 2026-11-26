@@ -100,6 +100,12 @@ test('TauriTransport retains structured failures for connection and overwrite di
   });
   await assert.rejects(() => client.post('/api/tabs/open', {}), (error) => {
     assert.deepEqual(error.payload.challenge, challenge);
+    assert.deepEqual(error.hostKeyChallenge, challenge);
+    return true;
+  });
+  const legacy = new TauriTransport({invoke: async () => ({status: 409, payload: {error: 'Verify host key', hostkey_challenge: challenge}})});
+  await assert.rejects(() => legacy.post('/api/tabs/open', {}), (error) => {
+    assert.deepEqual(error.hostKeyChallenge, challenge);
     return true;
   });
   await assert.rejects(() => client.post('/api/transfer/upload', {}), (error) => {

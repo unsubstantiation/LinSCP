@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
 set -euo pipefail
 log=$(mktemp)
+ssh_log=$(mktemp)
+ssh_root=$(mktemp -d)
+ssh_server=''
+cleanup() {
+  kill "$server" ${ssh_server:+"$ssh_server"} 2>/dev/null || true
+  rm -f "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
+  rm -rf -- "$ssh_root"
+}
 LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
 server=$!
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}"' EXIT
+trap cleanup EXIT
 for _ in $(seq 1 60); do
   grep -q '^READY ' "$log" && break
   kill -0 "$server" || { cat "$log"; exit 1; }
@@ -11,6 +19,19 @@ for _ in $(seq 1 60); do
 done
 port=$(sed -n 's/^READY //p' "$log" | head -n 1)
 test -n "$port"
+# A throwaway SSH fixture makes the Android agent refusal traverse the real
+# handshake, host-key challenge and authentication path inside the APK.
+LSCP_TEST_PORT=0 LSCP_TEST_ROOT="$ssh_root" python3 source/linux/tests/TestSftpServer.py >"$ssh_log" 2>&1 &
+ssh_server=$!
+for _ in $(seq 1 60); do
+  grep -q '^READY ' "$ssh_log" && break
+  kill -0 "$ssh_server" || { cat "$ssh_log"; exit 1; }
+  sleep 1
+done
+LINSCP_ANDROID_SSH_PORT=$(sed -n 's/^READY //p' "$ssh_log" | head -n 1)
+test -n "$LINSCP_ANDROID_SSH_PORT"
+export LINSCP_ANDROID_SSH_PORT
+adb reverse "tcp:$LINSCP_ANDROID_SSH_PORT" "tcp:$LINSCP_ANDROID_SSH_PORT"
 # The package is the one the configuration names, read rather than repeated:
 # a rename that reaches only some of these places would leave the harness
 # driving an app that is not installed.
@@ -75,7 +96,6 @@ fi
 # Inspect app-private bytes from the debug sandbox, without printing secrets.
 key_file=$(mktemp)
 sessions_file=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file"' EXIT
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
 python3 - "$key_file" "$sessions_file" <<'PYCODE'
@@ -112,7 +132,6 @@ adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_fi
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
 tampered=$(mktemp)
 observed=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed"' EXIT
 for target in key sessions; do
   adb shell am force-stop "$application"
   if [[ "$target" == key ]]; then original=$key_file; dest=sessions.key; else original=$sessions_file; dest=sessions.ini; fi
@@ -158,7 +177,6 @@ restart_and_run reopen-vault
 portable_file=$(mktemp)
 source_key=$(mktemp)
 source_ssh_key=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed" "$portable_file" "$source_key" "$source_ssh_key"' EXIT
 restart_and_run portable-export
 key_id=$(python3 - "$portable_file" <<'PYCODE'
 import json, re, sys

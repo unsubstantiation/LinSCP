@@ -3,6 +3,8 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
+const sshPort = Number(process.env.LINSCP_ANDROID_SSH_PORT);
+assert.ok(Number.isInteger(sshPort) && sshPort > 0 && sshPort < 65536, 'SSH fixture port is required');
 // The installed package, handed over by the harness that read it from the
 // configuration, so the storage this run finds is the storage of *this* app.
 const application = process.argv[3];
@@ -423,6 +425,22 @@ const expression = `
     }
   }
   await verifyAndroidWebViewRendering();
+  async function verifyAndroidAgentRefusal() {
+    let challenge;
+    try {
+      await invoke('POST', '/api/tabs/open', {session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', local_dir: root, initial_dir: '/'}});
+    } catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      challenge = error.payload.challenge;
+    }
+    if (!challenge || challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort} || !challenge.fingerprint) throw new Error('Expected SSH fixture host-key challenge');
+    let refusal;
+    try {
+      await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    } catch (error) { refusal = error; }
+    if (refusal?.status !== 400 || !/SSH agent authentication is not available on Android.*private key file/i.test(refusal.message || '')) throw new Error('Expected Android SSH agent refusal: ' + String(refusal?.message));
+  }
+  await verifyAndroidAgentRefusal();
   const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!opened.success || !opened.tab?.connected) throw new Error('WebDAV connect failed: ' + JSON.stringify(opened));
   const tab = opened.tab.id;
