@@ -38,6 +38,7 @@ def main():
     used = False
     last = ''
     history = []
+    system_waits = 0
     for _ in range(45):
         time.sleep(1)
         try:
@@ -49,6 +50,15 @@ def main():
         history.append([(n.get('text') or n.get('content-desc'), n.get('bounds')) for n in nodes if n.get('text') or n.get('content-desc')])
         def matching(*labels):
             return next((n for n in nodes if n.get('text') in labels or n.get('content-desc') in labels), None)
+        # Slow CI emulators may show the system ANR dialog over DocumentsUI.
+        # Wait rather than killing a process, but keep the overall retry bound so
+        # a permanently unresponsive system still fails the smoke test.
+        if matching("Process system isn't responding") is not None:
+            wait = matching('Wait', 'WAIT')
+            if wait is not None and system_waits < 3:
+                click(wait)
+                system_waits += 1
+                continue
         if used:
             allow = matching('Allow', 'ALLOW')
             if allow is not None:
