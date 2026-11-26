@@ -10820,7 +10820,7 @@
    * ------------------------------------------------------------------ */
 
   const TRANSFER_DEFAULTS = {
-    transfer: '', filemask: '', speed: 0, resumesupport: '', resumeSize: 0,
+    preset: '', transfer: '', filemask: '', speed: 0, resumesupport: '', resumeSize: 0,
     resume: false, preserveTime: true, newerOnly: false, append: false,
     noPermissions: false, priority: false
   };
@@ -10833,6 +10833,7 @@
 
   function preferencesToSettings(prefs) {
     return {
+      preset: prefs.preset || '',
       transfer: prefs.transfer || '',
       filemask: prefs.filemask || '',
       speed: prefs.speed || 0,
@@ -10851,6 +10852,7 @@
 
   function settingsToPreferences(settings) {
     return Object.assign({}, preferences || {}, {
+      preset: settings.preset || '',
       transfer: settings.transfer || '',
       filemask: settings.filemask || '',
       speed: settings.speed || 0,

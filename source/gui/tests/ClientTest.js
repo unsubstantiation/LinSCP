@@ -5648,6 +5648,8 @@ function options(id) {
     check('manual preset opt-out sends off to the backend', window.transferOptions().preset === 'off');
     await window.loadTransferPresets();
     check('manual preset opt-out survives reloading presets', presetSelect.value === 'off');
+    const offPreferences = window.settingsToPreferences(window.preferencesToSettings({preset: 'off'}));
+    check('manual preset opt-out persists through preferences', offPreferences.preset === 'off');
     presetSelect.value = '';
     window.selectTransferPreset();
     check('automatic preset selection leaves matching enabled', !('preset' in window.transferOptions()));

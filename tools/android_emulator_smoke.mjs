@@ -595,6 +595,30 @@ const expression = `
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
+  async function verifyAndroidTransferPreset() {
+    await invoke('POST', '/api/presets/save', {name: 'android-text-only', mask: '*.preset-txt'});
+    await invoke('POST', '/api/local/save', {path: root + '/allowed.preset-txt', content: 'preset allowed'});
+    await invoke('POST', '/api/local/save', {path: root + '/excluded.preset-bin', content: 'preset excluded'});
+    const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['allowed.preset-txt', 'excluded.preset-bin'], preset: 'android-text-only'});
+    let completed = false;
+    for (let i = 0; i < 120; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !previous.has(item.id));
+      if (task?.status === 'Completed') { completed = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('Preset transfer failed: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!completed) throw new Error('Preset transfer timed out');
+    const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
+    if (!listing.entries?.some(entry => entry.name === 'allowed.preset-txt') || listing.entries.some(entry => entry.name === 'excluded.preset-bin')) throw new Error('Preset filter did not control WebDAV upload');
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/allowed.preset-txt'))).content !== 'preset allowed') throw new Error('Preset transfer content differs');
+    await invoke('POST', '/api/presets/delete', {name: 'android-text-only'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['excluded.preset-bin'], preset: 'android-text-only'}); }
+    catch (error) { refused = error.status === 400; }
+    if (!refused) throw new Error('Deleted explicit preset silently fell back to defaults');
+  }
+  await verifyAndroidTransferPreset();
   const vault = await invoke('GET', '/api/vault/status');
   if (vault.vault !== 'setup_required') throw new Error('Expected a fresh emulator vault: ' + JSON.stringify(vault));
   await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});

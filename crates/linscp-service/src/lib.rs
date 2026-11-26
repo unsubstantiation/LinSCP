@@ -19434,6 +19434,7 @@ mod tests {
             .clone();
         assert!(prefs.is_object(), "the preferences document is readable");
         prefs["permissions"] = json!("0644");
+        prefs["preset"] = json!("off");
         prefs["preserve_time_dirs"] = json!(true);
         let saved = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
@@ -19447,7 +19448,10 @@ mod tests {
             body: json!({}),
         });
         assert_eq!(read.payload["preferences"]["permissions"], "0644");
+        assert_eq!(read.payload["preferences"]["preset"], "off");
         assert_eq!(read.payload["preferences"]["preserve_time_dirs"], true);
+        let reopened = CommanderService::new(temp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset"], "off");
     }
 
     /// `copyid` and keep-up-to-date both need a live server; with no tab they
