@@ -50,7 +50,7 @@ def main():
         def matching(*labels):
             return next((n for n in nodes if n.get('text') in labels or n.get('content-desc') in labels), None)
         if used:
-            allow = matching('Allow')
+            allow = matching('Allow', 'ALLOW')
             if allow is not None:
                 click(allow)
                 print('Granted fixture folder via Android DocumentsUI')
