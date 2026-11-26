@@ -8539,7 +8539,9 @@ impl CommanderService {
             let tab_opt = self.state.lock().expect("m").tabs.get(&tid).cloned();
             if let Some(tab) = tab_opt {
                 let site_preset = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
-                if !site_preset.is_empty() && !site_preset.eq_ignore_ascii_case("off") && !site_preset.eq_ignore_ascii_case("none") {
+                if site_preset.eq_ignore_ascii_case("off") || site_preset.eq_ignore_ascii_case("none") {
+                    matched = None;
+                } else if !site_preset.is_empty() {
                     matched = store.find(site_preset).map(|p| p.name.clone());
                 } else {
                     let filename = query.get("filename").map(String::as_str).unwrap_or("");
@@ -15360,6 +15362,9 @@ mod tests {
             let mut state = svc.state.lock().unwrap();
             state.tabs.get_mut(&id).unwrap().spec.as_mut().unwrap().preset_name = "off".into();
         }
+        let matched = svc.dispatch(ApiEnvelope { method: "GET".into(), path: format!("/api/presets?tab={id}&filename=allowed.txt"), body: json!({}) });
+        assert_eq!(matched.status, 200, "{}", matched.payload);
+        assert!(matched.payload["matched"].is_null(), "site opt-out must not show a matching rule: {}", matched.payload);
         let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": other, "names": ["allowed.txt", "excluded.bin"]}) }).await;
         assert_eq!(queued.status, 200, "{}", queued.payload);
         let mut done = false;

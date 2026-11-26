@@ -1,0 +1,20 @@
+name: Arena transfer preset validation
+on:
+  push:
+    branches: [arena/c4f5bb7a-linscp]
+permissions:
+  contents: read
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run service tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --test-threads=1 --skip live_
