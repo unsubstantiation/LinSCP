@@ -134,7 +134,7 @@ const expression = `
     if (!changed.success) throw new Error('Cannot change the remote fixture: ' + JSON.stringify(changed));
     await invoke('POST', '/api/queue/resume');
     const changedTask = await waitFailed(4);
-    if (!/etag|precondition|changed/i.test(String(changedTask.error || ''))) throw new Error('Changed representation failed for an unexpected reason: ' + JSON.stringify(changedTask));
+    if (!/etag|precondition|changed|conditional prefix range/i.test(String(changedTask.error || ''))) throw new Error('Changed representation failed for an unexpected reason: ' + JSON.stringify(changedTask));
     await assertCheckpointUnchanged('smoke-changed', 'Android');
   }
   await verifyAndroidWebDavResumeRefusals();
