@@ -1,9 +1,9 @@
-//! Durable encrypted undo journal for a future full-restore transaction.
+//! Durable encrypted undo journal for full-restore transactions.
 //!
-//! This primitive is not connected to application restore yet. A caller must
-//! hold an interprocess configuration lock and exclude all other writers before
-//! starting, committing, or recovering. Startup must recover before exposing
-//! configuration. Do not use this module as an atomicity guarantee by itself.
+//! The backup restore path prepares this journal before modifying targets and
+//! recovers it before exposing configuration after an interrupted restore. A
+//! caller must hold the configuration lock and exclude other writers before
+//! starting, committing, or recovering; this module alone cannot enforce that.
 
 use std::collections::BTreeSet;
 use std::io::Read;

@@ -10,7 +10,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -149,6 +149,20 @@ const expression = `
     if (!opened.tab?.connected) throw new Error('Portable restored credential failed to authenticate');
     return {root, portableBackupPhase: phase};
   }
+  async function verifyAndroidDamagedRestoreJournal() {
+    if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Expected locked vault with a pending journal');
+    async function expectUnavailable(method, path, body) {
+      let status;
+      try { await invoke(method, path, body); } catch (error) { status = error.status; }
+      if (status !== 503) throw new Error('Expected recovery gate for ' + path + ': ' + status);
+    }
+    await expectUnavailable('GET', '/api/sessions', {});
+    await expectUnavailable('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+    await expectUnavailable('POST', '/api/sessions/save', {name: 'must-not-save', session: {protocol: 'sftp', host: 'fixture.invalid'}});
+    if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Failed recovery left vault unlocked');
+    return {damagedJournalRefused: true};
+  }
+  if (${JSON.stringify(phase)} === 'damaged-journal') return await verifyAndroidDamagedRestoreJournal();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
   if (${JSON.stringify(phase)} === 'backup-restore') return await verifyAndroidFullBackupRestore();
   if (${JSON.stringify(phase)} === 'reopen-vault') return await verifyAndroidVaultRestart();
@@ -309,5 +323,5 @@ if (phase === 'portable-export') {
   writeFileSync(portableFile, JSON.stringify(value.portableData), {mode: 0o600});
   delete value.portableData; // never print backup bytes in CI logs
 }
-if (rootFile) writeFileSync(rootFile, String(reply.result.result.value.root));
+if (rootFile && phase !== 'damaged-journal') writeFileSync(rootFile, String(reply.result.result.value.root));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));

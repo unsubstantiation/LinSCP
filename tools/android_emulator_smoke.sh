@@ -182,4 +182,20 @@ cmp "$key_file" "$observed" || { echo "Portable restore changed the destination 
 restart_and_run portable-reopen
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
 cmp "$key_file" "$observed" || { echo "Destination vault key changed after restart" >&2; exit 1; }
+# A corrupt journal must gate access and survive the failed recovery attempt.
+# This deliberately does not claim to reproduce a mid-transaction power loss.
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
+adb shell am force-stop "$application"
+printf 'invalid journal fixture' > "$tampered"
+adb shell run-as "$application" sh -c "'cat > config/.full-restore-journal'" < "$tampered"
+restart_and_run damaged-journal
+adb exec-out run-as "$application" cat "$sandbox/config/.full-restore-journal" > "$observed"
+cmp "$tampered" "$observed" || { echo "Failed recovery changed the journal" >&2; exit 1; }
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$observed"
+cmp "$sessions_file" "$observed" || { echo "Failed recovery changed saved sites" >&2; exit 1; }
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
+cmp "$key_file" "$observed" || { echo "Failed recovery changed the vault key" >&2; exit 1; }
+adb shell am force-stop "$application"
+adb shell run-as "$application" rm config/.full-restore-journal
+restart_and_run portable-reopen
 echo "Installed application ID and its install directory verified: $application ($sandbox)"
