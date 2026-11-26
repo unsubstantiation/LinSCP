@@ -33,10 +33,16 @@ const expression = `
     if (!caps[bridge]) throw new Error('Native Android capability not registered: ' + bridge);
   }
   const nativeInvoke = window.__TAURI_INTERNALS__.invoke;
-  let unsafeUriRejected = false;
-  try { await nativeInvoke('linscp_open_external_uri', {uri: 'javascript:alert(1)'}); }
-  catch (_) { unsafeUriRejected = true; }
-  if (!unsafeUriRejected) throw new Error('Android external URI bridge accepted an unsafe scheme');
+  // Invoke the native command directly, not the validating JS helper: the
+  // Kotlin bridge must reject viewer options and credentials on its own.
+  for (const uri of ['javascript:alert(1)', 'rdp://example.com/path',
+                     'vnc://example.com/?password=secret', 'spice://example.com/#fragment',
+                     'rdp://user:secret@example.com/', 'rdp://example.com/with space']) {
+    let unsafeUriRejected = false;
+    try { await nativeInvoke('linscp_open_external_uri', {uri}); }
+    catch (_) { unsafeUriRejected = true; }
+    if (!unsafeUriRejected) throw new Error('Android external URI bridge accepted an unsafe URI: ' + uri);
+  }
   await nativeInvoke('linscp_foreground_start', {title: 'Android smoke transfer', ongoing: 1});
   await nativeInvoke('linscp_foreground_update', {done: 512, total: 1024});
   await nativeInvoke('linscp_foreground_stop');

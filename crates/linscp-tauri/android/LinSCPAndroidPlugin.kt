@@ -382,7 +382,15 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     val allowedSchemes = setOf("http", "https", "rdp", "vnc", "spice")
     val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: ""
     val hasUserInfo = uri.encodedAuthority?.contains('@') == true
-    if (scheme !in allowedSchemes || hasUserInfo || uri.host.isNullOrBlank()) {
+    val unsafeCharacter = raw.any { it.isWhitespace() || it.isISOControl() || it == '\\' }
+    val viewerScheme = scheme in setOf("rdp", "vnc", "spice")
+    // Native validation is mandatory: the webview may invoke this command
+    // directly, bypassing the TypeScript helper. Viewer targets are authority
+    // only, so no path or query can pass credentials or viewer options.
+    val unsafeViewerTarget = viewerScheme &&
+      ((uri.encodedPath != null && uri.encodedPath != "" && uri.encodedPath != "/") ||
+       uri.encodedQuery != null || uri.encodedFragment != null)
+    if (scheme !in allowedSchemes || hasUserInfo || uri.host.isNullOrBlank() || unsafeCharacter || unsafeViewerTarget) {
       invoke.reject("External URI is invalid or uses an unsupported scheme")
       return
     }
