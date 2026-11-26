@@ -10,7 +10,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -163,6 +163,51 @@ const expression = `
     return {damagedJournalRefused: true};
   }
   if (${JSON.stringify(phase)} === 'damaged-journal') return await verifyAndroidDamagedRestoreJournal();
+  async function verifyAndroidGrantedSafEditing() {
+    const phase = ${JSON.stringify(phase)};
+    if (phase === 'saf-pick-start') {
+      // Do not await: the host must drive the real system picker before the
+      // pending activity-result promise can resolve.
+      window.__smokeSafPicker = window.__TAURI_INTERNALS__.invoke('linscp_pick_saf_tree');
+      return {safPickerStarted: true};
+    }
+    const roots = await invoke('GET', '/api/local/roots');
+    let tree;
+    if (phase === 'saf-pick-finish') {
+      const picked = await window.__smokeSafPicker;
+      if (!picked.success || picked.cancelled || !picked.uri) throw new Error('System picker did not grant a folder');
+      tree = picked.uri;
+      if (!tree.includes('LinSCP-Ungranted-Smoke')) throw new Error('Picker returned the wrong folder: ' + tree);
+    } else {
+      tree = roots.roots?.find(entry => entry.kind === 'saf_tree' && entry.path.includes('LinSCP-Ungranted-Smoke'))?.path;
+    }
+    if (!tree) throw new Error('Persisted SAF root missing');
+    const rootsAfter = await invoke('GET', '/api/local/roots');
+    if (!rootsAfter.roots?.some(entry => entry.path === tree && !entry.read_only)) throw new Error('Writable SAF root not listed');
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    const localTab = await invoke('POST', '/api/tabs/local', {local_dir: tree, remote_dir: root});
+    const tab = localTab.tab.id;
+    const listing = await invoke('GET', '/api/local/list?tab=' + tab + '&path=' + encodeURIComponent(tree));
+    if (!listing.entries?.some(entry => entry.name === 'marker.txt')) throw new Error('SAF provider did not list marker');
+    const before = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=marker.txt');
+    const expected = phase === 'saf-pick-finish' ? 'saf-original' : 'saf-edited';
+    if (before.content !== expected) throw new Error('Unexpected provider bytes');
+    if (phase === 'saf-pick-finish') {
+      const stale = String(BigInt(before.info.mtime) * 1000000000n - 1n);
+      let rejected;
+      try { await invoke('POST', '/api/local/save', {tab, path: 'marker.txt', content: 'stale write', base_mtime_ns: stale}); }
+      catch (error) { rejected = error.status === 400; }
+      if (!rejected) throw new Error('Stale SAF editor save was not refused');
+      await invoke('POST', '/api/local/save', {tab, path: 'marker.txt', content: 'saf-edited'});
+      const edited = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=marker.txt');
+      if (edited.content !== 'saf-edited') throw new Error('SAF edited bytes differ');
+      await invoke('POST', '/api/local/save', {tab, path: 'created.txt', content: 'created via SAF'});
+      const created = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=created.txt');
+      if (created.content !== 'created via SAF') throw new Error('SAF created bytes differ');
+    }
+    return {root, safEditing: phase};
+  }
+  if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
   if (${JSON.stringify(phase)} === 'backup-restore') return await verifyAndroidFullBackupRestore();
   if (${JSON.stringify(phase)} === 'reopen-vault') return await verifyAndroidVaultRestart();
@@ -387,5 +432,5 @@ if (phase === 'portable-export') {
   writeFileSync(portableFile, JSON.stringify(value.portableData), {mode: 0o600});
   delete value.portableData; // never print backup bytes in CI logs
 }
-if (rootFile && phase !== 'damaged-journal') writeFileSync(rootFile, String(reply.result.result.value.root));
+if (rootFile && !['damaged-journal', 'saf-pick-start'].includes(phase)) writeFileSync(rootFile, String(reply.result.result.value.root));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));

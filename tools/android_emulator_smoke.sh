@@ -205,4 +205,12 @@ cmp "$key_file" "$observed" || { echo "Failed recovery changed the vault key" >&
 adb shell am force-stop "$application"
 adb shell run-as "$application" rm config/.full-restore-journal
 restart_and_run portable-reopen
+# Exercise a real persisted tree grant, obtained only through the OS picker.
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-start
+python3 tools/android_select_saf_folder.py
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-finish
+if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-edited ]]; then
+  echo "SAF provider did not persist edited bytes" >&2; exit 1
+fi
+restart_and_run saf-reopen
 echo "Installed application ID and its install directory verified: $application ($sandbox)"
