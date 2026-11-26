@@ -17,6 +17,10 @@ test -n "$port"
 application=$(python3 tools/android_application_id.py)
 adb reverse "tcp:$port" "tcp:$port"
 adb install -r android-artifacts/linscp-android-debug.apk
+# The shared folder exists outside the app sandbox, but the app has not been
+# granted its tree URI. Never depend on this fixture on a physical device.
+adb shell mkdir -p /sdcard/Documents/LinSCP-Ungranted-Smoke
+adb shell sh -c "'printf saf-original > /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt'"
 # Avoid an interactive Android 13+ notification permission prompt in the
 # emulator smoke run; production installs still request it on the first queue.
 adb shell pm grant "$application" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
@@ -32,6 +36,9 @@ app_root_file=$(mktemp)
 if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file"; then
   adb logcat -d --pid="$pid" -t 200 || true
   exit 1
+fi
+if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-original ]]; then
+  echo "Ungranted SAF write changed the shared-storage marker" >&2; exit 1
 fi
 # The smoke test proves the app reads and writes the storage it calls its own,
 # but it can only see the path string the Rust side reported. Ask the device

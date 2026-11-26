@@ -139,6 +139,15 @@ class AndroidApplicationIdTests(unittest.TestCase):
                 kotlin, re.DOTALL)
             self.assertIsNotNone(match, command)
             self.assertIn('runIo(invoke,', match.group(1), command)
+        # Resolution may query a DocumentsProvider and throw (for example if
+        # a grant was revoked). It must run inside the error-catching I/O
+        # worker, not synchronously before it starts.
+        for command in ['readUri', 'readUriChunk']:
+            match = re.search(
+                r'fun ' + command + r'\(invoke: Invoke\) \{(.*?)(?=\n  @Command|\n  private fun)',
+                kotlin, re.DOTALL)
+            body = match.group(1)
+            self.assertLess(body.index('runIo(invoke,'), body.index('resolveDocument('), command)
         self.assertIn('activity.runOnUiThread', kotlin)
         self.assertIn('synchronized(stageLock)', kotlin)
         self.assertIn('Thread({', kotlin[kotlin.index('private fun stageShareIntent'):])

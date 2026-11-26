@@ -214,8 +214,8 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun readUri(invoke: Invoke) {
     val uri = Uri.parse(invoke.parseArgs(SingleUriArgs::class.java).uri)
-    val resolved = resolveDocument(uri)
     runIo(invoke, "Cannot read SAF document") {
+      val resolved = resolveDocument(uri)
       val bytes = activity.contentResolver.openInputStream(resolved)?.use { it.readBytes() }
         ?: throw IllegalStateException("provider returned no stream")
       mapOf("base64" to android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
@@ -225,10 +225,10 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun readUriChunk(invoke: Invoke) {
     val args = invoke.parseArgs(ReadChunkArgs::class.java)
-    val resolved = resolveDocument(Uri.parse(args.uri))
     val want = args.length.coerceIn(0, 4 * 1024 * 1024)
     val offset = args.offset.coerceAtLeast(0L)
     runIo(invoke, "Cannot read SAF document chunk") {
+      val resolved = resolveDocument(Uri.parse(args.uri))
       if (want == 0) return@runIo mapOf("base64" to "")
       val buf = ByteArray(want)
       var totalRead = 0

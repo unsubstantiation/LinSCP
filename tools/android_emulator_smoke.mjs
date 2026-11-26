@@ -185,6 +185,26 @@ const expression = `
     }
   }
   await verifyAndroidViewerUriRefusals();
+  async function verifyAndroidUngrantedSafRefusals() {
+    const tree = 'content://com.android.externalstorage.documents/tree/primary%3ADocuments%2FLinSCP-Ungranted-Smoke';
+    const documentUri = tree + '/document/marker.txt';
+    const roots = await invoke('GET', '/api/local/roots');
+    if (roots.roots?.some(entry => entry.path === tree)) throw new Error('Ungranted folder appeared among persisted roots');
+    let registered = false;
+    try { await nativeInvoke('linscp_request_saf_tree', {uri: tree}); registered = true; }
+    catch (_) { /* The system provider must deny access without a grant. */ }
+    if (registered) throw new Error('Ungranted SAF folder registration succeeded');
+    async function expectRefusal(method, path, body) {
+      let status;
+      try { await invoke(method, path, body); } catch (error) { status = error.status; }
+      if (status !== 400) throw new Error('Expected ungranted SAF refusal for ' + path + ': ' + status);
+    }
+    await expectRefusal('GET', '/api/local/list?path=' + encodeURIComponent(tree), {});
+    await expectRefusal('POST', '/api/local/save', {path: documentUri, content: 'unexpected overwrite'});
+    const after = await invoke('GET', '/api/local/roots');
+    if (after.roots?.some(entry => entry.path === tree)) throw new Error('Refused SAF folder was persisted');
+  }
+  await verifyAndroidUngrantedSafRefusals();
   await nativeInvoke('linscp_foreground_start', {title: 'Android smoke transfer', ongoing: 1});
   await nativeInvoke('linscp_foreground_update', {done: 512, total: 1024});
   await nativeInvoke('linscp_foreground_stop');
@@ -332,7 +352,7 @@ const expression = `
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
   const locked = await invoke('POST', '/api/vault/lock');
   if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true};
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {
