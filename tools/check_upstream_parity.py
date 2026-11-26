@@ -66,6 +66,7 @@ CASE_SOURCES = {
     # their behaviour is asserted by node against the built bundle instead of
     # through a page that would only reach the parts jsdom can run.
     "ui-transport": "ui/tests/TransportAndPlatform.test.mjs",
+    "android-emulator": "tools/android_emulator_smoke.mjs",
     # The service's own Rust tests drive the same dispatch the three hosts call,
     # so a handler they share (the drop endpoints, remote delete) is evidenced
     # by the code that serves it rather than by a host that happens to wrap it.
@@ -403,6 +404,8 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite == "ui-transport":
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+                elif suite == "android-emulator":
+                    expression = r"\basync\s+function\s+" + re.escape(case) + r"\s*\("
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
                                "platform-windows-acl", "platform-linux", "platform-signals", "proto-ssh", "proto-ftp",
@@ -483,6 +486,8 @@ def case_links(row):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             elif suite == 'ui-transport':
                 pattern = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+            elif suite == 'android-emulator':
+                pattern = r"\basync\s+function\s+" + re.escape(case) + r"\s*\("
             elif suite == 'gui-cli-host':
                 # The host binary is a `main.rs`: its evidence is the attributes and
                 # calls that make the argument path exist, not a test function of
