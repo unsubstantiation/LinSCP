@@ -1351,6 +1351,11 @@ impl WebDavSession {
             )));
         }
 
+        if let Some(expected) = etag {
+            if resp.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(expected) {
+                return Err(ProtoError::Transport("WebDAV conditional download returned a missing or different ETag.".to_string()));
+            }
+        }
         let content_len = resp.content_length().unwrap_or(0);
         let total = opts.resume_offset + content_len;
         let mut transferred = 0u64;
@@ -1706,8 +1711,9 @@ impl RemoteSession for WebDavSession {
 
     async fn verify_prefix_if_match(
         &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
-        prefix: &mut (dyn AsyncRead + Unpin + Send),
+        prefix: &mut (dyn AsyncRead + Unpin + Send), version_id: Option<&str>, speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
+        if version_id.is_some() { return Err(ProtoError::Transport("Version-specific prefix verification is unsupported for WebDAV.".to_string())); }
         if !valid_strong_etag(etag) || prefix_len == 0 || prefix_len > total_len {
             return Err(ProtoError::Transport("Invalid verified-resume prefix or ETag.".to_string()));
         }
@@ -1719,8 +1725,13 @@ impl RemoteSession for WebDavSession {
         if response.status().as_u16() != 206 || received != expected {
             return Err(ProtoError::Transport("WebDAV did not return the expected conditional prefix range.".to_string()));
         }
+        if response.headers().get("etag").and_then(|value| value.to_str().ok()) != Some(etag) {
+            return Err(ProtoError::Transport("WebDAV prefix verification returned a missing or different ETag.".to_string()));
+        }
         let mut compared = 0u64;
+        let mut limiter = RateLimiter::new(speed_kbytes_per_sec);
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("WebDAV prefix stream failed: {e}")))? {
+            limiter.consume(chunk.len()).await;
             compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("Prefix length overflow.".to_string()))?;
             if compared > prefix_len { return Err(ProtoError::Transport("WebDAV returned too much prefix data.".to_string())); }
             let mut local = vec![0u8; chunk.len()];

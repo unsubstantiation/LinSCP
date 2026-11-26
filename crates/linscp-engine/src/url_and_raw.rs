@@ -249,15 +249,15 @@ fn percent_decode_strict(input: &str, context: &str) -> Result<String, String> {
         if bytes[i] == b'%' {
             if i + 2 >= bytes.len() {
                 return Err(format!(
-                    "Invalid percent-encoding in URL {context} '{input}'."
+                    "Invalid percent-encoding in URL {context}."
                 ));
             }
             let hi = (bytes[i + 1] as char)
                 .to_digit(16)
-                .ok_or_else(|| format!("Invalid percent-encoding in URL {context} '{input}'."))?;
+                .ok_or_else(|| format!("Invalid percent-encoding in URL {context}."))?;
             let lo = (bytes[i + 2] as char)
                 .to_digit(16)
-                .ok_or_else(|| format!("Invalid percent-encoding in URL {context} '{input}'."))?;
+                .ok_or_else(|| format!("Invalid percent-encoding in URL {context}."))?;
             let byte = ((hi << 4) | lo) as u8;
             if byte == 0 {
                 return Err(format!("NUL byte (%00) is not allowed in URL {context}."));
@@ -281,7 +281,7 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
         );
     }
     let Some((raw_scheme, after_scheme)) = url.split_once("://") else {
-        return Err(format!("'{url}' is not a session URL (missing '://')."));
+        return Err("Not a session URL (missing '://').".to_string());
     };
     let scheme_lc = raw_scheme.to_ascii_lowercase();
     let mut raw_fields = BTreeMap::new();
@@ -311,10 +311,8 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
         "spice" => (ProtocolScheme::Spice, 5900u16),
         "x2go" => (ProtocolScheme::X2Go, 22u16),
         "x11" | "x" | "waypipe" => (ProtocolScheme::X11, 22u16),
-        other => {
-            return Err(format!(
-                "Unsupported URL protocol scheme '{other}' (expected sftp, scp, ftp, ftps, ftpes, http, https, dav, davs, webdav, webdavs, s3, rdp, vnc, spice, x2go or x11)."
-            ));
+        _ => {
+            return Err("Unsupported URL protocol scheme (expected sftp, scp, ftp, ftps, ftpes, http, https, dav, davs, webdav, webdavs, s3, rdp, vnc, spice, x2go or x11).".to_string());
         }
     };
 
@@ -323,7 +321,7 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
         None => (after_scheme, ""),
     };
     if authority.is_empty() {
-        return Err(format!("Session URL '{url}' is missing a host name."));
+        return Err("Session URL is missing a host name.".to_string());
     }
 
     let (userinfo_opt, hostport) = match authority.rfind('@') {
@@ -354,34 +352,28 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
 
     let (host, port, explicit_port) = if let Some(rest) = hostport.strip_prefix('[') {
         let Some(close) = rest.find(']') else {
-            return Err(format!(
-                "Session URL '{url}' has an unclosed '[' in IPv6 host."
-            ));
+            return Err("Session URL has an unclosed '[' in IPv6 host.".to_string());
         };
         let ipv6_host = &rest[..close];
         if ipv6_host.is_empty() {
-            return Err(format!("Session URL '{url}' has an empty IPv6 host."));
+            return Err("Session URL has an empty IPv6 host.".to_string());
         }
         let tail = &rest[close + 1..];
         if tail.is_empty() {
             (ipv6_host.to_string(), default_port, false)
         } else if let Some(port_str) = tail.strip_prefix(':') {
-            let p = parse_strict_port(port_str, url)?;
+            let p = parse_strict_port(port_str)?;
             (ipv6_host.to_string(), p, true)
         } else {
-            return Err(format!(
-                "Unexpected characters '{tail}' after IPv6 literal in '{url}'."
-            ));
+            return Err("Unexpected characters after IPv6 literal in session URL.".to_string());
         }
     } else {
         let colon_count = hostport.matches(':').count();
         if colon_count > 1 {
-            return Err(format!(
-                "IPv6 host literal in '{url}' must be enclosed in '[' and ']'."
-            ));
+            return Err("IPv6 host literal in session URL must be enclosed in '[' and ']'.".to_string());
         }
         if let Some((h, port_str)) = hostport.split_once(':') {
-            let p = parse_strict_port(port_str, url)?;
+            let p = parse_strict_port(port_str)?;
             (percent_decode_strict(h, "host")?, p, true)
         } else {
             (percent_decode_strict(hostport, "host")?, default_port, false)
@@ -393,7 +385,7 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
             .chars()
             .any(|c| (c as u32) <= 0x20 || c == '\x7f' || c == '/')
     {
-        return Err(format!("Invalid host name '{host}' in session URL '{url}'."));
+        return Err("Invalid host name in session URL.".to_string());
     }
 
     let initial_dir = if raw_path.is_empty() {
@@ -423,15 +415,13 @@ pub fn parse_site_url(url: &str) -> Result<ParsedSiteSpec, String> {
     Ok(spec)
 }
 
-fn parse_strict_port(port_str: &str, url: &str) -> Result<u16, String> {
+fn parse_strict_port(port_str: &str) -> Result<u16, String> {
     if port_str.is_empty() || !port_str.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("Invalid port '{port_str}' in session URL '{url}'."));
+        return Err("Invalid port in session URL.".to_string());
     }
-    let p: u16 = port_str
-        .parse()
-        .map_err(|_| format!("Port '{port_str}' in '{url}' is out of range (1..65535)."))?;
+    let p: u16 = port_str.parse().map_err(|_| "Port in session URL is out of range (1..65535).".to_string())?;
     if p == 0 {
-        return Err(format!("Port in '{url}' must be between 1 and 65535."));
+        return Err("Port in session URL must be between 1 and 65535.".to_string());
     }
     Ok(p)
 }
@@ -2972,6 +2962,36 @@ mod tests {
             spec.session.hostkey = "ssh-ed25519 SHA256:example".into();
             assert!(build_tls_settings(&spec).is_ok());
         }
+    }
+
+    #[test]
+    fn invalid_session_urls_never_echo_input_or_credentials() {
+        // Malformed inputs can put credentials in any component, not just a
+        // well-formed userinfo section. Diagnostics report the category only.
+        let cases = [
+            "alice:distinct-secret@example.com",
+            "distinct-secret://host/",
+            "sftp://alice:distinct-secret@/",
+            "sftp://alice:distinct-secret@[broken/",
+            "sftp://alice:distinct-secret@[]/",
+            "sftp://alice:distinct-secret@[::1]bad/",
+            "sftp://alice:distinct-secret@example.com:bad/",
+            "sftp://alice:distinct-secret@example.com:999999/",
+            "sftp://alice:distinct-secret@example.com:0/",
+            "sftp://alice:distinct-secret@::1/",
+            "sftp://alice:distinct-secret@bad%20host/",
+            "sftp://alice:distinct-secret%@example.com/",
+            "sftp://distinct-secret%@example.com/",
+            "sftp://example.com/distinct-secret%",
+        ];
+        for url in cases {
+            let error = parse_site_url(url).expect_err("invalid URL must fail");
+            assert!(!error.contains("distinct-secret"), "unsafe error for {url}: {error}");
+            assert!(!error.contains(url), "raw URL leaked: {error}");
+        }
+        let parsed = parse_site_url("ftpes://alice:valid%20secret@example.com:2121/folder%20one").unwrap();
+        assert_eq!(parsed.session.password.as_deref(), Some("valid secret"));
+        assert_eq!(parsed.session.initial_dir, "/folder one");
     }
 
     #[test]

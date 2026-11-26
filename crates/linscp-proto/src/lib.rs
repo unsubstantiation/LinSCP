@@ -314,10 +314,9 @@ impl RateLimiter {
         }
         self.bytes_transferred += bytes as u64;
         let now = Instant::now();
-        let Some(start) = self.started_at else {
-            self.started_at = Some(now);
-            return;
-        };
+        // Account for the first chunk too: a response delivered in one chunk
+        // must not bypass the limit entirely.
+        let start = *self.started_at.get_or_insert(now);
         let target_ms =
             (self.bytes_transferred * 1000) / (u64::from(self.limit_kbytes_per_sec) * 1024);
         let elapsed_ms = now.duration_since(start).as_millis() as u64;
@@ -361,7 +360,7 @@ pub trait RemoteSession: Send + Sync {
     /// Compare a local prefix against an ETag-pinned remote representation.
     async fn verify_prefix_if_match(
         &self, _remote_path: &str, _etag: &str, _prefix_len: u64, _total_len: u64,
-        _prefix: &mut (dyn AsyncRead + Unpin + Send),
+        _prefix: &mut (dyn AsyncRead + Unpin + Send), _version_id: Option<&str>, _speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
         Err(ProtoError::UnsupportedCapability("verified resume", self.scheme()))
     }
@@ -442,6 +441,10 @@ pub trait RemoteSession: Send + Sync {
         Err(ProtoError::UnsupportedCapability("dav_lock", self.scheme()))
     }
     /// Return the current S3 object's ETag, or None if it does not exist.
+    /// Obtain an ETag for exactly the requested S3 version.
+    async fn s3_get_version_etag(&self, _remote_path: &str, _version_id: &str) -> Result<Option<String>, ProtoError> {
+        Err(ProtoError::UnsupportedCapability("s3 version ETag", self.scheme()))
+    }
     async fn s3_get_etag(&self, _remote_path: &str) -> Result<Option<String>, ProtoError> {
         Err(ProtoError::UnsupportedCapability("s3_etag", self.scheme()))
     }
@@ -785,6 +788,14 @@ pub async fn connect_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn speed_limit_paces_a_single_chunk() {
+        let start = Instant::now();
+        let mut limiter = RateLimiter::new(16);
+        limiter.consume(4096).await;
+        assert!(start.elapsed() >= Duration::from_millis(225), "the first chunk bypassed throttling");
+    }
 
     #[test]
     fn host_key_policy_rejects_wildcard_and_acceptnew() {

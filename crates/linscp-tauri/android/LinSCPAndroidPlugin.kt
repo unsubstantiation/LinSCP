@@ -214,8 +214,8 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun readUri(invoke: Invoke) {
     val uri = Uri.parse(invoke.parseArgs(SingleUriArgs::class.java).uri)
-    val resolved = resolveDocument(uri)
     runIo(invoke, "Cannot read SAF document") {
+      val resolved = resolveDocument(uri)
       val bytes = activity.contentResolver.openInputStream(resolved)?.use { it.readBytes() }
         ?: throw IllegalStateException("provider returned no stream")
       mapOf("base64" to android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP))
@@ -225,10 +225,10 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   @Command
   fun readUriChunk(invoke: Invoke) {
     val args = invoke.parseArgs(ReadChunkArgs::class.java)
-    val resolved = resolveDocument(Uri.parse(args.uri))
     val want = args.length.coerceIn(0, 4 * 1024 * 1024)
     val offset = args.offset.coerceAtLeast(0L)
     runIo(invoke, "Cannot read SAF document chunk") {
+      val resolved = resolveDocument(Uri.parse(args.uri))
       if (want == 0) return@runIo mapOf("base64" to "")
       val buf = ByteArray(want)
       var totalRead = 0
@@ -382,7 +382,15 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     val allowedSchemes = setOf("http", "https", "rdp", "vnc", "spice")
     val scheme = uri.scheme?.lowercase(Locale.ROOT) ?: ""
     val hasUserInfo = uri.encodedAuthority?.contains('@') == true
-    if (scheme !in allowedSchemes || hasUserInfo || uri.host.isNullOrBlank()) {
+    val unsafeCharacter = raw.any { it.isWhitespace() || it.isISOControl() || it == '\\' }
+    val viewerScheme = scheme in setOf("rdp", "vnc", "spice")
+    // Native validation is mandatory: the webview may invoke this command
+    // directly, bypassing the TypeScript helper. Viewer targets are authority
+    // only, so no path or query can pass credentials or viewer options.
+    val unsafeViewerTarget = viewerScheme &&
+      ((uri.encodedPath != null && uri.encodedPath != "" && uri.encodedPath != "/") ||
+       uri.encodedQuery != null || uri.encodedFragment != null)
+    if (scheme !in allowedSchemes || hasUserInfo || uri.host.isNullOrBlank() || unsafeCharacter || unsafeViewerTarget) {
       invoke.reject("External URI is invalid or uses an unsupported scheme")
       return
     }

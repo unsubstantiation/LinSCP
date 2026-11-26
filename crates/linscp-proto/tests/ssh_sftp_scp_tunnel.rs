@@ -507,6 +507,31 @@ async fn bounded_exec_collects_caps_and_closes_without_killing_ssh() {
     assert_eq!(ssh.exec_command_bounded("pwd", Duration::from_secs(2), 1024).await.unwrap().exit_code, Some(0));
 }
 
+/// Both channel streams contribute to one byte budget. A server alternating
+/// substantial stdout and stderr must not deadlock or lose stream identity;
+/// at the exact limit it succeeds, and one byte less refuses the result.
+#[tokio::test]
+async fn bounded_exec_interleaves_streams_and_enforces_combined_limit() {
+    let user_key = common::generate_ed25519_ssh_key(0x7a, "streams@test");
+    let (port, host_sha256, _, _) = start_mock_ssh_server(0x1a, user_key.private_key.public_key().clone(), false).await;
+    let cfg = SshConnectConfig {
+        tab_id: 91, role: "destination".into(), host: "127.0.0.1".into(), port,
+        username: "tester".into(), password: Some(Zeroizing::new("correct-horse-battery".into())),
+        pinned_host_key: Some(host_sha256), ..Default::default()
+    };
+    let session = SftpClientSession::connect(ProtocolScheme::Sftp, &cfg, None, 0).await.unwrap();
+    let ssh = session.ssh_connection();
+    let bytes_per_stream = 16 * 4096;
+    let output = ssh.exec_command_bounded("__LINSCP_TEST_INTERLEAVED__", Duration::from_secs(10), 2 * bytes_per_stream).await.unwrap();
+    assert_eq!(output.stdout, vec![b'O'; bytes_per_stream]);
+    assert_eq!(output.stderr, vec![b'E'; bytes_per_stream]);
+    assert_eq!(output.exit_code, Some(7));
+    let error = ssh.exec_command_bounded("__LINSCP_TEST_INTERLEAVED__", Duration::from_secs(10), 2 * bytes_per_stream - 1).await.unwrap_err();
+    assert!(error.to_string().contains("byte limit"), "{error}");
+    assert_eq!(ssh.exec_command_bounded("pwd", Duration::from_secs(5), 1024).await.unwrap().stdout, b"/home/tester\n");
+    session.close().await.unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // Granular ports of the `live-sftp` suite cases cited by the parity ledger
 // (`docs/upstream-parity.json`, suite `proto-ssh`). Each test mirrors the

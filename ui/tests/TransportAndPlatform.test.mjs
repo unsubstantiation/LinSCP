@@ -461,18 +461,26 @@ test('Android external URI dispatch allows supported viewers and rejects unsafe 
   assert.equal(await openExternalUri('rdp://server.example:3389', { invoker }), true);
   assert.equal(await openExternalUri('vnc://server.example:5900', { invoker }), true);
   assert.equal(await openExternalUri('spice://server.example:5900', { invoker }), true);
-  assert.deepEqual(calls.map((call) => call.command), Array(3).fill('linscp_open_external_uri'));
+  assert.equal(await openExternalUri('https://example.com/help?topic=rdp#details', { invoker }), true);
+  assert.deepEqual(calls.map((call) => call.command), Array(4).fill('linscp_open_external_uri'));
   assert.deepEqual(calls.map((call) => call.payload.uri), [
     'rdp://server.example:3389',
     'vnc://server.example:5900',
     'spice://server.example:5900',
+    'https://example.com/help?topic=rdp#details',
   ]);
 
   assert.equal(await openExternalUri('javascript:alert(1)', { invoker }), false);
   assert.equal(await openExternalUri('rdp://user:password@server.example:3389', { invoker }), false);
   assert.equal(await openExternalUri('rdp:///missing-host', { invoker }), false);
+  for (const unsafe of [
+    'rdp://server.example/path', 'vnc://server.example/?password=secret',
+    'spice://server.example/#fragment', 'rdp://server.example/?',
+    'vnc://server.example/%2F', 'rdp://server.example/with space',
+    'https://example.com/with\\backslash',
+  ]) assert.equal(await openExternalUri(unsafe, { invoker }), false, unsafe);
   assert.equal(await openExternalUri('rdp://server.example:3389', { invoker: null }), false);
-  assert.equal(calls.length, 3);
+  assert.equal(calls.length, 4);
 });
 
 test('the SAF picker degrades to null where no shell can open one', async () => {

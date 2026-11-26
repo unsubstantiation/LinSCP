@@ -529,15 +529,13 @@ async fn test_staged_resume_continues_the_staging_file_not_the_old_final() {
     // not splice that one in.
     fs::write(&dest, b"old").expect("write the old destination");
 
-    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
-    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
-
-    let (ok, out) = run_script(
-        &mut interp,
-        &format!("get -resume -resumesupport=on /staged.bin {}", dest.display()),
-    )
-    .await;
-    assert!(ok, "the resumed download runs: {out}");
+    let flags = linscp_engine::transfer::TransferFlags {
+        resume: true, allow_best_effort_resume: true,
+        resume_support: linscp_engine::presets::ResumeSupportMode::On,
+        ..Default::default()
+    };
+    let result = linscp_engine::transfer::download_single_file(&*sftp, "/staged.bin", None, &dest, &flags, &mut in_memory_logger(), None).await;
+    assert!(result.unwrap(), "the acknowledged resumed download runs");
 
     assert_eq!(
         fs::read(&dest).unwrap(),
@@ -585,6 +583,43 @@ async fn test_a_staged_download_publishes_only_the_whole_file() {
         "the staging file is published onto the destination"
     );
 
+    sftp.close().await.unwrap();
+}
+
+/// The interpreter's resume-support setting must reach the actual download,
+/// not just the option display. An unrelated `.filepart` makes staging
+/// observable without interrupting a network operation: direct downloads leave
+/// it untouched; staged downloads must refuse it rather than clobber it.
+#[tokio::test]
+async fn sftp_resume_support_off_and_size_threshold_control_staging() {
+    let tmp = tempfile::tempdir().unwrap();
+    let (sftp, _) = connect_mock(0x86, 0x87).await;
+    let mut interp = ScriptInterpreter::new(test_config(tmp.path()), in_memory_logger());
+    adopt(&mut interp, Arc::clone(&sftp), tmp.path());
+    let sentinel = b"someone else's partial";
+    for (name, size, option, expect_direct) in [
+        ("off.bin", 2048, "option resume off; get", true),
+        ("override.bin", 2048, "option resume on; get -resumesupport=off", true),
+        ("below.bin", 1023, "get -resumesupport=1", true),
+        ("boundary.bin", 1024, "get -resumesupport=1", false),
+        ("forced.bin", 32, "get -resumesupport=on", false),
+    ] {
+        let data = vec![b'x'; size];
+        let remote = format!("/{name}");
+        seed_remote(&sftp, &remote, &data, None).await;
+        let dest = tmp.path().join(name);
+        let stage = tmp.path().join(format!("{name}.filepart"));
+        fs::write(&stage, sentinel).unwrap();
+        let command = format!("{option} {remote} \"{}\"", dest.display());
+        let (ok, output) = run_script(&mut interp, &command).await;
+        assert_eq!(ok, expect_direct, "{name}: {output}");
+        assert_eq!(fs::read(&stage).unwrap(), sentinel, "existing checkpoint must remain untouched for {name}");
+        if expect_direct {
+            assert_eq!(fs::read(&dest).unwrap(), data);
+        } else {
+            assert!(!dest.exists(), "staging refusal must not publish a destination for {name}");
+        }
+    }
     sftp.close().await.unwrap();
 }
 
@@ -1270,6 +1305,7 @@ async fn test_interrupted_staged_download_resumes_its_partial() {
 
     cancelled.store(false, Ordering::SeqCst);
     flags.resume = true;
+    flags.allow_best_effort_resume = true;
     assert!(download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, None).await.unwrap());
     assert_eq!(fs::read(&destination).unwrap(), payload);
     assert!(!stage.exists(), "the completed stage was published");
@@ -1294,11 +1330,18 @@ async fn test_verified_resume_refuses_a_changed_sftp_prefix() {
     let flags = TransferFlags {
         no_clobber: true,
         resume: true,
+        allow_best_effort_resume: true,
         source_etag: Some(format!("\"sftp:{}:{}\"", info.size, info.mtime)),
         preserve_time: false,
         ..Default::default()
     };
     let mut logger = in_memory_logger();
+    let mut refused_flags = flags.clone();
+    refused_flags.allow_best_effort_resume = false;
+    let error = download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &refused_flags, &mut logger, None).await.unwrap_err();
+    assert!(error.contains("explicit best-effort"), "{error}");
+    assert!(!destination.exists());
+    assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8]);
     download_verified_resume(&*sftp, "/verified.bin", &info, &destination, &flags, &mut logger, None).await.unwrap();
     assert_eq!(fs::read(&destination).unwrap(), original);
     assert_eq!(fs::read(&checkpoint).unwrap(), &original[..8], "the checkpoint is never changed");
@@ -1338,7 +1381,7 @@ async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
     let (sftp, _) = connect_mock(0x81, 0x82).await;
     seed_remote(&sftp, "/changed.bin", b"new-data-1234567", Some(1_700_000_000)).await;
     let mut logger = in_memory_logger();
-    let flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+    let flags = TransferFlags { resume: true, allow_best_effort_resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
 
     let dest = tmp.path().join("staged.bin");
     let stage = tmp.path().join("staged.bin.filepart");
@@ -1363,5 +1406,21 @@ async fn test_ordinary_sftp_resume_refuses_stale_local_prefixes() {
     assert!(download_single_file(&*sftp, "/changed.bin", None, &dest, &flags, &mut logger, None).await.is_err());
     assert_eq!(fs::read(&stage).unwrap(), b"a staging file larger than the remote");
     assert_eq!(fs::read(&dest).unwrap(), b"old final");
+    sftp.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn sftp_resume_prefix_verification_obeys_speed_limit() {
+    use std::time::{Duration, Instant};
+    let (sftp, _) = connect_mock(0x83, 0x84).await;
+    let payload = vec![73u8; 16 * 1024];
+    seed_remote(&sftp, "/limited.bin", &payload, None).await;
+    let info = sftp.stat("/limited.bin").await.unwrap().unwrap();
+    let token = format!("\"sftp:{}:{}\"", info.size, info.mtime);
+    let mut prefix = payload.as_slice();
+    let start = Instant::now();
+    sftp.verify_prefix_if_match("/limited.bin", &token, info.size, info.size, &mut prefix, None, 64).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(220), "SFTP prefix verification ignored speed limit");
+    assert!(prefix.is_empty());
     sftp.close().await.unwrap();
 }

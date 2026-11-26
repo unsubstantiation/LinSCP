@@ -10,7 +10,7 @@ use linscp_platform::terminal::utc_ymdhms;
 use linscp_types::FileEntry;
 
 use crate::filemask::{format_permissions_9, mode_from_permissions_str};
-use crate::script_params::{censored_for_log, mask_url_credentials_inline};
+use crate::script_params::{censored_for_log, mask_url_credentials_inline, redact_diagnostic_secrets};
 
 /// Upstream XML session log namespace preserved intentionally for automation consumers.
 pub const SESSION_XML_NAMESPACE: &str = "http://winscp.net/schema/session/1.0";
@@ -364,7 +364,7 @@ impl SessionLogger {
         let line_body = if self.text_log_sensitive {
             message.to_string()
         } else {
-            censored_for_log(message)
+            censored_for_log(&redact_diagnostic_secrets(message))
         };
         let ts = now_utc_iso();
         if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
@@ -399,11 +399,14 @@ impl SessionLogger {
         let indent = self.op_indent();
         let mut buf = format!("{indent}<failure>\n");
         let mut any = false;
-        for line in message.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        // Redact the whole diagnostic before splitting it: a quoted secret
+        // may span lines, including when its closing quote is missing.
+        let safe_message = redact_diagnostic_secrets(message);
+        for line in safe_message.lines().map(str::trim).filter(|l| !l.is_empty()) {
             any = true;
             buf.push_str(&format!(
                 "{indent}  <message>{}</message>\n",
-                xml_escape_text(&mask_url_credentials_inline(line))
+                xml_escape_text(line)
             ));
         }
         if !any {
@@ -452,11 +455,12 @@ impl SessionLogger {
             Err(err) => {
                 buf.push_str(&format!("{indent}  <result success=\"false\">\n"));
                 let mut any = false;
-                for line in err.lines().map(str::trim).filter(|l| !l.is_empty()) {
+                let safe_error = redact_diagnostic_secrets(err);
+                for line in safe_error.lines().map(str::trim).filter(|l| !l.is_empty()) {
                     any = true;
                     buf.push_str(&format!(
                         "{indent}    <message>{}</message>\n",
-                        xml_escape_text(&mask_url_credentials_inline(line))
+                        xml_escape_text(line)
                     ));
                 }
                 if !any {
@@ -787,6 +791,81 @@ fn rotate_if_needed(path: &Path, policy: LogRotationPolicy) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "Failure -password=\"first-secret\nsecond-secret\" remaining detail\nnext detail";
+        let unterminated = "Failure -passphrase=\"third-secret\nfourth-secret";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("test");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+            logger.record_group_failure(unterminated);
+            logger.record_transfer(false, "file", "dest", None, Err(unterminated));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            for secret in ["first-secret", "second-secret", "third-secret", "fourth-secret"] {
+                assert!(!log.contains(secret), "{log}");
+            }
+            assert!(log.contains("-password=***"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert_eq!(xml.matches("-password=*** remaining detail").count(), 2);
+        assert_eq!(xml.matches("next detail").count(), 2);
+        assert_eq!(xml.matches("-passphrase=***").count(), 2);
+    }
+
+    #[test]
+    fn text_and_xml_failures_redact_recognized_secret_switches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "connection failed (-password=\"two word secret\") ProxyPassword=proxy-secret S3SessionToken=token-secret";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("test");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            for secret in ["two word secret", "proxy-secret", "token-secret"] { assert!(!log.contains(secret), "{log}"); }
+            assert!(log.contains("ProxyPassword=***"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert_eq!(xml.matches("ProxyPassword=***").count(), 2);
+        assert!(xml.contains("<failure>"));
+        assert!(xml.contains("<result success=\"false\">"));
+    }
+
+    #[test]
+    fn text_and_xml_logs_redact_multiple_urls_in_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        let text_path = tmp.path().join("session.log");
+        let xml_path = tmp.path().join("session.xml");
+        let message = "failed sftp://a:first-secret@one and ftp://b:second-secret@two/path";
+        {
+            let mut logger = SessionLogger::open(Some(&text_path), 0, false, None, Some(&xml_path), true, "nosession").unwrap();
+            logger.begin_command_group("open sftp://a:first-secret@one ftp://b:second-secret@two");
+            logger.record_group_failure(message);
+            logger.record_transfer(false, "file", "dest", None, Err(message));
+        }
+        for path in [&text_path, &xml_path] {
+            let log = std::fs::read_to_string(path).unwrap();
+            assert!(!log.contains("first-secret"), "{log}");
+            assert!(!log.contains("second-secret"), "{log}");
+            assert!(log.contains("a:***@one"), "{log}");
+            assert!(log.contains("b:***@two"), "{log}");
+        }
+        let xml = std::fs::read_to_string(xml_path).unwrap();
+        assert!(xml.contains("<failure>"));
+        assert!(xml.contains("<result success=\"false\">"));
+    }
 
     #[test]
     fn xml_log_writes_valid_root_groups_and_escapes_multiline_output() {

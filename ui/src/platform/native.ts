@@ -68,9 +68,14 @@ export async function openExternalUri(
   const invoker = options.invoker ?? nativeInvoker();
   if (!invoker) return false;
   try {
+    if (/[\s\u0000-\u001f\u007f\\]/.test(uri)) return false;
     const parsed = new URL(uri);
     if (!['http:', 'https:', 'rdp:', 'vnc:', 'spice:'].includes(parsed.protocol) ||
         !parsed.hostname || parsed.username || parsed.password) return false;
+    // Viewer URIs are only an authority. Never hand a viewer path, query or
+    // fragment that could contain credentials or alter its launch behavior.
+    if (['rdp:', 'vnc:', 'spice:'].includes(parsed.protocol) &&
+        ((parsed.pathname !== '' && parsed.pathname !== '/') || uri.includes('?') || uri.includes('#'))) return false;
     const reply = await invoker.invoke<{ opened?: boolean }>('linscp_open_external_uri', { uri });
     return reply?.opened === true;
   } catch {

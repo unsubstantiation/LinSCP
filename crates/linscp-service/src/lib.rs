@@ -536,8 +536,8 @@ impl CommanderService {
         let query = parse_query(query_str);
         match (method.as_str(), raw_path) {
             ("GET", "/api/status") => self.handle_status(),
-            // The optional account layer is a server deployment feature; the
-            // native app has no account server, so it answers as signed out
+            // This native service has no account server or account isolation;
+            // it answers as signed out
             // and signing out succeeds. The page offers the entry on every
             // host, and an unrouted answer there was a 404 the person saw as a
             // broken menu item.
@@ -1856,12 +1856,28 @@ impl CommanderService {
         } else {
             std::fs::symlink_metadata(&local_dest).is_ok()
         };
+        let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+        if resume && is_saf_path(&local_dest.to_string_lossy()) {
+            return api_error(400, "Verified resume is not supported for granted folders.");
+        }
+        if resume && exists {
+            return api_error(400, "Verified resume requires a new local destination; choose another name or start a fresh download.");
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if exists && overwrite != "overwrite" {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
         }
         let mut flags = linscp_engine::transfer::TransferFlags::default();
         flags.version_id = Some(version_id.clone());
+        flags.resume = resume;
+        if resume {
+            let tag = match session.s3_get_version_etag(&remote_path, &version_id).await {
+                Ok(Some(tag)) if tag.starts_with('"') && tag.ends_with('"') && tag.len() >= 2 && !tag[1..tag.len()-1].contains('"') && !tag.chars().any(char::is_control) => tag,
+                Ok(_) => return api_error(400, "Version resume requires a strong source ETag."),
+                Err(error) => return api_error(400, error.to_string()),
+            };
+            flags.source_etag = Some(tag);
+        }
         flags.preserve_time = true;
         let dest_str = local_dest.to_string_lossy().into_owned();
         let job = queue::QueueJob::RemoteDownload {
@@ -4990,6 +5006,10 @@ impl CommanderService {
         if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
             return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
         }
+        let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
+        if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
@@ -5127,6 +5147,7 @@ impl CommanderService {
             if resume && allow_overwrite { return api_error(400, "Verified resume requires a new local destination."); }
             let mut flags = linscp_engine::transfer::TransferFlags::default();
             flags.resume = resume;
+            flags.allow_best_effort_resume = best_effort_resume;
             flags.append = append;
             flags.newer_only = newer_only;
             flags.transfer_mode = transfer_mode;
@@ -13765,6 +13786,53 @@ mod tests {
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
 
+    /// The native dispatcher is single-user, even if a legacy accounts file
+    /// exists. These compatibility endpoints must not imply authentication
+    /// or a per-account filesystem jail is active.
+    #[tokio::test]
+    async fn native_account_endpoints_do_not_enable_account_isolation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let config = tmp.path().join("config");
+        std::fs::create_dir_all(&config).unwrap();
+        std::fs::write(config.join("accounts.ini"), "[alice]\nhash=legacy\n").unwrap();
+        let svc = CommanderService::new(config, Arc::new(NativeLocalFs::new()));
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        for async_dispatch in [false, true] {
+            let login = request("POST", "/api/login", json!({"username": "alice", "password": "secret"}));
+            let reply = if async_dispatch { svc.dispatch_async(login).await } else { svc.dispatch(login) };
+            assert_eq!(reply.status, 400);
+            assert_eq!(reply.payload["accounts_enabled"], false);
+            assert_eq!(reply.payload["success"], false);
+            assert!(!reply.payload.to_string().contains("secret"));
+            let status = request("GET", "/api/login", json!({}));
+            let reply = if async_dispatch { svc.dispatch_async(status).await } else { svc.dispatch(status) };
+            assert_eq!(reply.status, 200);
+            assert_eq!(reply.payload["accounts_enabled"], false);
+            assert_eq!(reply.payload["logged_in"], false);
+            assert_eq!(reply.payload["csrf_token"], "");
+        }
+        let logout = svc.dispatch(request("POST", "/api/logout", json!({})));
+        assert_eq!(logout.status, 200);
+        assert_eq!(logout.payload["accounts_enabled"], false);
+        // A normal local endpoint works without login: consumers must not
+        // mistake the compatibility responses for an authorization boundary.
+        svc.state.lock().unwrap().current_local_dir = Some(tmp.path().to_string_lossy().into_owned());
+        let list = svc.dispatch(request("GET", "/api/local/list", json!({})));
+        assert_eq!(list.status, 200, "{}", list.payload);
+        assert_eq!(list.payload["success"], true);
+    }
+
+    #[test]
+    fn pasted_url_errors_do_not_expose_credentials() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        for url in ["sftp://alice:distinct-secret@example.com:bad/", "sftp://alice:distinct-secret%@example.com/"] {
+            let reply = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/session/url".into(), body: json!({"url":url}) });
+            assert_eq!(reply.status, 400);
+            assert!(!reply.payload.to_string().contains("distinct-secret"), "{}", reply.payload);
+        }
+    }
+
     #[test]
     fn corrupt_bookmarks_and_workspaces_are_not_overwritten() {
         let tmp = tempfile::tempdir().unwrap();
@@ -15541,6 +15609,59 @@ mod tests {
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        // The versions dialog queues a version-scoped verified resume and
+        // never adopts another version's partial or overwrites a destination.
+        let version_bytes = b"original version payload";
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/versioned-resume.bin", version_bytes, Default::default()).await.unwrap();
+        let versions = session.s3_list_versions("/photos/versioned-resume.bin").await.unwrap();
+        let version_id = versions.iter().find(|v| v.is_latest && !v.is_delete_marker).unwrap().version_id.clone();
+        linscp_proto::upload_bytes(session.as_ref(), "/photos/versioned-resume.bin", b"newest version payload!!", Default::default()).await.unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().remote_dir = "/photos".into();
+        let target = local.join("versioned-copy.bin");
+        let checkpoint = linscp_engine::transfer::local_stage_path(&target, Some(&version_id)).unwrap();
+        let other_checkpoint = linscp_engine::transfer::local_stage_path(&target, Some("unrelated-version")).unwrap();
+        std::fs::write(&checkpoint, &version_bytes[..8]).unwrap();
+        std::fs::write(&other_checkpoint, b"other version").unwrap();
+        let body = json!({"tab": id, "name": "versioned-resume.bin", "version_id": version_id, "local_dir": local, "target_name": "versioned-copy.bin", "resume": true});
+        std::fs::write(&target, b"existing destination").unwrap();
+        let refusal = svc.dispatch_async(request("/api/s3/version-download", body.clone())).await;
+        assert_eq!(refusal.status, 400, "{}", refusal.payload);
+        assert_eq!(std::fs::read(&target).unwrap(), b"existing destination");
+        std::fs::remove_file(&target).unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/s3/version-download", body.clone())).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut complete = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            match tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                Some("Completed") => { complete = true; break; }
+                Some("Failed") => panic!("version resume failed: {:?}", tasks[idx]),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        assert!(complete);
+        assert_eq!(std::fs::read(&target).unwrap(), version_bytes);
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), &version_bytes[..8]);
+        assert_eq!(std::fs::read(&other_checkpoint).unwrap(), b"other version");
+        // A changed checkpoint is rejected without publishing a destination.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::write(&checkpoint, b"stale").unwrap();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/s3/version-download", body)).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut failed = false;
+        for _ in 0..1000 {
+            let (tasks, _) = svc.queue.snapshot();
+            match tasks.get(idx).and_then(|t| t["status"].as_str()) {
+                Some("Failed") => { failed = true; break; }
+                Some("Completed") => panic!("stale version checkpoint was published"),
+                _ => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+            }
+        }
+        assert!(failed);
+        assert!(!target.exists());
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), b"stale");
         let bytes = b"verified S3 resume payload";
         for (name, partial, succeeds) in [
             ("resume-ok.bin", Some(&bytes[..8]), true),
@@ -16798,6 +16919,34 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    async fn exercise_webdav_ignored_if_match(svc: &CommanderService, id: u64, downloaded: &Path, session: &dyn RemoteSession) {
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        // Even a server that ignores If-Match cannot silently splice a new
+        // representation when it returns a different ETag with its range.
+        linscp_proto::upload_bytes(session, "/resume-ignore.txt", b"abcdefghij", Default::default()).await.unwrap();
+        std::fs::write(downloaded.join("resume-ignore.txt.filepart"), b"abcd").unwrap();
+        svc.queue.pause();
+        let idx = svc.queue.snapshot().0.len();
+        let queued = svc.dispatch_async(request("/api/transfer/download", json!({"tab": id, "local_dir": downloaded, "remote_dir": "/", "names": ["resume-ignore.txt"], "resume": true}))).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        linscp_proto::upload_bytes(session, "/resume-ignore.txt", b"abcdNEWxyz", Default::default()).await.unwrap();
+        svc.queue.resume();
+        let mut failed = false;
+        for _ in 0..500 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Failed") {
+                assert!(tasks[idx]["error"].as_str().unwrap_or_default().contains("ETag"));
+                failed = true; break;
+            }
+            if tasks.get(idx).and_then(|t| t["status"].as_str()) == Some("Completed") { panic!("unconfirmed WebDAV representation was published"); }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(failed);
+        assert!(!downloaded.join("resume-ignore.txt").exists());
+        assert_eq!(std::fs::read(downloaded.join("resume-ignore.txt.filepart")).unwrap(), b"abcd");
+    }
+
+    #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn live_webdav_gui_upload_download() {
         if std::env::var_os("LSCP_LIVE_WEBDAV").is_none() { return; }
@@ -16810,7 +16959,7 @@ mod tests {
         let local = tmp.join("local"); let downloaded = tmp.join("downloaded");
         std::fs::create_dir_all(&local).unwrap(); std::fs::create_dir_all(&downloaded).unwrap();
         let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
-        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin").env("LSCP_TEST_BAD_RANGE", "1").env("LSCP_TEST_MKCOL_RESPONSES", "1")
+        let child = Command::new("/usr/bin/python3").arg(server_path).env("LSCP_TEST_PORT", "0").env("LSCP_TEST_GET_DELAY", "0.005").env("LSCP_TEST_DELETE_RACE", "1").env("LSCP_TEST_DROP_ONCE", "/resume-drop.bin").env("LSCP_TEST_BAD_RANGE", "1").env("LSCP_TEST_MKCOL_RESPONSES", "1").env("LSCP_TEST_IGNORE_IF_MATCH", "1")
             .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
         let mut server = Server(child);
         let mut line = String::new();
@@ -17325,6 +17474,7 @@ mod tests {
         assert!(!downloaded.join("resume-race.txt").exists());
         assert_eq!(std::fs::read(downloaded.join("resume-race.txt.filepart")).unwrap(), b"abcd");
         // A server that lies about the returned range cannot cause a splice.
+        Box::pin(exercise_webdav_ignored_if_match(&svc, id, &downloaded, session.as_ref())).await;
         linscp_proto::upload_bytes(session.as_ref(), "/resume-wrong-range.txt", b"abcdefghij", Default::default()).await.unwrap();
         std::fs::write(downloaded.join("resume-wrong-range.txt.filepart"), b"abcd").unwrap();
         let idx = svc.queue.snapshot().0.len();
@@ -18350,6 +18500,47 @@ mod tests {
         assert_eq!(listed.payload["keys"][0]["reference"], reference);
         assert_eq!(listed.payload["keys"][0]["label"], "id_ed25519");
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    /// Reopening in a fresh service tests the actual on-disk vault, not just
+    /// an already-unlocked in-memory key. A corrupt ciphertext must not be
+    /// interpreted as an empty store and overwritten by a subsequent save.
+    #[test]
+    fn saved_site_vault_reopens_and_rejects_wrong_password_and_tampering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let body = json!({"name":"secret-site", "session":{"protocol":"sftp", "host":"private.example", "username":"alice", "password":"unique-password-value"}});
+        let saved = service.dispatch(request("POST", "/api/sessions/save", body.clone()));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let encrypted = std::fs::read(tmp.path().join("sessions.ini")).unwrap();
+        assert!(encrypted.starts_with(b"LSCP-SESSION-VAULT-1$"));
+        for secret in ["secret-site", "private.example", "unique-password-value"] {
+            assert!(!encrypted.windows(secret.len()).any(|w| w == secret.as_bytes()));
+        }
+        assert!(std::fs::read(tmp.path().join("sessions.key")).unwrap().starts_with(b"LSCPVLT1"));
+        drop(service);
+        let reopened = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        assert!(SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).is_err());
+        let wrong = reopened.dispatch(request("POST", "/api/vault/unlock", json!({"password":"not the right password"})));
+        assert_eq!(wrong.status, 400, "{}", wrong.payload);
+        assert_eq!(std::fs::read(tmp.path().join("sessions.ini")).unwrap(), encrypted);
+        unlock_for_test(&reopened);
+        let store = SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("secret-site").unwrap().password.as_deref(), Some("unique-password-value"));
+        let listed = reopened.dispatch(request("GET", "/api/sessions", json!({})));
+        assert_eq!(listed.status, 200);
+        assert!(!listed.payload.to_string().contains("unique-password-value"));
+
+        let mut tampered = encrypted.clone();
+        let i = tampered.len() / 2;
+        tampered[i] = if tampered[i] == b'A' { b'B' } else { b'A' };
+        std::fs::write(tmp.path().join("sessions.ini"), &tampered).unwrap();
+        assert!(SessionStore::load_from_dir(tmp.path(), reopened.secret_vault.as_ref()).is_err());
+        let refused = reopened.dispatch(request("POST", "/api/sessions/save", body));
+        assert_ne!(refused.status, 200, "{}", refused.payload);
+        assert_eq!(std::fs::read(tmp.path().join("sessions.ini")).unwrap(), tampered);
     }
 
     #[test]
@@ -20496,6 +20687,61 @@ mod tests {
         let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// A granted folder has no native watcher. A mutation made after the
+    /// initial snapshot must be picked up by the next timed pass, not merely
+    /// by the initial catch-up pass (which the older one-pass test covered).
+    #[tokio::test]
+    async fn saf_keep_up_to_date_rechecks_after_poll_interval() {
+        use std::time::Duration;
+        use linscp_engine::keepuptodate::{run_keep_up_to_date, KeepUpToDateOptions};
+        let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let session = MockSession::new();
+        let opts = KeepUpToDateOptions { interval_ms: 400, max_passes: 2, install_signal_handlers: false, ..Default::default() };
+        let mut logger = linscp_engine::xml_log::SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+        let mut pass_one = None;
+        let mut statuses = Vec::new();
+        let count = run_keep_up_to_date(&session, Path::new(SAF_GRANTED_DIR), "/", Some(&fs), &opts, &mut logger, |status| {
+            statuses.push(status.to_string());
+            if status.starts_with("Pass 1:") {
+                assert_eq!(session.bytes_of("/first.txt").as_deref(), Some(b"first".as_slice()));
+                pass_one = Some(std::time::Instant::now());
+                bridge.add_file(&MockBridge::doc_uri("later.txt"), b"arrived after the first pass");
+            }
+        }).await.unwrap();
+        assert!(pass_one.unwrap().elapsed() >= Duration::from_millis(350), "the no-watcher path must wait for its poll interval");
+        assert!(statuses.iter().any(|s| s.starts_with("Pass 2:")), "{statuses:?}");
+        assert!(count >= 2, "both passes must apply their upload");
+        assert_eq!(session.bytes_of("/later.txt").as_deref(), Some(b"arrived after the first pass".as_slice()));
+    }
+
+    /// The same no-watcher wait remains cancellable promptly even when its
+    /// rescan interval is long; the queued task must not perform another pass.
+    #[tokio::test]
+    async fn saf_keep_up_to_date_cancels_during_poll_wait() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
+        let fs = NativeLocalFs::with_saf(bridge.clone());
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(fs));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let reply = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/keepuptodate".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "interval": 60, "count": 0}) }).await;
+        assert_eq!(reply.status, 200, "{}", reply.payload);
+        let task_id = reply.payload["task_id"].as_u64().unwrap();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while session.bytes_of("/first.txt").is_none() {
+            assert!(tokio::time::Instant::now() < deadline, "initial synchronization did not finish");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        bridge.add_file(&MockBridge::doc_uri("late.txt"), b"too late");
+        let cancel = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/queue/cancel".into(), body: json!({"task_id": task_id}) });
+        assert_eq!(cancel.status, 200, "{}", cancel.payload);
+        let task = wait_for_task(&svc, "Cancelled").await;
+        assert_eq!(task["id"].as_u64(), Some(task_id));
+        assert!(session.bytes_of("/late.txt").is_none());
+    }
+
     /// Link creation validates before it touches the filesystem, on every
     /// platform: the two names must differ and be single leaves, the link
     /// name must be free, and a granted folder gets the limitation's name.
@@ -21049,6 +21295,29 @@ mod tests {
                 stderr: Vec::new(),
             })
         }
+    }
+
+    #[tokio::test]
+    async fn sftp_resume_requires_explicit_per_request_risk_approval() {
+        let temp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(temp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSshInstallSession { executed: Mutex::new(Vec::new()) });
+        let tab = TabRuntime { id: 42, name: "test".into(), site_name: None, is_local: false, connected: true,
+            local_dir: temp.path().to_string_lossy().into_owned(), remote_dir: "/".into(), other_local_dir: String::new(),
+            observed_hostkey: String::new(), hostkey_role: "destination".into(), hostkey_changed: false, error: String::new(),
+            spec: None, session_json: json!({"protocol": "sftp"}), remote: Some(session) };
+        svc.state.lock().unwrap().tabs.insert(42, tab);
+        let request = |accept: bool| ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(),
+            body: json!({"tab": 42, "local_dir": temp.path(), "remote_dir": "/", "names": ["missing"], "resume": true, "accept_best_effort_resume_risk": accept}) };
+        let refused = svc.dispatch_async(request(false)).await;
+        assert_eq!(refused.status, 409, "{}", refused.payload);
+        assert_eq!(refused.payload["best_effort_resume_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        let approved = svc.dispatch_async(request(true)).await;
+        assert_eq!(approved.status, 400, "{}", approved.payload); // The mock reports no source.
+        assert!(approved.payload.get("best_effort_resume_risk").is_none());
+        let again = svc.dispatch_async(request(false)).await;
+        assert_eq!(again.status, 409); // Approval was not persisted.
     }
 
     #[tokio::test]

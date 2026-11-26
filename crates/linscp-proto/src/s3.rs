@@ -2110,8 +2110,8 @@ impl RemoteSession for S3Session {
         &self, remote_path: &str, etag: &str, opts: TransferRequest,
         sink: &mut (dyn AsyncWrite + Unpin + Send), progress: Option<&ProgressCallback>,
     ) -> Result<u64, ProtoError> {
-        if !valid_strong_s3_etag(etag) || opts.version_id.is_some() {
-            return Err(ProtoError::Transport("S3 conditional download requires a strong ETag and the current object.".to_string()));
+        if !valid_strong_s3_etag(etag) || opts.version_id.as_deref().is_some_and(str::is_empty) {
+            return Err(ProtoError::Transport("S3 conditional download requires a strong ETag and a valid version ID.".to_string()));
         }
         let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else {
             return Err(ProtoError::Transport("S3 download requires a bucket and object key.".to_string()));
@@ -2121,7 +2121,13 @@ impl RemoteSession for S3Session {
         }
         let mut headers = vec![("if-match".to_string(), etag.to_string())];
         if opts.resume_offset > 0 { headers.push(("range".to_string(), format!("bytes={}-", opts.resume_offset))); }
-        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let qp = opts.version_id.as_ref().map(|v| vec![("versionId".to_string(), v.clone())]).unwrap_or_default();
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &qp, &headers, Vec::new()).await?;
+        if let Some(version) = opts.version_id.as_deref() {
+            if response.headers().get("x-amz-version-id").and_then(|v| v.to_str().ok()) != Some(version) {
+                return Err(ProtoError::Transport("S3 conditional download returned a missing or different version ID.".to_string()));
+            }
+        }
         let expected_status = if opts.resume_offset > 0 { 206 } else { 200 };
         if response.status().as_u16() != expected_status {
             return Err(ProtoError::Transport(format!("Conditional S3 download was not confirmed (HTTP {}).", response.status())));
@@ -2140,10 +2146,15 @@ impl RemoteSession for S3Session {
         }
         let total = opts.resume_offset.saturating_add(response.content_length().unwrap_or(0));
         let mut transferred = 0u64;
+        let mut limiter = RateLimiter::new(opts.speed_kbytes_per_sec);
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 download stream failed: {e}")))? {
             sink.write_all(&chunk).await.map_err(|e| ProtoError::Transport(format!("S3 sink write failed: {e}")))?;
             transferred = transferred.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 download length overflow.".to_string()))?;
             if let Some(cb) = progress { cb(opts.resume_offset.saturating_add(transferred), total); }
+            if opts.speed_kbytes_per_sec > 0 {
+                sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
+            }
+            limiter.consume(chunk.len()).await;
         }
         sink.flush().await.map_err(|e| ProtoError::Transport(format!("S3 sink flush failed: {e}")))?;
         Ok(transferred)
@@ -2151,8 +2162,9 @@ impl RemoteSession for S3Session {
 
     async fn verify_prefix_if_match(
         &self, remote_path: &str, etag: &str, prefix_len: u64, total_len: u64,
-        prefix: &mut (dyn AsyncRead + Unpin + Send),
+        prefix: &mut (dyn AsyncRead + Unpin + Send), version_id: Option<&str>, speed_kbytes_per_sec: u32,
     ) -> Result<(), ProtoError> {
+        if version_id.is_some_and(str::is_empty) { return Err(ProtoError::Transport("Invalid S3 version ID.".to_string())); }
         if !valid_strong_s3_etag(etag) || prefix_len == 0 || prefix_len > total_len {
             return Err(ProtoError::Transport("Invalid S3 resume prefix or ETag.".to_string()));
         }
@@ -2163,7 +2175,13 @@ impl RemoteSession for S3Session {
             return Err(ProtoError::Transport("S3 download object key must not be empty.".to_string()));
         }
         let headers = vec![("if-match".to_string(), etag.to_string()), ("range".to_string(), format!("bytes=0-{}", prefix_len - 1))];
-        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &[], &headers, Vec::new()).await?;
+        let qp = version_id.map(|v| vec![("versionId".to_string(), v.to_string())]).unwrap_or_default();
+        let mut response = self.send_signed(Method::GET, Some(&bucket), &key, &qp, &headers, Vec::new()).await?;
+        if let Some(version) = version_id {
+            if response.headers().get("x-amz-version-id").and_then(|v| v.to_str().ok()) != Some(version) {
+                return Err(ProtoError::Transport("S3 prefix verification returned a missing or different version ID.".to_string()));
+            }
+        }
         let expected = format!("bytes 0-{}/{}", prefix_len - 1, total_len);
         let received = response.headers().get("content-range").and_then(|v| v.to_str().ok()).unwrap_or("");
         if response.status().as_u16() != 206 || received != expected {
@@ -2173,7 +2191,9 @@ impl RemoteSession for S3Session {
             return Err(ProtoError::Transport("S3 prefix verification returned a missing or different ETag.".to_string()));
         }
         let mut compared = 0u64;
+        let mut limiter = RateLimiter::new(speed_kbytes_per_sec);
         while let Some(chunk) = response.chunk().await.map_err(|e| ProtoError::Transport(format!("S3 prefix stream failed: {e}")))? {
+            limiter.consume(chunk.len()).await;
             compared = compared.checked_add(chunk.len() as u64).ok_or_else(|| ProtoError::Transport("S3 prefix length overflow.".to_string()))?;
             if compared > prefix_len { return Err(ProtoError::Transport("S3 returned too much prefix data.".to_string())); }
             let mut local = vec![0u8; chunk.len()];
@@ -2259,6 +2279,20 @@ impl RemoteSession for S3Session {
             return Err(ProtoError::Transport("Conditional overwrite requires a single strong ETag.".to_string()));
         }
         self.conditional_put(remote_path, opts, source, total_size, progress, "if-match", etag).await
+    }
+
+    async fn s3_get_version_etag(&self, remote_path: &str, version_id: &str) -> Result<Option<String>, ProtoError> {
+        if version_id.is_empty() { return Err(ProtoError::Transport("Invalid S3 version ID.".to_string())); }
+        let (Some(bucket), key) = self.split_bucket_and_key(remote_path)? else { return Ok(None); };
+        if key.is_empty() { return Ok(None); }
+        let qp = vec![("versionId".to_string(), version_id.to_string())];
+        let resp = self.send_signed(Method::HEAD, Some(&bucket), &key, &qp, &[], Vec::new()).await?;
+        if resp.status().as_u16() == 404 { return Ok(None); }
+        if !resp.status().is_success() { return Err(ProtoError::Transport(format!("S3 version HEAD failed with HTTP {}.", resp.status()))); }
+        if resp.headers().get("x-amz-version-id").and_then(|v| v.to_str().ok()) != Some(version_id) {
+            return Err(ProtoError::Transport("S3 version HEAD returned a missing or different version ID.".to_string()));
+        }
+        Ok(resp.headers().get("etag").and_then(|v| v.to_str().ok()).map(str::to_string))
     }
 
     async fn s3_get_etag(&self, remote_path: &str) -> Result<Option<String>, ProtoError> {

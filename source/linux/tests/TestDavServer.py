@@ -711,7 +711,8 @@ class DavHandler(BaseHTTPRequestHandler):
                 return
             tag = SERVER_STORE.etag_of(path) or ""
             expected = self.headers.get("If-Match", "").strip()
-            if expected and expected != tag:
+            ignore_match = path == "/resume-ignore.txt" and os.environ.get("LSCP_TEST_IGNORE_IF_MATCH") == "1"
+            if expected and expected != tag and not ignore_match:
                 self.send_precondition_failed()
                 return
             data = item.get("data", b"")

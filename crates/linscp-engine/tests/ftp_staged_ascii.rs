@@ -18,6 +18,7 @@ async fn ftp_fixture() -> (u16, Arc<Mutex<HashMap<String, Vec<u8>>>>, tokio::tas
         control.get_mut().write_all(b"220 ready\r\n").await.unwrap();
         let mut data_listener: Option<TcpListener> = None;
         let mut rename_source = String::new();
+        let mut rest_offset = 0usize;
         let mut sequence = 0;
         loop {
             let mut line = String::new();
@@ -43,6 +44,16 @@ async fn ftp_fixture() -> (u16, Arc<Mutex<HashMap<String, Vec<u8>>>>, tokio::tas
                     let mut bytes = Vec::new();
                     data.read_to_end(&mut bytes).await.unwrap();
                     shared.lock().await.insert(stage, bytes);
+                    "226 transfer complete\r\n".to_string()
+                }
+                "REST" => { rest_offset = arg.parse().unwrap(); "350 Restart position accepted\r\n".to_string() }
+                "RETR" => {
+                    let bytes = shared.lock().await.get(arg).cloned().unwrap();
+                    control.get_mut().write_all(b"150 Opening data connection\r\n").await.unwrap();
+                    let (mut data, _) = data_listener.take().unwrap().accept().await.unwrap();
+                    data.write_all(&bytes[rest_offset..]).await.unwrap();
+                    data.shutdown().await.unwrap();
+                    rest_offset = 0;
                     "226 transfer complete\r\n".to_string()
                 }
                 "MLST" => {
@@ -102,6 +113,63 @@ async fn staged_ftp_ascii_preserves_guards_and_reports_converted_size() {
     flags.append = true;
     assert!(upload_single_file(&ftp, &source, "/dest.txt", &flags, &mut logger, None).await.is_err());
     assert_eq!(files.lock().await.get("/dest.txt").unwrap(), b"one\ntwo\nthree\n");
+    ftp.close().await.unwrap();
+    server.await.unwrap();
+}
+
+/// A stale FTP prefix is rejected without touching either local path. The
+/// complete RETR is drained after a mismatch, so the session remains usable.
+#[tokio::test]
+async fn ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable() {
+    use linscp_engine::presets::ResumeSupportMode;
+    use linscp_engine::transfer::download_single_file;
+
+    let (port, files, server) = ftp_fixture().await;
+    let ftp = FtpSession::connect(FtpConnectConfig { scheme: ProtocolScheme::Ftp, host: "127.0.0.1".into(), port, ..Default::default() }, None, 0).await.unwrap();
+    let payload: Vec<u8> = (0..(1024 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+    files.lock().await.insert("/dest.txt".into(), payload.clone());
+    let tmp = tempfile::tempdir().unwrap();
+    let destination = tmp.path().join("download.bin");
+    let stage = tmp.path().join("download.bin.filepart");
+    std::fs::write(&destination, b"old destination").unwrap();
+    std::fs::write(&stage, b"wrong prefix").unwrap();
+    let mut flags = TransferFlags { resume: true, resume_support: ResumeSupportMode::On, preserve_time: false, ..Default::default() };
+    let mut logger = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+    let refused = download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap_err();
+    assert!(refused.contains("explicit best-effort"), "{refused}");
+    assert_eq!(std::fs::read(&stage).unwrap(), b"wrong prefix");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old destination");
+    flags.allow_best_effort_resume = true;
+    let error = download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap_err();
+    assert!(error.contains("do not match"), "{error}");
+    assert_eq!(std::fs::read(&destination).unwrap(), b"old destination");
+    assert_eq!(std::fs::read(&stage).unwrap(), b"wrong prefix");
+
+    // The prefix spans several comparator chunks. After the mismatch above,
+    // an ordinary command and a successful resumed transfer must both work.
+    assert!(ftp.stat("/dest.txt").await.unwrap().is_some());
+    std::fs::write(&stage, &payload[..100_000]).unwrap();
+    assert!(download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap());
+    assert_eq!(std::fs::read(&destination).unwrap(), payload);
+    assert!(!stage.exists());
+    ftp.close().await.unwrap();
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn ftp_resume_verification_rate_limits_the_full_retr() {
+    use std::time::{Duration, Instant};
+    let (port, files, server) = ftp_fixture().await;
+    let ftp = FtpSession::connect(FtpConnectConfig { scheme: ProtocolScheme::Ftp, host: "127.0.0.1".into(), port, ..Default::default() }, None, 0).await.unwrap();
+    let payload = vec![91u8; 16 * 1024];
+    files.lock().await.insert("/limited.bin".into(), payload.clone());
+    let info = ftp.stat("/limited.bin").await.unwrap().unwrap();
+    let token = format!("\"ftp:{}:{}\"", info.size, info.mtime);
+    let mut prefix = &payload[..1024];
+    let start = Instant::now();
+    ftp.verify_prefix_if_match("/limited.bin", &token, 1024, info.size, &mut prefix, None, 64).await.unwrap();
+    assert!(start.elapsed() >= Duration::from_millis(220), "FTP verification must throttle the entire RETR");
+    assert!(ftp.stat("/limited.bin").await.unwrap().is_some());
     ftp.close().await.unwrap();
     server.await.unwrap();
 }

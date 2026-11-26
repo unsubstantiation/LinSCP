@@ -491,6 +491,25 @@ function options(id) {
 (async () => {
   await new Promise(resolve => setTimeout(resolve, 400));
 
+  // An FTP/SFTP resume risk requires an affirmative, one-request approval.
+  {
+    const originalConfirm = window.confirm;
+    let prompts = [];
+    let requests = [];
+    const send = async approval => {
+      requests.push(Object.assign({}, approval));
+      return {result: approval.accept_best_effort_resume_risk ? {success: true} : {best_effort_resume_risk: true}};
+    };
+    window.confirm = message => { prompts.push(message); return false; };
+    const declined = await window.applyDropApprovals(send);
+    check('best-effort resume refusal does not retry', declined.cancelled && requests.length === 1 && prompts[0].includes('corrupt'));
+    requests = []; prompts = [];
+    window.confirm = message => { prompts.push(message); return true; };
+    const accepted = await window.applyDropApprovals(send);
+    check('best-effort resume approval is explicit', accepted.result.success && requests.length === 2 && requests[1].accept_best_effort_resume_risk === true);
+    window.confirm = originalConfirm;
+  }
+
   // Boot fetched what it needs.
   const doc = window.document;
   const paths = calls.map(call => call.path);
@@ -2884,6 +2903,22 @@ function options(id) {
   check('a task with no type or status does not empty the queue',
     doc.getElementById('queueList').children.length === 2,
     String(doc.getElementById('queueList').children.length));
+  // IDs and numeric fields are normally service-generated. A malformed IPC
+  // response must not turn them into HTML or executable event handlers.
+  responses['/api/transfers'] = { paused: false, transfers: [
+    { id: '1)\" autofocus onfocus=\"window.__queuePwned=1', status: 'Queued', type: 'Download' },
+    { id: 7, status: 'Running', type: '<img src=x onerror=alert(1)>', source: '<svg/onload=alert(1)>',
+      destination: 'normal', bytes_total: 100, bytes_done: '<img src=x>', percent: '0\" onmouseover=\"window.__queuePwned=1' },
+    { id: 8, status: 'Running', type: 'Download', bytes_total: 100, bytes_done: 100, percent: 300 }
+  ] };
+  await window.refreshQueue();
+  const safeQueue = doc.getElementById('queueList');
+  check('queue rejects invalid identifiers and treats malformed fields as inert text',
+    safeQueue.children.length === 2 && !safeQueue.querySelector('img,svg,[onmouseover],[autofocus]') &&
+      safeQueue.textContent.includes('<img src=x onerror=alert(1)>') &&
+      safeQueue.querySelector('.progress-bar').style.width === '0%', safeQueue.innerHTML);
+  check('queue progress is clamped to the range zero to one hundred',
+    safeQueue.querySelectorAll('.progress-bar')[1].style.width === '100%');
   responses['/api/transfers'] = savedTransfers;
   await window.refreshQueue();
 
@@ -4169,6 +4204,13 @@ function options(id) {
     const s3DlCall = calls.filter(call => call.path === '/api/s3/version-download').pop();
     check('S3 version download queues the selected version_id',
       !!s3DlCall && JSON.parse(s3DlCall.options.body).version_id === 'ver-1');
+    check('S3 version resume is opt-in by default', !doc.getElementById('s3VersionResume').checked && JSON.parse(s3DlCall.options.body).resume === false);
+    doc.getElementById('s3VersionResume').checked = true;
+    await window.downloadS3Version('report.csv', 'ver-1');
+    const resumedVersion = JSON.parse(calls.filter(call => call.path === '/api/s3/version-download').pop().options.body);
+    check('S3 version resume sends the selected version and explicit flag', resumedVersion.resume === true && resumedVersion.version_id === 'ver-1');
+    await window.openS3Versions();
+    check('S3 version resume approval is not persisted across dialogs', !doc.getElementById('s3VersionResume').checked);
     await window.deleteS3Version('report.csv', 'ver-1');
     const s3DelCall = calls.filter(call => call.path === '/api/s3/version-delete').pop();
     check('S3 version delete posts the selected version_id',
@@ -5835,6 +5877,16 @@ function options(id) {
       return origInvokeProps(cmd, args);
     };
     const wfState = window.eval('state');
+    // A tab ID is captured by a closure, never concatenated into JS/HTML.
+    const safeTabs = wfState.tabs, safeActive = wfState.activeTab;
+    wfState.tabs = [{ id: '1)\" onmouseover=\"window.__tabPwned=1', name: '<img src=x onerror=alert(1)>', connected: false }];
+    wfState.activeTab = null;
+    window.renderTabs();
+    check('tab labels and identifiers cannot inject executable markup',
+      !doc.querySelector('#tabStrip img, #tabStrip [onmouseover]') &&
+      doc.getElementById('tabStrip').textContent.includes('<img src=x onerror=alert(1)>'));
+    wfState.tabs = safeTabs; wfState.activeTab = safeActive;
+    window.renderTabs();
     const savedWfRemoteEntries = wfState.remote.entries.slice();
     const savedWfRemoteSel = new Set(wfState.remote.selection);
     const savedWfTabs = wfState.tabs.slice();

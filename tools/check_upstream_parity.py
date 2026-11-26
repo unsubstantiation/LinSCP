@@ -66,6 +66,7 @@ CASE_SOURCES = {
     # their behaviour is asserted by node against the built bundle instead of
     # through a page that would only reach the parts jsdom can run.
     "ui-transport": "ui/tests/TransportAndPlatform.test.mjs",
+    "android-emulator": "tools/android_emulator_smoke.mjs",
     # The service's own Rust tests drive the same dispatch the three hosts call,
     # so a handler they share (the drop endpoints, remote delete) is evidenced
     # by the code that serves it rather than by a host that happens to wrap it.
@@ -95,6 +96,7 @@ CASE_SOURCES = {
     # configuration directory the desktop expects. The file is Linux-only, so a Windows build
     # carries none of these cases.
     "platform-linux": "crates/linscp-platform/src/linux.rs",
+    "platform-signals": "crates/linscp-platform/tests/signal_handling.rs",
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
@@ -121,10 +123,13 @@ CASE_SOURCES = {
     # guarded-upload refusal until guarded SFTP uploads exist. Android runs
     # no Rust tests, so Android rows cite other suites instead.
     "engine-sftp": "crates/linscp-engine/tests/sftp_live_cases.rs",
+    "engine-watcher": "crates/linscp-engine/src/keepuptodate.rs",
+    "engine-xml": "crates/linscp-engine/src/xml_log.rs",
     # Conditional text uploads exercised through the WebDAV protocol.
     "engine-dav-ascii": "crates/linscp-engine/tests/conditional_ascii_upload.rs",
     # FTP STOU publication of converted text through the engine and protocol.
     "engine-ftp-ascii": "crates/linscp-engine/tests/ftp_staged_ascii.rs",
+    "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs",
     # The SCP engine end to end against the mock server: the live-scp cases
     # ported to Rust - the directory engine, the shell commands, the
     # transfers and the refusals.
@@ -399,11 +404,13 @@ def check_capabilities(inventory, errors, root=ROOT):
                 elif suite == "ui-transport":
                     # The bundle's own suite is node:test, so a case is a test().
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+                elif suite == "android-emulator":
+                    expression = r"\basync\s+function\s+" + re.escape(case) + r"\s*\("
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "platform-linux", "proto-ssh", "proto-ftp",
+                               "platform-windows-acl", "platform-linux", "platform-signals", "proto-ssh", "proto-ftp",
                                "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
-                               "engine-sftp", "engine-dav-ascii", "engine-ftp-ascii", "engine-scp", "engine-script", "engine-editor",
+                               "engine-sftp", "engine-watcher", "engine-xml", "engine-dav-ascii", "engine-ftp-ascii", "engine-conditional-resume", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):
                     # A cited case must be a #[test]/#[tokio::test] function,
                     # not merely a function of that name. A helper taking
@@ -479,6 +486,8 @@ def case_links(row):
                 pattern = r"check\(\s*['\"]" + re.escape(case) + r"['\"]"
             elif suite == 'ui-transport':
                 pattern = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
+            elif suite == 'android-emulator':
+                pattern = r"\basync\s+function\s+" + re.escape(case) + r"\s*\("
             elif suite == 'gui-cli-host':
                 # The host binary is a `main.rs`: its evidence is the attributes and
                 # calls that make the argument path exist, not a test function of

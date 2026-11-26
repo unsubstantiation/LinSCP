@@ -474,9 +474,7 @@ pub fn censored_for_log(line: &str) -> String {
     out.join(" ")
 }
 
-fn censor_single_token(tok: &str) -> String {
-    let lower = tok.to_ascii_lowercase();
-    for prefix in [
+const SECRET_SWITCH_PREFIXES: &[&str] = &[
         "-password=",
         "/password=",
         "-password:",
@@ -491,7 +489,11 @@ fn censor_single_token(tok: &str) -> String {
         "tunnelpassphrase=",
         "tunnelpassphraseplain=",
         "s3sessiontoken=",
-    ] {
+    ];
+
+fn censor_single_token(tok: &str) -> String {
+    let lower = tok.to_ascii_lowercase();
+    for &prefix in SECRET_SWITCH_PREFIXES {
         if lower.starts_with(prefix) {
             return format!("{}***", &tok[..prefix.len()]);
         }
@@ -504,33 +506,100 @@ fn censor_single_token(tok: &str) -> String {
     }
 }
 
+/// Redact recognized secret switches embedded in diagnostic prose while
+/// preserving surrounding text. This is deliberately conservative for
+/// unterminated quoted values: the remainder of the input is not logged.
+pub fn redact_diagnostic_secrets(text: &str) -> String {
+    let masked = mask_url_credentials_inline(text);
+    let lower = masked.to_ascii_lowercase();
+    let mut out = String::with_capacity(masked.len());
+    let mut pos = 0;
+    while pos < masked.len() {
+        let boundary = pos == 0 || masked[..pos].chars().next_back().is_some_and(|c| c.is_whitespace() || matches!(c, '(' | '[' | '{' | '\'' | '"'));
+        let prefix = if boundary { SECRET_SWITCH_PREFIXES.iter().find(|prefix| lower[pos..].starts_with(**prefix)) } else { None };
+        if let Some(prefix) = prefix {
+            let value_start = pos + prefix.len();
+            out.push_str(&masked[pos..value_start]);
+            out.push_str("***");
+            let rest = &masked[value_start..];
+            pos = if let Some(quote) = rest.chars().next().filter(|c| *c == '\'' || *c == '"') {
+                // Retain no quoted contents. A backslash can escape the next
+                // character; a missing closing quote consumes the remainder.
+                let mut end = rest.len();
+                let mut escaped = false;
+                for (i, c) in rest[quote.len_utf8()..].char_indices() {
+                    if escaped { escaped = false; continue; }
+                    if c == '\\' { escaped = true; continue; }
+                    if c == quote { end = quote.len_utf8() + i + c.len_utf8(); break; }
+                }
+                value_start + end
+            } else {
+                value_start + rest.find(|c: char| c.is_whitespace()).unwrap_or(rest.len())
+            };
+        } else {
+            let c = masked[pos..].chars().next().unwrap();
+            out.push(c);
+            pos += c.len_utf8();
+        }
+    }
+    out
+}
+
+/// Mask each URL authority independently. Stop at URL delimiters rather than
+/// searching through a following sentence for an unrelated `@`.
 pub fn mask_url_credentials_inline(text: &str) -> String {
-    let Some(scheme_pos) = text.find("://") else {
-        return text.to_string();
-    };
-    let after_scheme = scheme_pos + 3;
-    let authority_end = text[after_scheme..]
-        .find('/')
-        .map(|i| after_scheme + i)
-        .unwrap_or(text.len());
-    let authority = &text[after_scheme..authority_end];
-    let Some(at_rel) = authority.rfind('@') else {
-        return text.to_string();
-    };
-    let userinfo = &authority[..at_rel];
-    let Some(colon_rel) = userinfo.find(':') else {
-        return text.to_string();
-    };
-    format!(
-        "{}:***@{}",
-        &text[..after_scheme + colon_rel],
-        &authority[at_rel + 1..]
-    ) + &text[authority_end..]
+    let mut out = String::with_capacity(text.len());
+    let mut pos = 0;
+    while let Some(relative) = text[pos..].find("://") {
+        let authority_start = pos + relative + 3;
+        out.push_str(&text[pos..authority_start]);
+        let authority_end = text[authority_start..]
+            .find(|c: char| c.is_whitespace() || matches!(c, '/' | '?' | '#' | '\'' | '"' | '<' | '>'))
+            .map(|i| authority_start + i)
+            .unwrap_or(text.len());
+        let authority = &text[authority_start..authority_end];
+        if let Some(at) = authority.rfind('@') {
+            let userinfo = &authority[..at];
+            if let Some(colon) = userinfo.find(':') {
+                out.push_str(&authority[..colon + 1]);
+                out.push_str("***");
+                out.push_str(&authority[at..]);
+            } else {
+                out.push_str(authority);
+            }
+        } else {
+            out.push_str(authority);
+        }
+        pos = authority_end;
+    }
+    out.push_str(&text[pos..]);
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn redacts_secret_switches_in_diagnostics_without_destroying_prose() {
+        let message = r#"échec (-Password="two word secret") ProxyPassword=proxy-secret /passphrase:key-secret S3SessionToken=token-secret end"#;
+        let safe = redact_diagnostic_secrets(message);
+        assert_eq!(safe, "échec (-Password=***) ProxyPassword=*** /passphrase:*** S3SessionToken=*** end");
+        assert_eq!(redact_diagnostic_secrets("failed -password=\"unfinished secret"), "failed -password=***");
+        assert_eq!(redact_diagnostic_secrets("prefixProxyPassword=ordinary"), "prefixProxyPassword=ordinary");
+        assert_eq!(redact_diagnostic_secrets("open sftp://user:urlsecret@example.com/ -password=secret"), "open sftp://user:***@example.com/ -password=***");
+    }
+
+    #[test]
+    fn redacts_each_url_in_diagnostics_independently() {
+        let input = "failed sftp://a:first-secret@one and ftp://b:second-secret@two/path; see https://public.example and ftps://c:third-secret@three?foo=bar";
+        let got = mask_url_credentials_inline(input);
+        assert_eq!(got, "failed sftp://a:***@one and ftp://b:***@two/path; see https://public.example and ftps://c:***@three?foo=bar");
+        assert_eq!(mask_url_credentials_inline("sftp://example.com contact a:b@example.com"), "sftp://example.com contact a:b@example.com");
+        assert_eq!(mask_url_credentials_inline("(sftp://u:p%40ss@[::1]:22/x)"), "(sftp://u:***@[::1]:22/x)");
+        assert_eq!(mask_url_credentials_inline("sftp://u:pass,semi;paren)@host/path"), "sftp://u:***@host/path");
+        assert_eq!(censored_for_log("open sftp://a:first-secret@one ftp://b:second-secret@two"), "open sftp://a:***@one ftp://b:***@two");
+    }
 
     #[test]
     fn parameter_expansion_and_log_censoring_match_script_rules() {
