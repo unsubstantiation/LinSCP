@@ -63,14 +63,14 @@ The internal interpreter parses automatic/on/off and per-transfer -resumesupport
 
 **Area:** Transfers · **Status:** partial
 
-Named, per-site and rule-selected presets change live transfer settings.
+Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out and persists the selection. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings can override preset fields.
 
-**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-script, which checks the preset store, the rules that match a session or a file mask, and the preset a site stores with itself.
+**Next:** The emulator verifies a named mask against the WebDAV fixture, but per-site selection and every transfer setting are not exercised on Android or third-party servers. The historical live-dav suite needs the retired CLI. GUI manual transfer settings can override preset settings, and physical devices remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Exercise per-site presets and transfer-mode and permission settings on Android and against relevant live servers.
+- [ ] Clarify and test precedence between manual settings and automatic preset values.
 
 ## transfer.curl-progress
 
