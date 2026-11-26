@@ -377,14 +377,14 @@ source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop
 
 **Area:** Packaging/platforms · **Status:** partial
 
-CMakeLists.txt builds the Linux binaries, registers CTest suites, refuses non-Linux hosts and installs the CLI, GUI, desktop entry and man page.
+CMake wraps the native Tauri build, registers Rust and UI CTest entries, and installs the GUI, desktop entry and icons using CMAKE_INSTALL_PREFIX and DESTDIR. A Linux CI run built with CMake and opened the staged GUI under Xvfb; the Debian workflow repeats this smoke. A distribution test also exercises a custom prefix containing spaces with a stub executable. The retired CLI and man page are not installed, and CMake does not explicitly reject non-Linux hosts.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
+**Next:** The native Linux build and staged GUI launch are covered, but desktop menu discovery and scheme-handler selection from a custom prefix are unverified. CMake registers CTest entries, but this smoke does not execute them. The upstream console client is not shipped.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Exercise desktop menu discovery and scheme-handler selection for a custom-prefix install and run the registered CTest entries.
+- [ ] Do not claim the retired CLI is installed.
 
 ## platform.debian-package
 
