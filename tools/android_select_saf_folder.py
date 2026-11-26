@@ -28,6 +28,14 @@ def click(node):
     adb('shell', 'input', 'tap', str((x1 + x2) // 2), str((y1 + y2) // 2))
 
 
+def open_directory(node):
+    # DocumentsUI's grid uses a double-tap to open a folder; one tap can
+    # merely select the card rather than navigating into it.
+    click(node)
+    time.sleep(0.12)
+    click(node)
+
+
 def main():
     visited_folder = False
     used = False
@@ -56,12 +64,12 @@ def main():
                 continue
         folder = matching('LinSCP-Ungranted-Smoke')
         if folder:
-            click(folder)
+            open_directory(folder)
             visited_folder = True
             continue
         docs = matching('Documents')
         if docs:
-            click(docs)
+            open_directory(docs)
             continue
         storage = matching('Internal storage', 'sdk_gphone64_x86_64', 'sdk_gphone64_arm64')
         if storage:
