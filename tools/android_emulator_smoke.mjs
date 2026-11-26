@@ -201,7 +201,7 @@ const expression = `
   const marker = await invoke('POST', '/api/local/save', {path: root + '/android-smoke-marker.txt', content: 'android-smoke'});
   if (!marker.success) throw new Error('Marker write failed: ' + JSON.stringify(marker));
   async function verifyAndroidWebViewRendering() {
-    const guiState = window.eval('state');
+    const guiState = state; // DevTools shares the page's global lexical scope; CSP forbids eval.
     const previousTabs = guiState.tabs, previousActive = guiState.activeTab;
     const previousEntries = guiState.local.entries, previousSelection = guiState.local.selection;
     const originalRequest = window.LinSCPTransport.request;
