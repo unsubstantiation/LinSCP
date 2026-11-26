@@ -91,7 +91,7 @@ restart_and_run() {
   done
   if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
   adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
-  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase"; then
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase" "${portable_file:-}"; then
     adb logcat -d --pid="$pid" -t 200 || true
     exit 1
   fi
@@ -146,4 +146,27 @@ if adb shell run-as "$application" test -e "$sandbox/config/.full-restore-journa
   echo "Full restore left a pending journal" >&2; exit 1
 fi
 restart_and_run reopen-vault
+# Carry an encrypted backup out of the disposable app, clear its data and
+# Keystore, and restore into a fresh vault with a different password/master key.
+portable_file=$(mktemp)
+source_key=$(mktemp)
+trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed" "$portable_file" "$source_key"' EXIT
+restart_and_run portable-export
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$source_key"
+adb shell am force-stop "$application"
+if [[ $(adb shell pm clear "$application" | tr -d '\r') != Success ]]; then
+  echo "Could not clear disposable Android app data" >&2; exit 1
+fi
+adb shell pm grant "$application" android.permission.POST_NOTIFICATIONS >/dev/null 2>&1 || true
+restart_and_run portable-setup
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
+if cmp -s "$source_key" "$key_file"; then
+  echo "Fresh destination unexpectedly reused the source vault envelope" >&2; exit 1
+fi
+restart_and_run portable-import
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
+cmp "$key_file" "$observed" || { echo "Portable restore changed the destination vault key" >&2; exit 1; }
+restart_and_run portable-reopen
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
+cmp "$key_file" "$observed" || { echo "Destination vault key changed after restart" >&2; exit 1; }
 echo "Installed application ID and its install directory verified: $application ($sandbox)"

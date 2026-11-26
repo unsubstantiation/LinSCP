@@ -1,7 +1,7 @@
 // Runs against the debug WebView through Chrome DevTools. The WebDAV fixture
 // is reached through adb reverse; all IPC executes inside the installed APK.
 import assert from 'node:assert/strict';
-import { writeFileSync } from 'node:fs';
+import { readFileSync, writeFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
 // The installed package, handed over by the harness that read it from the
 // configuration, so the storage this run finds is the storage of *this* app.
@@ -10,8 +10,12 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
+const portableFile = process.argv[6];
+if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
+const portableBackup = phase === 'portable-import' ? readFileSync(portableFile, 'utf8') : '';
+
 let pages;
 for (let i = 0; i < 60; i++) {
   try {
@@ -105,6 +109,31 @@ const expression = `
     const root = (await invoke('GET', '/api/status')).local_dir;
     return {root, backupRestore: true, restoreRefusals: true};
   }
+  async function verifyAndroidBackupAcrossVaults() {
+    const phase = ${JSON.stringify(phase)};
+    const status = await invoke('GET', '/api/vault/status');
+    const expected = phase === 'portable-setup' ? 'setup_required' : 'locked';
+    if (status.vault !== expected) throw new Error('Unexpected portable backup vault status: ' + status.vault);
+    const password = phase === 'portable-export' ? 'android smoke vault password' : 'different destination vault password';
+    await invoke('POST', '/api/vault/unlock', {password});
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    if (phase === 'portable-setup') return {root, destinationVaultSetUp: true};
+    if (phase === 'portable-export') {
+      const exported = await invoke('POST', '/api/backup/export', {password: 'portable android backup password'});
+      if (!exported.success || !atob(exported.data_base64).startsWith('LSCPBAK1')) throw new Error('Portable backup export failed');
+      return {root, backupBase64: exported.data_base64};
+    }
+    if (phase === 'portable-import') {
+      const restored = await invoke('POST', '/api/backup/import', {password: 'portable android backup password', data_base64: ${JSON.stringify(portableBackup)}, confirm_replace: true});
+      if (!restored.success) throw new Error('Portable backup restore failed');
+    }
+    const sessions = await invoke('GET', '/api/sessions');
+    if (!sessions.sessions?.some(site => site.name === 'android-smoke-vault-site')) throw new Error('Portable restore omitted saved site');
+    const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!opened.tab?.connected) throw new Error('Portable restored credential failed to authenticate');
+    return {root, portableBackupPhase: phase};
+  }
+  if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
   if (${JSON.stringify(phase)} === 'backup-restore') return await verifyAndroidFullBackupRestore();
   if (${JSON.stringify(phase)} === 'reopen-vault') return await verifyAndroidVaultRestart();
   if (${JSON.stringify(phase)} === 'tampered-key' || ${JSON.stringify(phase)} === 'tampered-sessions') return await verifyAndroidVaultTampering();
@@ -255,8 +284,14 @@ for (let i = 0; i < 60 && stable < 2; i++) {
   if (stable < 2) await new Promise(resolve => setTimeout(resolve, 1000));
 }
 assert.equal(stable, 2, 'WebView did not become ready');
-const reply = await evaluate(expression, phase === 'backup-restore' ? 300000 : 120000);
+const reply = await evaluate(expression, ['backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(phase) ? 300000 : 120000);
 socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
+if (phase === 'portable-export') {
+  const value = reply.result.result.value;
+  assert.ok(typeof value.backupBase64 === 'string' && value.backupBase64.length > 0, 'portable backup missing');
+  writeFileSync(portableFile, value.backupBase64, {mode: 0o600});
+  delete value.backupBase64; // never print backup bytes in CI logs
+}
 if (rootFile) writeFileSync(rootFile, String(reply.result.result.value.root));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));
