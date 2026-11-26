@@ -193,14 +193,14 @@ SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; w
 
 **Area:** Security/authentication · **Status:** partial
 
-There is no local HTTP API and therefore no bearer token to steal or leak. Upstream serves the page from a loopback socket guarded by a per-run token; LinSCP does not open that socket at all. In the packaged app the page calls CommanderService::dispatch in-process over Tauri IPC (invoke("linscp_invoke")), so requests never cross a TCP boundary and cannot be reached from another process on the machine. The trade-off is that the IPC surface is not itself authenticated: whatever can invoke into the webview can drive the service. That is the same boundary the desktop client always had - the local user - and the browser build, which is what the `gui` suite drives, talks to the service through the same dispatch entry point.
+The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths.
 
-**Next:** The absence of a listening socket is a property of the shipped binary, not something a case asserts: no suite binds a port and proves none appears, and the IPC surface is not shown to be unreachable from another local process. The tauri crate's tests run on Linux and Windows but need the native-shell feature for the IPC command itself, which CI does not build.
+**Next:** The GUI cases run in jsdom with a mock backend, not a packaged WebView. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; the native-shell IPC path, remaining rendering surfaces, and Android device behavior need security validation.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
+- [ ] Exercise packaged desktop and Android IPC boundaries, including attempts from untrusted web content and local processes.
+- [ ] Audit and test the remaining untrusted-data rendering surfaces, and validate the absence of any unintended API listener in the shipped application.
 
 ## security.gssapi-and-tunnels
 
