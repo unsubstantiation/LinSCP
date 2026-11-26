@@ -481,13 +481,13 @@ LinSCP is a Linux-only client and the check that says so is part of the build: t
 
 **Area:** Packaging/platforms · **Status:** partial
 
-Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod, synchronization, transfers, copy/move and watching keep their named refusals (see platform.android-saf-refusals). Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup.
+Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks the edited bytes outside the app, and reopens the granted folder after a process restart.
 
-**Next:** No suite has touched a real DocumentsProvider: the bridge is an in-memory mock, so provider behaviour (mtime precision, create-or-replace error cases, large documents) is unproven on a device.
+**Next:** The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Other providers, properties rows, revoked access races, large documents and physical-device behavior are unverified.
 
 **Acceptance criteria:**
 
-- [ ] Open, edit, save and re-read a file in a granted folder on an Android device or emulator, covering the stale-save refusal and the properties rows the dialog shows.
+- [ ] Validate properties and provider error cases, including revoked permissions and large files, on different DocumentsProviders and physical Android devices.
 
 ## platform.android-saf-local-copy-move
 

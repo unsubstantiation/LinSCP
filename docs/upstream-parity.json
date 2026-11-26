@@ -156,7 +156,7 @@
         }
       },
       "android": {
-        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, the emulator smoke separately exercises a Keystore-backed vault restart, but not the SAF or share-sheet flows. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, the emulator smoke separately exercises Keystore-backed vault restart and a real DocumentsUI-granted folder, but not the share-sheet flow. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-06",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -193,7 +193,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -4761,12 +4761,16 @@
       "id": "platform.android-saf-editing",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod, synchronization, transfers, copy/move and watching keep their named refusals (see platform.android-saf-refusals). Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup.",
+      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks the edited bytes outside the app, and reopens the granted folder after a process restart.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/ops.rs",
         "ui/src/platform/capabilities.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt",
+        "tools/android_emulator_smoke.mjs",
+        "tools/android_emulator_smoke.sh",
+        "tools/android_select_saf_folder.py"
       ],
       "checks": {
         "service": [
@@ -4775,6 +4779,9 @@
         ],
         "gui": [
           "a granted folder offers the editor"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafEditing"
         ]
       },
       "verified_on": {
@@ -4787,12 +4794,13 @@
           "gui"
         ],
         "android": [
-          "gui"
+          "gui",
+          "android-emulator"
         ]
       },
-      "gap": "No suite has touched a real DocumentsProvider: the bridge is an in-memory mock, so provider behaviour (mtime precision, create-or-replace error cases, large documents) is unproven on a device.",
+      "gap": "The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Other providers, properties rows, revoked access races, large documents and physical-device behavior are unverified.",
       "acceptance": [
-        "Open, edit, save and re-read a file in a granted folder on an Android device or emulator, covering the stale-save refusal and the properties rows the dialog shows."
+        "Validate properties and provider error cases, including revoked permissions and large files, on different DocumentsProviders and physical Android devices."
       ]
     },
     {
