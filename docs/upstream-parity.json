@@ -4139,10 +4139,15 @@
       "id": "desktop.scheme-handlers",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output.",
+      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output. Linux and Windows platform tests cover authenticated delivery, bad-token refusal and queue limits; jsdom covers modal deferral and review.",
       "source": [
         "debian/linscp.desktop",
         "crates/linscp-platform/src/cli_args.rs",
+        "crates/linscp-platform/src/lib.rs",
+        "crates/linscp-tauri/src/lib.rs",
+        "crates/linscp-tauri/src/main.rs",
+        "source/gui/web/index.html",
+        "source/gui/tests/ClientTest.js",
         "crates/linscp-engine/src/url_and_raw.rs",
         "crates/linscp-service/src/lib.rs"
       ],
@@ -4153,6 +4158,10 @@
         ],
         "gui-cli": [
           "startup_session_url_is_reviewed_not_executed"
+        ],
+        "gui": [
+          "native launch URL waits while another dialog is open",
+          "native launch URL opens review without connecting"
         ]
       },
       "gap": "The Debian entry declares transfer URI handlers and the native launcher offers URLs for review. Actual desktop registration and end-to-end launch, Windows registration, Android deep links, and untrusted-URL security validation remain unverified.",
@@ -4163,11 +4172,13 @@
       "verified_on": {
         "linux": [
           "service",
-          "gui-cli"
+          "gui-cli",
+          "gui"
         ],
         "windows": [
           "service",
-          "gui-cli"
+          "gui-cli",
+          "gui"
         ]
       }
     },
