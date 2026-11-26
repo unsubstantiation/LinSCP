@@ -270,6 +270,7 @@ const expression = `
       }
       throw new Error('SAF transfer timed out');
     }
+    await verifyAndroidGrantedSafLocalCopyMove(tree, localTab, root, runTask);
     await runTask('/api/transfer/upload', {tab, local_dir: tree, remote_dir: '/', names: ['created.txt']});
     const remote = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/created.txt'));
     if (remote.content !== 'created via SAF') throw new Error('SAF upload bytes differ on WebDAV');
@@ -292,6 +293,28 @@ const expression = `
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
+  }
+  async function verifyAndroidGrantedSafLocalCopyMove(tree, safTab, root, runTask) {
+    const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: tree})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: rootTab, name: 'saf-local-copy'});
+    const plain = root + '/saf-local-copy';
+    const plainTab = (await invoke('POST', '/api/tabs/local', {local_dir: plain, remote_dir: tree})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: safTab, path: 'provider-copy.txt', content: 'provider copy bytes'});
+    await runTask('/api/transfer/upload', {tab: safTab, local_dir: tree, remote_dir: plain, names: ['provider-copy.txt']});
+    if ((await invoke('GET', '/api/local/edit?tab=' + plainTab + '&path=provider-copy.txt')).content !== 'provider copy bytes') throw new Error('SAF to local copy differs');
+    await invoke('POST', '/api/local/save', {tab: plainTab, path: 'plain-move.txt', content: 'plain move bytes'});
+    await runTask('/api/transfer/move', {tab: plainTab, direction: 'upload', local_dir: plain, remote_dir: tree, names: ['plain-move.txt']});
+    if ((await invoke('GET', '/api/local/edit?tab=' + safTab + '&path=plain-move.txt')).content !== 'plain move bytes') throw new Error('Local to SAF move differs');
+    const plainList = await invoke('GET', '/api/local/list?tab=' + plainTab + '&path=' + encodeURIComponent(plain));
+    if (plainList.entries?.some(entry => entry.name === 'plain-move.txt')) throw new Error('Local move source remains');
+    await invoke('POST', '/api/local/save', {tab: plainTab, path: 'provider-copy.txt', content: 'protected destination'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/move', {tab: safTab, direction: 'upload', local_dir: tree, remote_dir: plain, names: ['provider-copy.txt']}); }
+    catch (error) { refused = error.status === 409; }
+    if (!refused || (await invoke('GET', '/api/local/edit?tab=' + safTab + '&path=provider-copy.txt')).content !== 'provider copy bytes' || (await invoke('GET', '/api/local/edit?tab=' + plainTab + '&path=provider-copy.txt')).content !== 'protected destination') throw new Error('Conflicting SAF move did not preserve both files');
+    await runTask('/api/transfer/upload', {tab: safTab, local_dir: tree, remote_dir: plain, names: ['editor-boundary']});
+    const nested = (await invoke('POST', '/api/tabs/local', {local_dir: plain + '/editor-boundary', remote_dir: tree})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + nested + '&path=inside.txt')).content !== 'inside') throw new Error('Nested SAF copy differs');
   }
   async function verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask) {
     // Isolate the fixture so the delete test cannot touch the grant marker.
