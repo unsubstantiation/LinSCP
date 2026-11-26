@@ -283,7 +283,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         ?: throw IllegalStateException("provider did not create the document")
       activity.contentResolver.openOutputStream(target, "wt")?.close()
         ?: throw IllegalStateException("provider returned no output stream")
-      mapOf("uri" to target.toString())
+      // Return the app's parent-relative path, not the provider's flattened
+      // document ID: later chunk writes must resolve through the same parent.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -333,7 +335,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val bytes = android.util.Base64.decode(args.data_base64, android.util.Base64.DEFAULT)
       activity.contentResolver.openOutputStream(target, "wt")?.use { it.write(bytes); it.flush() }
         ?: throw IllegalStateException("provider returned no output stream")
-      mapOf("uri" to target.toString())
+      // Return the app's parent-relative path, not the provider's flattened
+      // document ID: later chunk writes must resolve through the same parent.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -350,7 +354,8 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         DocumentsContract.createDocument(activity.contentResolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, args.name)
           ?: throw IllegalStateException("provider did not create the directory")
       }
-      mapOf("uri" to result.toString())
+      // Keep the structured parent chain for subsequent nested operations.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -811,11 +816,15 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     if (childIndex >= segments.size) return documentUri(uri)
     if (segments[childIndex] != "document") throw IllegalArgumentException("Invalid SAF document URI")
     val grantId = segments[treeIndex + 1]
-    if (segments.size == childIndex + 2 && segments[childIndex + 1] == grantId) {
-      return DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
-    }
     var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
     var i = childIndex + 1
+    if (segments[i] == grantId) {
+      i += 1
+      if (i < segments.size) {
+        if (segments[i] != "document" || i + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF document URI")
+        i += 1
+      }
+    }
     while (i < segments.size) {
       // Interpret alternating separators and names by position, not value:
       // a real file or folder may itself be named "document".
