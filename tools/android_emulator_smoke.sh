@@ -150,8 +150,17 @@ restart_and_run reopen-vault
 # Keystore, and restore into a fresh vault with a different password/master key.
 portable_file=$(mktemp)
 source_key=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed" "$portable_file" "$source_key"' EXIT
+source_ssh_key=$(mktemp)
+trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed" "$portable_file" "$source_key" "$source_ssh_key"' EXIT
 restart_and_run portable-export
+key_id=$(python3 - "$portable_file" <<'PYCODE'
+import json, re, sys
+ref = json.load(open(sys.argv[1], encoding='utf-8'))['keyReference']
+assert re.fullmatch(r'vaultkey://[a-f0-9]{32}', ref)
+print(ref.removeprefix('vaultkey://'))
+PYCODE
+)
+adb exec-out run-as "$application" cat "$sandbox/config/keys/$key_id.key.vault" > "$source_ssh_key"
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$source_key"
 adb shell am force-stop "$application"
 if [[ $(adb shell pm clear "$application" | tr -d '\r') != Success ]]; then
@@ -164,6 +173,10 @@ if cmp -s "$source_key" "$key_file"; then
   echo "Fresh destination unexpectedly reused the source vault envelope" >&2; exit 1
 fi
 restart_and_run portable-import
+adb exec-out run-as "$application" cat "$sandbox/config/keys/$key_id.key.vault" > "$observed"
+if cmp -s "$source_ssh_key" "$observed"; then
+  echo "Destination SSH key ciphertext was not rewrapped" >&2; exit 1
+fi
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
 cmp "$key_file" "$observed" || { echo "Portable restore changed the destination vault key" >&2; exit 1; }
 restart_and_run portable-reopen

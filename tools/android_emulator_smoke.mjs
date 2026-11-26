@@ -14,7 +14,7 @@ assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'back
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
-const portableBackup = phase === 'portable-import' ? readFileSync(portableFile, 'utf8') : '';
+const portableBackup = ['portable-import', 'portable-reopen'].includes(phase) ? JSON.parse(readFileSync(portableFile, 'utf8')) : null;
 
 let pages;
 for (let i = 0; i < 60; i++) {
@@ -118,17 +118,33 @@ const expression = `
     await invoke('POST', '/api/vault/unlock', {password});
     const root = (await invoke('GET', '/api/status')).local_dir;
     if (phase === 'portable-setup') return {root, destinationVaultSetUp: true};
+    // A deliberately nonfunctional private-key fixture: this exercises vault
+    // encryption and backup rewrapping, not SSH parsing or authentication.
+    const keyFixture = 'android portable backup private key fixture';
     if (phase === 'portable-export') {
+      const key = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
+      if (!key.success || !/^vaultkey:\/\/[a-f0-9]{32}$/.test(key.reference)) throw new Error('Fixture key import failed');
+      await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: 'fixture.invalid', username: 'test', keyfile: key.reference}});
       const exported = await invoke('POST', '/api/backup/export', {password: 'portable android backup password'});
       if (!exported.success || !atob(exported.data_base64).startsWith('LSCPBAK1')) throw new Error('Portable backup export failed');
-      return {root, backupBase64: exported.data_base64};
+      return {root, portableData: {backupBase64: exported.data_base64, keyReference: key.reference}};
     }
+    const portable = ${JSON.stringify(portableBackup)};
     if (phase === 'portable-import') {
-      const restored = await invoke('POST', '/api/backup/import', {password: 'portable android backup password', data_base64: ${JSON.stringify(portableBackup)}, confirm_replace: true});
+      const restored = await invoke('POST', '/api/backup/import', {password: 'portable android backup password', data_base64: portable.backupBase64, confirm_replace: true});
       if (!restored.success) throw new Error('Portable backup restore failed');
     }
     const sessions = await invoke('GET', '/api/sessions');
     if (!sessions.sessions?.some(site => site.name === 'android-smoke-vault-site')) throw new Error('Portable restore omitted saved site');
+    const keySite = sessions.sessions?.find(site => site.name === 'portable-key-site');
+    if (keySite?.private_key !== portable.keyReference) throw new Error('Restored site key reference differs');
+    const listedKeys = await invoke('GET', '/api/vault/keys');
+    if (!listedKeys.keys?.some(key => key.reference === portable.keyReference && key.label === 'portable-fixture-key')) throw new Error('Restored key metadata missing');
+    // Import deduplication opens existing encrypted keys and compares the
+    // plaintext, so this also checks the restored key decrypts under the
+    // destination vault without exposing private bytes through a read API.
+    const duplicate = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
+    if (!duplicate.deduplicated || duplicate.reference !== portable.keyReference) throw new Error('Restored key cannot be decrypted to the original fixture');
     const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
     if (!opened.tab?.connected) throw new Error('Portable restored credential failed to authenticate');
     return {root, portableBackupPhase: phase};
@@ -289,9 +305,9 @@ socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
 if (phase === 'portable-export') {
   const value = reply.result.result.value;
-  assert.ok(typeof value.backupBase64 === 'string' && value.backupBase64.length > 0, 'portable backup missing');
-  writeFileSync(portableFile, value.backupBase64, {mode: 0o600});
-  delete value.backupBase64; // never print backup bytes in CI logs
+  assert.ok(typeof value.portableData?.backupBase64 === 'string' && value.portableData.backupBase64.length > 0, 'portable backup missing');
+  writeFileSync(portableFile, JSON.stringify(value.portableData), {mode: 0o600});
+  delete value.portableData; // never print backup bytes in CI logs
 }
 if (rootFile) writeFileSync(rootFile, String(reply.result.result.value.root));
 console.log('Android WebView and Rust service smoke test passed:', JSON.stringify(reply.result.result.value));
