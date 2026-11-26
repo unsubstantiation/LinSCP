@@ -204,8 +204,49 @@ const expression = `
       await invoke('POST', '/api/local/save', {tab, path: 'created.txt', content: 'created via SAF'});
       const created = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=created.txt');
       if (created.content !== 'created via SAF') throw new Error('SAF created bytes differ');
+      const properties = await invoke('POST', '/api/local/properties', {tab, names: ['created.txt']});
+      if (properties.properties?.[0]?.name !== 'created.txt' || properties.properties[0].size !== 15 || properties.properties[0].is_dir) throw new Error('SAF file properties differ: ' + JSON.stringify(properties));
+      await verifyAndroidGrantedSafTransfers(tree, tab, root);
     }
     return {root, safEditing: phase};
+  }
+  async function verifyAndroidGrantedSafTransfers(tree, localTab, root) {
+    const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+    if (!opened.tab?.connected) throw new Error('Cannot open WebDAV for SAF transfers');
+    const tab = opened.tab.id;
+    async function runTask(path, body) {
+      const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+      const reply = await invoke('POST', path, body);
+      if (!reply.success) throw new Error('SAF transfer was not queued');
+      for (let i = 0; i < 120; i++) {
+        const task = (await invoke('GET', '/api/transfers')).transfers.find(task => !previous.has(task.id));
+        if (task?.status === 'Completed') return;
+        if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('SAF transfer failed: ' + JSON.stringify(task));
+        await sleep(250);
+      }
+      throw new Error('SAF transfer timed out');
+    }
+    await runTask('/api/transfer/upload', {tab, local_dir: tree, remote_dir: '/', names: ['created.txt']});
+    const remote = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/created.txt'));
+    if (remote.content !== 'created via SAF') throw new Error('SAF upload bytes differ on WebDAV');
+    await invoke('POST', '/api/remote/save', {tab, path: '/saf-down.txt', content: 'download into SAF'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt'], resume: true}); }
+    catch (error) { refused = error.status === 400 && /verified resume.*granted folders/i.test(error.message || ''); }
+    if (!refused) throw new Error('Verified resume into a granted folder was not refused');
+    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']});
+    const downloaded = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt');
+    if (downloaded.content !== 'download into SAF') throw new Error('SAF download bytes differ');
+    let conflict = false;
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']}); }
+    catch (error) { conflict = error.status === 409; }
+    if (!conflict || (await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt')).content !== 'download into SAF') throw new Error('Existing SAF destination was not protected');
+    await invoke('POST', '/api/remote/save', {tab, path: '/saf-move.txt', content: 'move into SAF'});
+    await runTask('/api/transfer/move', {tab, direction: 'download', local_dir: tree, remote_dir: '/', names: ['saf-move.txt']});
+    const moved = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-move.txt');
+    if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
+    const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
+    if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
   }
   if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
