@@ -15327,6 +15327,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn selected_transfer_preset_filters_queued_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let left = tmp.path().join("left");
+        let right = tmp.path().join("right");
+        for dir in [&cfg, &left, &right] { std::fs::create_dir_all(dir).unwrap(); }
+        std::fs::write(left.join("allowed.txt"), b"allowed").unwrap();
+        std::fs::write(left.join("excluded.bin"), b"excluded").unwrap();
+        let svc = CommanderService::new(cfg, Arc::new(NativeLocalFs::new()));
+        let saved = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/presets/save".into(), body: json!({"name": "text-only", "mask": "*.txt"}) });
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let id = svc.create_local_tab(left.to_string_lossy().into_owned(), right.to_string_lossy().into_owned()).payload["tab"]["id"].as_u64().unwrap();
+        {
+            let mut state = svc.state.lock().unwrap();
+            let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+            spec.preset_name = "text-only".into();
+            state.tabs.get_mut(&id).unwrap().spec = Some(spec);
+        }
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["allowed.txt", "excluded.bin"]}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right.join("allowed.txt")).unwrap(), b"allowed");
+        assert!(!right.join("excluded.bin").exists());
+        assert_eq!(svc.queue.snapshot().0.len(), 1);
+    }
+
+    #[tokio::test]
     async fn local_file_copy_is_queued_and_conflicts_are_not_overwritten() {
         let tmp = std::env::temp_dir().join(format!("linscp-queue-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
