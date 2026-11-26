@@ -65,4 +65,32 @@ if ! adb shell run-as "$application" ls "$sandbox" | tr -d '\r' | grep -Fx "andr
   adb shell run-as "$application" ls -la "$sandbox" >&2 || true
   exit 1
 fi
+# Inspect app-private bytes from the debug sandbox, without printing secrets.
+key_file=$(mktemp)
+sessions_file=$(mktemp)
+trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file"' EXIT
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
+python3 - "$key_file" "$sessions_file" <<'PYCODE'
+import pathlib, sys
+key, sessions = (pathlib.Path(p).read_bytes() for p in sys.argv[1:])
+assert key.startswith(b'LSCPKST1'), 'vault key was not Android Keystore wrapped'
+assert sessions.startswith(b'LSCP-SESSION-VAULT-1$'), 'saved sites were not sealed'
+for secret in (b'android-smoke-vault-site', b'testuser', b'testpass', b'127.0.0.1'):
+    assert secret not in sessions, 'saved site metadata appeared in plaintext'
+PYCODE
+# Force-stop actually destroys the app process and its in-memory vault key.
+adb shell am force-stop "$application"
+adb shell am start -n "$application/.MainActivity"
+for _ in $(seq 1 90); do
+  pid=$(adb shell pidof "$application" | tr -d '\r' || true)
+  if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
+  sleep 1
+done
+if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
+adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
+if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" reopen-vault; then
+  adb logcat -d --pid="$pid" -t 200 || true
+  exit 1
+fi
 echo "Installed application ID and its install directory verified: $application ($sandbox)"

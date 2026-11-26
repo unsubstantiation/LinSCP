@@ -9,6 +9,7 @@ const application = process.argv[3];
 // Where to record the app-private root the service reported, so the harness can
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
+const reopenVault = process.argv[5] === 'reopen-vault';
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 let pages;
 for (let i = 0; i < 60; i++) {
@@ -28,6 +29,27 @@ const expression = `
   for (let i = 0; i < 60 && !window.LinSCPTransport; i++) await sleep(1000);
   if (window.LinSCPTransport?.mode !== 'tauri') throw new Error('Tauri frontend transport not initialized');
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
+  async function verifyAndroidVaultRestart() {
+    const status = await invoke('GET', '/api/vault/status');
+    if (status.vault !== 'locked') throw new Error('Restart did not lock vault: ' + JSON.stringify(status));
+    let rejected = false;
+    try { await invoke('POST', '/api/vault/unlock', {password: 'wrong vault password'}); }
+    catch (error) { rejected = error.status === 400; }
+    if (!rejected) throw new Error('Wrong vault password was not rejected');
+    const afterWrong = await invoke('GET', '/api/vault/status');
+    if (afterWrong.vault !== 'locked') throw new Error('Wrong password unlocked the vault');
+    await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
+    const sessions = await invoke('GET', '/api/sessions');
+    if (!sessions.sessions?.some(site => site.name === 'android-smoke-vault-site')) throw new Error('Saved site missing after restart');
+    if (JSON.stringify(sessions).includes('testpass')) throw new Error('Saved site listing exposed password');
+    // Authentication against the fixture proves the password was recovered,
+    // without exposing it through the list API.
+    const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!opened.tab?.connected) throw new Error('Saved site did not reconnect after restart: ' + JSON.stringify(opened));
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    return {root, vaultRestart: true, wrongPasswordRefused: true, savedSiteReconnect: true};
+  }
+  if (${JSON.stringify(reopenVault)}) return await verifyAndroidVaultRestart();
   const caps = window.LinSCPCore.hostCapabilities({host: window});
   for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers', 'desktopLaunchers']) {
     if (!caps[bridge]) throw new Error('Native Android capability not registered: ' + bridge);
@@ -142,6 +164,13 @@ const expression = `
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
+  const vault = await invoke('GET', '/api/vault/status');
+  if (vault.vault !== 'setup_required') throw new Error('Expected a fresh emulator vault: ' + JSON.stringify(vault));
+  await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
+  const savedSite = await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+  if (!savedSite.success) throw new Error('Cannot save Android vault site');
+  const locked = await invoke('POST', '/api/vault/lock');
+  if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
   return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true};
 })()`;
 let nextId = 0;
