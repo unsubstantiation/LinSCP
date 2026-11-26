@@ -48,6 +48,7 @@ const expression = `
     await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
     const sessions = await invoke('GET', '/api/sessions');
     if (!sessions.sessions?.some(site => site.name === 'android-smoke-vault-site')) throw new Error('Saved site missing after restart');
+    if (sessions.sessions.some(site => site.name.startsWith('android-site-manager/'))) throw new Error('Deleted site manager fixtures returned after restart');
     if (JSON.stringify(sessions).includes('testpass')) throw new Error('Saved site listing exposed password');
     // Authentication against the fixture proves the password was recovered,
     // without exposing it through the list API.
@@ -576,6 +577,35 @@ const expression = `
   await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
   const savedSite = await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
+  async function verifyAndroidSiteManager() {
+    const session = {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'};
+    for (const name of ['android-site-manager/team', 'android-site-manager/team/one', 'android-site-manager/team/nested/two', 'android-site-manager/teamwork/other']) {
+      await invoke('POST', '/api/sessions/save', {name, session});
+    }
+    const names = async () => (await invoke('GET', '/api/sessions')).sessions.map(site => site.name).sort();
+    let conflict = false;
+    try { await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/team', new_name: 'android-site-manager/teamwork', folder: true}); }
+    catch (error) { conflict = error.status === 409; }
+    if (!conflict) throw new Error('Conflicting folder rename was not refused');
+    const renamed = await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/team', new_name: 'android-site-manager/edge', folder: true});
+    if (renamed.renamed !== 2) throw new Error('Unexpected folder rename count: ' + JSON.stringify(renamed));
+    await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/edge/one', new_name: 'android-site-manager/edge/primary'});
+    const found = await names();
+    for (const name of ['android-site-manager/team', 'android-site-manager/edge/primary', 'android-site-manager/edge/nested/two', 'android-site-manager/teamwork/other']) {
+      if (!found.includes(name)) throw new Error('Site rename lost ' + name);
+    }
+    if (found.includes('android-site-manager/team/one') || found.includes('android-site-manager/edge/one')) throw new Error('Old site name survived rename');
+    const connected = await invoke('POST', '/api/tabs/open', {site_name: 'android-site-manager/edge/primary'});
+    if (!connected.tab?.connected) throw new Error('Renamed site did not retain working credentials');
+    await invoke('POST', '/api/tabs/close', {tab: connected.tab.id});
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/edge', folder: true});
+    const remaining = await names();
+    if (remaining.some(name => name.startsWith('android-site-manager/edge/')) || !remaining.includes('android-site-manager/team') || !remaining.includes('android-site-manager/teamwork/other')) throw new Error('Folder delete affected wrong sites');
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/team'});
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/teamwork', folder: true});
+    if ((await names()).some(name => name.startsWith('android-site-manager/'))) throw new Error('Site deletion failed');
+  }
+  await verifyAndroidSiteManager();
   const locked = await invoke('POST', '/api/vault/lock');
   if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
   return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true};
