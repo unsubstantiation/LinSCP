@@ -80,17 +80,60 @@ for secret in (b'android-smoke-vault-site', b'testuser', b'testpass', b'127.0.0.
     assert secret not in sessions, 'saved site metadata appeared in plaintext'
 PYCODE
 # Force-stop actually destroys the app process and its in-memory vault key.
-adb shell am force-stop "$application"
-adb shell am start -n "$application/.MainActivity"
-for _ in $(seq 1 90); do
-  pid=$(adb shell pidof "$application" | tr -d '\r' || true)
-  if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
-  sleep 1
+restart_and_run() {
+  local phase=$1
+  adb shell am force-stop "$application"
+  adb shell am start -n "$application/.MainActivity"
+  for _ in $(seq 1 90); do
+    pid=$(adb shell pidof "$application" | tr -d '\r' || true)
+    if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
+    sleep 1
+  done
+  if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
+  adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase"; then
+    adb logcat -d --pid="$pid" -t 200 || true
+    exit 1
+  fi
+}
+restart_and_run reopen-vault
+
+# Snapshot after reconnect, which may update the site's last-used metadata.
+# The emulator is disposable; run-as is debug-only and does not expose a
+# production UI or add a test hook to the application.
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
+tampered=$(mktemp)
+observed=$(mktemp)
+trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed"' EXIT
+for target in key sessions; do
+  adb shell am force-stop "$application"
+  if [[ "$target" == key ]]; then original=$key_file; dest=sessions.key; else original=$sessions_file; dest=sessions.ini; fi
+  python3 - "$target" "$original" "$tampered" <<'PYCODE'
+import pathlib, sys
+target, src, dst = sys.argv[1:]
+data = bytearray(pathlib.Path(src).read_bytes())
+if target == 'key':
+    assert data.startswith(b'LSCPKST1') and len(data) > 36
+    data[-1] ^= 1  # corrupt the GCM authentication tag, not the format marker
+else:
+    marker = b'LSCP-SESSION-VAULT-1$'
+    assert data.startswith(marker) and len(data) > len(marker) + 8
+    i = len(marker) + 4
+    data[i] = ord('A') if data[i] != ord('A') else ord('B')
+pathlib.Path(dst).write_bytes(data)
+PYCODE
+  adb shell run-as "$application" sh -c "'cat > config/$dest'" < "$tampered"
+  restart_and_run "tampered-$target"
+  adb exec-out run-as "$application" cat "$sandbox/config/$dest" > "$observed"
+  cmp "$tampered" "$observed" || { echo "Damaged $dest was modified after refusal" >&2; exit 1; }
+  # The other member of the pair must also remain unchanged.
+  if [[ "$target" == key ]]; then other=sessions.ini; other_original=$sessions_file; else other=sessions.key; other_original=$key_file; fi
+  adb exec-out run-as "$application" cat "$sandbox/config/$other" > "$observed"
+  cmp "$other_original" "$observed" || { echo "Unmodified $other changed after refusal" >&2; exit 1; }
+  adb shell am force-stop "$application"
+  adb shell run-as "$application" sh -c "'cat > config/$dest'" < "$original"
 done
-if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
-adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
-if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" reopen-vault; then
-  adb logcat -d --pid="$pid" -t 200 || true
-  exit 1
-fi
+# A clean restart must still recover and use the saved credential after restore.
+restart_and_run reopen-vault
 echo "Installed application ID and its install directory verified: $application ($sandbox)"

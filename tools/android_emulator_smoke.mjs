@@ -9,7 +9,8 @@ const application = process.argv[3];
 // Where to record the app-private root the service reported, so the harness can
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
-const reopenVault = process.argv[5] === 'reopen-vault';
+const phase = process.argv[5] || 'initial';
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 let pages;
 for (let i = 0; i < 60; i++) {
@@ -49,7 +50,25 @@ const expression = `
     const root = (await invoke('GET', '/api/status')).local_dir;
     return {root, vaultRestart: true, wrongPasswordRefused: true, savedSiteReconnect: true};
   }
-  if (${JSON.stringify(reopenVault)}) return await verifyAndroidVaultRestart();
+  async function verifyAndroidVaultTampering() {
+    const phase = ${JSON.stringify(phase)};
+    const status = await invoke('GET', '/api/vault/status');
+    if (status.vault !== 'locked') throw new Error('Damaged vault did not start locked');
+    let unlockStatus;
+    try { await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'}); }
+    catch (error) { unlockStatus = error.status; }
+    const expected = phase === 'tampered-key' ? 400 : 500;
+    if (unlockStatus !== expected) throw new Error('Damaged vault unlock did not fail as expected: ' + unlockStatus);
+    if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Damaged vault did not remain locked');
+    let saveStatus;
+    try { await invoke('POST', '/api/sessions/save', {name: 'must-not-replace-store', session: {protocol: 'dav', host: 'invalid.example', username: 'test', password: 'test'}}); }
+    catch (error) { saveStatus = error.status; }
+    if (!saveStatus || saveStatus < 400) throw new Error('Save unexpectedly accepted with damaged vault');
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    return {root, tamperedVaultRefused: phase};
+  }
+  if (${JSON.stringify(phase)} === 'reopen-vault') return await verifyAndroidVaultRestart();
+  if (${JSON.stringify(phase)} === 'tampered-key' || ${JSON.stringify(phase)} === 'tampered-sessions') return await verifyAndroidVaultTampering();
   const caps = window.LinSCPCore.hostCapabilities({host: window});
   for (const bridge of ['safTrees', 'shareIntents', 'foregroundTransfers', 'desktopLaunchers']) {
     if (!caps[bridge]) throw new Error('Native Android capability not registered: ' + bridge);
