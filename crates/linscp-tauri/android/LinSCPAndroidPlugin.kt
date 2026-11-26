@@ -804,9 +804,12 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
     val segments = uri.pathSegments
     val treeIndex = segments.indexOf("tree")
-    val childIndex = segments.indexOf("document")
-    // A tree root can also be spelled /tree/<id>/document/<id>.
-    if (treeIndex < 0 || treeIndex + 1 >= segments.size || childIndex < 0) return documentUri(uri)
+    // The tree ID or a file name can itself be literally "document". Only
+    // the structural separator immediately after the tree ID starts children.
+    if (treeIndex < 0 || treeIndex + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF tree URI")
+    val childIndex = treeIndex + 2
+    if (childIndex >= segments.size) return documentUri(uri)
+    if (segments[childIndex] != "document") throw IllegalArgumentException("Invalid SAF document URI")
     val grantId = segments[treeIndex + 1]
     if (segments.size == childIndex + 2 && segments[childIndex + 1] == grantId) {
       return DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
@@ -814,8 +817,8 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
     var i = childIndex + 1
     while (i < segments.size) {
-      // `document/id/document/id/...` - the pairs repeat, so skip the keyword.
-      if (segments[i] == "document") { i += 1; continue }
+      // Interpret alternating separators and names by position, not value:
+      // a real file or folder may itself be named "document".
       val wanted = segments[i]
       val children = DocumentsContract.buildChildDocumentsUriUsingTree(
         uri, DocumentsContract.getDocumentId(current))
@@ -837,6 +840,10 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val id = found ?: throw IllegalStateException("no document named $wanted in this folder")
       current = DocumentsContract.buildDocumentUriUsingTree(uri, id)
       i += 1
+      if (i < segments.size) {
+        if (segments[i] != "document" || i + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF document URI")
+        i += 1
+      }
     }
     return current
   }

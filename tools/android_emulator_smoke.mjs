@@ -220,6 +220,13 @@ const expression = `
     const own = subdir + '/document/inside.txt';
     const read = await invoke('GET', '/api/local/edit?tab=' + nestedTab + '&path=' + encodeURIComponent(own));
     if (read.content !== 'inside') throw new Error('SAF pane cannot open its direct child');
+    // A literal name equal to the URI separator is still a name.
+    await invoke('POST', '/api/local/mkdir', {tab: nestedTab, name: 'document'});
+    const documentDir = subdir + '/document/document';
+    const docTab = (await invoke('POST', '/api/tabs/local', {local_dir: documentDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: docTab, path: 'document', content: 'literal document'});
+    const literal = await invoke('GET', '/api/local/edit?tab=' + docTab + '&path=document');
+    if (literal.content !== 'literal document') throw new Error('SAF literal document name did not resolve');
     const sibling = tree + '/document/marker.txt';
     for (const method of ['read', 'save']) {
       let refused = false;
