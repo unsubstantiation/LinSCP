@@ -1,0 +1,22 @@
+name: GUI rendering safety validation
+on:
+  push:
+    branches: [arena/cf506e43-linscp]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install and test GUI
+        shell: bash
+        run: |
+          cd ui
+          npm ci > install.log 2>&1 || { tail -100 install.log; exit 1; }
+          npm test > test.log 2>&1 || { tail -100 test.log; echo "::error::$(tail -60 test.log | tr '\n' ' ')"; exit 1; }

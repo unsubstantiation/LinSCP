@@ -2903,6 +2903,22 @@ function options(id) {
   check('a task with no type or status does not empty the queue',
     doc.getElementById('queueList').children.length === 2,
     String(doc.getElementById('queueList').children.length));
+  // IDs and numeric fields are normally service-generated. A malformed IPC
+  // response must not turn them into HTML or executable event handlers.
+  responses['/api/transfers'] = { paused: false, transfers: [
+    { id: '1)\" autofocus onfocus=\"window.__queuePwned=1', status: 'Queued', type: 'Download' },
+    { id: 7, status: 'Running', type: '<img src=x onerror=alert(1)>', source: '<svg/onload=alert(1)>',
+      destination: 'normal', bytes_total: 100, bytes_done: '<img src=x>', percent: '0\" onmouseover=\"window.__queuePwned=1' },
+    { id: 8, status: 'Running', type: 'Download', bytes_total: 100, bytes_done: 100, percent: 300 }
+  ] };
+  await window.refreshQueue();
+  const safeQueue = doc.getElementById('queueList');
+  check('queue rejects invalid identifiers and treats malformed fields as inert text',
+    safeQueue.children.length === 2 && !safeQueue.querySelector('img,svg,[onmouseover],[autofocus]') &&
+      safeQueue.textContent.includes('<img src=x onerror=alert(1)>') &&
+      safeQueue.querySelector('.progress-bar').style.width === '0%', safeQueue.innerHTML);
+  check('queue progress is clamped to the range zero to one hundred',
+    safeQueue.querySelectorAll('.progress-bar')[1].style.width === '100%');
   responses['/api/transfers'] = savedTransfers;
   await window.refreshQueue();
 
@@ -5861,6 +5877,16 @@ function options(id) {
       return origInvokeProps(cmd, args);
     };
     const wfState = window.eval('state');
+    // A tab ID is captured by a closure, never concatenated into JS/HTML.
+    const safeTabs = wfState.tabs, safeActive = wfState.activeTab;
+    wfState.tabs = [{ id: '1)\" onmouseover=\"window.__tabPwned=1', name: '<img src=x onerror=alert(1)>', connected: false }];
+    wfState.activeTab = null;
+    window.renderTabs();
+    check('tab labels and identifiers cannot inject executable markup',
+      !doc.querySelector('#tabStrip img, #tabStrip [onmouseover]') &&
+      doc.getElementById('tabStrip').textContent.includes('<img src=x onerror=alert(1)>'));
+    wfState.tabs = safeTabs; wfState.activeTab = safeActive;
+    window.renderTabs();
     const savedWfRemoteEntries = wfState.remote.entries.slice();
     const savedWfRemoteSel = new Set(wfState.remote.selection);
     const savedWfTabs = wfState.tabs.slice();

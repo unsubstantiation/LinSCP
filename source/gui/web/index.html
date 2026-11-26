@@ -2695,6 +2695,8 @@
 
   function formatBytes(bytes) {
     if (bytes === null || bytes === undefined) return '';
+    bytes = Number(bytes);
+    if (!Number.isFinite(bytes) || bytes < 0) return '';
     if (bytes < 1024) return bytes + ' B';
     if (bytes < 1024 * 1024) return (bytes / 1024).toLocaleString(languageTag, {minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false}) + ' KB';
     if (bytes < 1024 * 1024 * 1024) return (bytes / 1048576).toLocaleString(languageTag, {minimumFractionDigits: 1, maximumFractionDigits: 1, useGrouping: false}) + ' MB';
@@ -2942,7 +2944,8 @@
       }
       div.innerHTML = '<span class="dot ' + (tab.connected ? 'on' : 'off') + '"></span>' +
         '<span>' + escapeHtml(tab.name) + '</span>' +
-        '<span class="tab-close" onclick="event.stopPropagation(); closeTab(' + tab.id + ')">✕</span>';
+        '<span class="tab-close">✕</span>';
+      div.querySelector('.tab-close').onclick = (event) => { event.stopPropagation(); closeTab(tab.id); };
       div.onclick = () => selectTab(tab.id);
       strip.appendChild(div);
     }
@@ -7718,7 +7721,7 @@
     const data = await apiGet('/api/transfers');
     if (!data) return;
     state.queue = Array.isArray(data.transfers)
-      ? data.transfers.filter(task => task && typeof task === 'object')
+      ? data.transfers.filter(task => task && typeof task === 'object' && Number.isSafeInteger(task.id) && task.id >= 0)
       : [];
     state.paused = !!data.paused;
     syncForegroundService();
@@ -7738,7 +7741,8 @@
       // A task with no status would throw out of the queue refresh, which
       // stopped every later transfer from being listed at all.
       const status = String(task.status === undefined || task.status === null ? '' : task.status);
-      const percent = task.percent || 0;
+      const rawPercent = Number(task.percent);
+      const percent = Number.isFinite(rawPercent) ? Math.max(0, Math.min(100, rawPercent)) : 0;
       const speedText = status === 'Running' && task.speed_bps > 0
         ? ' · ' + formatBytes(task.speed_bps) + '/s'
         : '';
