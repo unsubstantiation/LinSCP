@@ -29,10 +29,8 @@ def click(node):
 
 
 def open_directory(node):
-    # Focus a card and activate it. Some DocumentsUI builds treat a touch as
-    # selection rather than navigation in the tree picker.
+    # Tap the text within the directory's clickable card.
     click(node)
-    adb('shell', 'input', 'keyevent', 'KEYCODE_ENTER')
 
 
 def main():
@@ -53,31 +51,31 @@ def main():
             return next((n for n in nodes if n.get('text') in labels or n.get('content-desc') in labels), None)
         if used:
             allow = matching('Allow')
-            if allow:
+            if allow is not None:
                 click(allow)
                 print('Granted fixture folder via Android DocumentsUI')
                 return
         if visited_folder:
             use = matching('Use this folder', 'USE THIS FOLDER')
-            if use and use.get('enabled') == 'true':
+            if use is not None and use.get('enabled') == 'true':
                 click(use)
                 used = True
                 continue
         folder = matching('LinSCP-Ungranted-Smoke')
-        if folder:
+        if folder is not None:
             open_directory(folder)
             visited_folder = True
             continue
         docs = matching('Documents')
-        if docs:
+        if docs is not None:
             open_directory(docs)
             continue
         storage = matching('Internal storage', 'sdk_gphone64_x86_64', 'sdk_gphone64_arm64')
-        if storage:
+        if storage is not None:
             click(storage)
             continue
         menu = matching('Show roots', 'Open navigation drawer', 'Browse')
-        if menu:
+        if menu is not None:
             click(menu)
             continue
     print('Could not select test SAF folder; recent screens:', history[-8:], file=sys.stderr)
