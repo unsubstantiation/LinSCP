@@ -40,7 +40,7 @@
     "policy": "A status of 'verified' means the behavior was checked, not that it looked right while somebody was reading the code. So an entry carries 'verified_on': for each platform LinSCP ships on, the suites whose tests cover it. LinSCP ships on Linux, Windows, and Android - the Rust workspace plus Tauri v2 - so an entry may be 'verified' only when 'linux', 'windows' and 'android' appear in that map naming the suites that actually ran it. The rule is still written for any number of platforms, and a suite that is not listed under a platform cannot be cited for it, because evidence nobody can reproduce is not evidence. The notes stay authoritative about what is missing either way - evidence for the parts that are covered does not certify the rest, which is why --require-full fails while any entry is not verified. A suite flagged not runnable under a platform executes no case there and cannot be cited for it; a capability's citations name only suites whose cases its checks list.",
     "platforms": {
       "linux": {
-        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-watcher, engine-xml, engine-scp, engine-script, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "debian-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); `cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri` (platform-signals, proto-ssh, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-watcher, engine-xml, engine-scp, engine-script, engine-editor, backup, vault-password) and `cargo test -p linscp-service` (service, service-commands, service-tabs); dpkg-buildpackage runs debian/rules, which runs `cargo test --workspace --all-targets` (gui-cli, gui-shell-actions, gui-shell-definitions); `python3 tools/check_upstream_parity.py` and the repo-state suites tools/tests/test_parity_inventory.py, test_platform_conversion.py, test_wayland_compatibility.py, test_translations.py and test_repo_hygiene.py; the file-manager smoke drives the installed linscp-gui the way a file manager does. Evidence is an exit-0 run with failed=0 - a failing suite exits non-zero, and its `evidence:` line is not evidence. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-15",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -81,7 +81,8 @@
           "engine-ftp-ascii": "Loopback FTP STOU text upload through the engine, including conversion, progress and refusal of conflicting destination guards.",
           "engine-conditional-resume": "crates/linscp-engine/tests/ordinary_conditional_resume.rs - loopback WebDAV and S3 conditional prefix comparison, stale and weak ETag refusal, concurrent source change and direct partial refusal.",
           "engine-watcher": "crates/linscp-engine/src/keepuptodate.rs - native watcher installation failure injected into the engine and timed fallback synchronization against a local destination.",
-          "engine-xml": "crates/linscp-engine/src/xml_log.rs - XML and text logging unit tests, including multiple credential-bearing URLs in failure messages."
+          "engine-xml": "crates/linscp-engine/src/xml_log.rs - XML and text logging unit tests, including multiple credential-bearing URLs in failure messages.",
+          "platform-signals": "crates/linscp-platform/tests/signal_handling.rs - process-isolated Unix signal tests for interrupted and resize flags and restored SIGINT/SIGTERM default dispositions."
         },
         "not_runnable": {
           "live-curl": "argv-driven: needs a `linscp` binary, but crates/linscp-cli does not exist and test_gui_distribution.py forbids it",
@@ -4507,7 +4508,7 @@
       "id": "platform.posix-runtime-services",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from upstream POSIX runtime services and does not use the retired curl subprocess. Linux and Windows host tests exercise bounded SSH exec capture over a mock server, including interleaved stdout/stderr, a combined limit, timeout, and connection reuse; that is not a local child-process test.",
+      "notes": "Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from upstream POSIX runtime services and does not use the retired curl subprocess. Linux and Windows host tests exercise bounded SSH exec capture over a mock server, including interleaved stdout/stderr, a combined limit, timeout, and connection reuse; that is not a local child-process test. An isolated Linux subprocess checks SIGINT, SIGTERM and SIGWINCH delivery, flag clearing, inherited-ignore reset, and restored default termination.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
         "crates/linscp-platform/src/terminal.rs",
@@ -4524,13 +4525,17 @@
         "proto-ssh": [
           "bounded_exec_interleaves_streams_and_enforces_combined_limit",
           "bounded_exec_collects_caps_and_closes_without_killing_ssh"
+        ],
+        "platform-signals": [
+          "posix_watch_signal_handlers_are_isolated_and_restore_defaults"
         ]
       },
       "verified_on": {
         "linux": [
           "unit",
           "platform-linux",
-          "proto-ssh"
+          "proto-ssh",
+          "platform-signals"
         ],
         "windows": [
           "unit",
@@ -4541,10 +4546,10 @@
           "platform-linux"
         ]
       },
-      "gap": "The upstream unit suite has no build target. Host tests cover platform filesystem/configuration and bounded mock-SSH exec output, but do not exercise local child stdout/stderr capture, process-wide signal handling, real SSH servers, or Android runtime behavior.",
+      "gap": "Linux host tests cover isolated signal handling as well as filesystem/configuration, and Linux/Windows tests cover bounded mock-SSH exec output. Local child stdout/stderr capture, real SSH servers, Windows console control events, and Android runtime behavior remain unverified.",
       "acceptance": [
         "If local child output capture remains a supported requirement, test the actual child-process path with simultaneous stdout and stderr output.",
-        "Test signal handling in an isolated process and validate relevant runtime behavior on an Android device."
+        "Validate Windows console control events and relevant runtime behavior on an Android device."
       ]
     },
     {

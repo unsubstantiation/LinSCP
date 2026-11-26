@@ -95,6 +95,7 @@ CASE_SOURCES = {
     # configuration directory the desktop expects. The file is Linux-only, so a Windows build
     # carries none of these cases.
     "platform-linux": "crates/linscp-platform/src/linux.rs",
+    "platform-signals": "crates/linscp-platform/tests/signal_handling.rs",
     # The SSH/SFTP/SCP/tunnel protocol behaviour against the mock server.
     # Android runs no Rust tests, so Android rows cite other suites instead.
     "proto-ssh": "crates/linscp-proto/tests/ssh_sftp_scp_tunnel.rs",
@@ -404,7 +405,7 @@ def check_capabilities(inventory, errors, root=ROOT):
                     expression = r"\btest\(\s*['\"]" + re.escape(case) + r"['\"]"
                 elif suite in ("service", "service-commands", "gui-cli",
                                "gui-shell-definitions", "gui-shell-actions",
-                               "platform-windows-acl", "platform-linux", "proto-ssh", "proto-ftp",
+                               "platform-windows-acl", "platform-linux", "platform-signals", "proto-ssh", "proto-ftp",
                                "proto-dav-s3", "proto-webdav", "proto-hostkey", "proto-scp",
                                "engine-sftp", "engine-watcher", "engine-xml", "engine-dav-ascii", "engine-ftp-ascii", "engine-conditional-resume", "engine-scp", "engine-script", "engine-editor",
                                "vault-password", "service-tabs"):

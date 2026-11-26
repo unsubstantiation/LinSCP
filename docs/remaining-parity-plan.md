@@ -428,14 +428,14 @@ An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
 
 **Area:** Packaging/platforms · **Status:** partial
 
-Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from upstream POSIX runtime services and does not use the retired curl subprocess. Linux and Windows host tests exercise bounded SSH exec capture over a mock server, including interleaved stdout/stderr, a combined limit, timeout, and connection reuse; that is not a local child-process test.
+Linux provides private filesystem and configuration helpers and signal handling. The native implementation differs from upstream POSIX runtime services and does not use the retired curl subprocess. Linux and Windows host tests exercise bounded SSH exec capture over a mock server, including interleaved stdout/stderr, a combined limit, timeout, and connection reuse; that is not a local child-process test. An isolated Linux subprocess checks SIGINT, SIGTERM and SIGWINCH delivery, flag clearing, inherited-ignore reset, and restored default termination.
 
-**Next:** The upstream unit suite has no build target. Host tests cover platform filesystem/configuration and bounded mock-SSH exec output, but do not exercise local child stdout/stderr capture, process-wide signal handling, real SSH servers, or Android runtime behavior.
+**Next:** Linux host tests cover isolated signal handling as well as filesystem/configuration, and Linux/Windows tests cover bounded mock-SSH exec output. Local child stdout/stderr capture, real SSH servers, Windows console control events, and Android runtime behavior remain unverified.
 
 **Acceptance criteria:**
 
 - [ ] If local child output capture remains a supported requirement, test the actual child-process path with simultaneous stdout and stderr output.
-- [ ] Test signal handling in an isolated process and validate relevant runtime behavior on an Android device.
+- [ ] Validate Windows console control events and relevant runtime behavior on an Android device.
 
 ## platform.terminal-and-console
 
