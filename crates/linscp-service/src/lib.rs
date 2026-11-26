@@ -13500,7 +13500,9 @@ fn resolve_editor_local_path(base: &str, raw_path: &str) -> Result<String, Strin
         // Like a native path, an absolute SAF editor target must be a direct
         // child of this pane, not merely somewhere under the same tree grant.
         // Compare the URI's structured document segments; string-prefix checks
-        // would confuse sibling names and escaped separators.
+        // would confuse sibling names and escaped separators. This is a lexical
+        // check: provider document IDs can be opaque aliases, so it is not an
+        // authorization boundary for opaque DocumentsProvider IDs.
         if parsed_target.tree_uri() != parsed_base.tree_uri()
             || parsed_target.documents.len() != parsed_base.documents.len() + 1
             || parsed_target.documents[..parsed_base.documents.len()] != parsed_base.documents[..]

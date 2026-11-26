@@ -481,13 +481,13 @@ LinSCP is a Linux-only client and the check that says so is part of the build: t
 
 **Area:** Packaging/platforms · **Status:** partial
 
-Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks file properties and the edited bytes outside the app, and reopens the granted folder after a process restart.
+Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks file properties and the edited bytes outside the app, and reopens the granted folder after a process restart. Structured SAF editor URIs must name an immediate child of the active pane; host tests cover both panes and the emulator tests a sibling read/write refusal. This is lexical validation, not an authorization boundary against opaque provider document-ID aliases.
 
-**Next:** The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Other providers, directory properties, revoked access races, large documents and physical-device behavior are unverified.
+**Next:** The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Provider document-ID aliases can bypass lexical pane containment; other providers, directory properties, revoked access races, large documents and physical-device behavior are unverified.
 
 **Acceptance criteria:**
 
-- [ ] Validate properties and provider error cases, including revoked permissions and large files, on different DocumentsProviders and physical Android devices.
+- [ ] Enforce provider-aware pane containment for opaque document IDs; validate properties and provider error cases, including revoked permissions and large files, on different DocumentsProviders and physical Android devices.
 
 ## platform.android-saf-local-copy-move
 
@@ -598,13 +598,13 @@ RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-de
 
 **Area:** Packaging/platforms · **Status:** partial
 
-Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders.
+Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and one keep-up-to-date pass.
 
-**Next:** Host-side mock-bridge tests cover a second timed polling pass and cancellation, but no suite has planned against or published into a real DocumentsProvider. Provider behavior (mtime fidelity after a publish, nested document URIs, large-tree walk time, and polling cadence) remains unproven on a device.
+**Next:** The emulator exercises single-file synchronization and one polling pass with the external-storage DocumentsProvider and a WebDAV fixture. Nested trees, over-cap files, timed second passes, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.
 
 **Acceptance criteria:**
 
-- [ ] Synchronize both directions with delete against a granted folder on an Android device or emulator, covering a checksum comparison, the over-cap refusal and one keep-up-to-date pass.
+- [ ] Validate nested-tree synchronization, document-cap refusal, timed repeated polling and cancellation with real providers and physical devices.
 
 ## Cross-cutting release gate
 
