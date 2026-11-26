@@ -193,7 +193,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -3325,20 +3325,24 @@
       "id": "security.gui-api-token",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths.",
+      "notes": "The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView.",
       "source": [
         "crates/linscp-tauri/src/lib.rs",
         "crates/linscp-service/src/lib.rs",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "tools/android_emulator_smoke.mjs"
       ],
       "checks": {
         "gui": [
           "tab labels and identifiers cannot inject executable markup",
           "queue rejects invalid identifiers and treats malformed fields as inert text",
           "queue progress is clamped to the range zero to one hundred"
+        ],
+        "android-emulator": [
+          "verifyAndroidWebViewRendering"
         ]
       },
-      "gap": "The GUI cases run in jsdom with a mock backend, not a packaged WebView. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; the native-shell IPC path, remaining rendering surfaces, and Android device behavior need security validation.",
+      "gap": "The Android WebView smoke covers file-pane rendering from a real IPC listing and injected tab/queue data; it does not establish IPC isolation. Desktop GUI cases use jsdom with a mock backend. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; other rendering surfaces, untrusted web content and physical-device behavior need security validation.",
       "acceptance": [
         "Exercise packaged desktop and Android IPC boundaries, including attempts from untrusted web content and local processes.",
         "Audit and test the remaining untrusted-data rendering surfaces, and validate the absence of any unintended API listener in the shipped application."
@@ -3349,6 +3353,9 @@
         ],
         "windows": [
           "gui"
+        ],
+        "android": [
+          "android-emulator"
         ]
       }
     },

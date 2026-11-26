@@ -193,9 +193,9 @@ SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; w
 
 **Area:** Security/authentication · **Status:** partial
 
-The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths.
+The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView.
 
-**Next:** The GUI cases run in jsdom with a mock backend, not a packaged WebView. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; the native-shell IPC path, remaining rendering surfaces, and Android device behavior need security validation.
+**Next:** The Android WebView smoke covers file-pane rendering from a real IPC listing and injected tab/queue data; it does not establish IPC isolation. Desktop GUI cases use jsdom with a mock backend. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; other rendering surfaces, untrusted web content and physical-device behavior need security validation.
 
 **Acceptance criteria:**
 
