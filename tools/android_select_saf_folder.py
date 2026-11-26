@@ -29,17 +29,17 @@ def click(node):
 
 
 def open_directory(node):
-    # DocumentsUI's grid uses a double-tap to open a folder; one tap can
-    # merely select the card rather than navigating into it.
+    # Focus a card and activate it. Some DocumentsUI builds treat a touch as
+    # selection rather than navigation in the tree picker.
     click(node)
-    time.sleep(0.12)
-    click(node)
+    adb('shell', 'input', 'keyevent', 'KEYCODE_ENTER')
 
 
 def main():
     visited_folder = False
     used = False
     last = ''
+    history = []
     for _ in range(45):
         time.sleep(1)
         try:
@@ -48,6 +48,7 @@ def main():
         except (subprocess.SubprocessError, ET.ParseError):
             continue
         nodes = list(root.iter('node'))
+        history.append([(n.get('text') or n.get('content-desc'), n.get('bounds')) for n in nodes if n.get('text') or n.get('content-desc')])
         def matching(*labels):
             return next((n for n in nodes if n.get('text') in labels or n.get('content-desc') in labels), None)
         if used:
@@ -79,7 +80,7 @@ def main():
         if menu:
             click(menu)
             continue
-    print('Could not select test SAF folder; last DocumentsUI hierarchy:', last, file=sys.stderr)
+    print('Could not select test SAF folder; recent screens:', history[-8:], file=sys.stderr)
     raise SystemExit(1)
 
 
