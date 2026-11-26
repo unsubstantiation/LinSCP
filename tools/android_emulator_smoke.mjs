@@ -10,7 +10,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 let pages;
 for (let i = 0; i < 60; i++) {
@@ -67,6 +67,45 @@ const expression = `
     const root = (await invoke('GET', '/api/status')).local_dir;
     return {root, tamperedVaultRefused: phase};
   }
+  async function verifyAndroidFullBackupRestore() {
+    if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Expected locked vault before backup test');
+    await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
+    const backupPassword = 'independent android backup password';
+    const backup = await invoke('POST', '/api/backup/export', {password: backupPassword});
+    if (!backup.success || !backup.data_base64 || !atob(backup.data_base64).startsWith('LSCPBAK1')) throw new Error('Invalid encrypted backup envelope');
+    const encrypted = atob(backup.data_base64);
+    for (const secret of ['android-smoke-vault-site', 'testuser', 'testpass']) {
+      if (encrypted.includes(secret)) throw new Error('Backup exposed site metadata in plaintext');
+    }
+    await invoke('POST', '/api/sessions/save', {name: 'after-backup-site', session: {protocol: 'sftp', host: 'after-backup.example', username: 'other'}});
+    async function names() { return (await invoke('GET', '/api/sessions')).sessions.map(site => site.name).sort(); }
+    const expectedBefore = JSON.stringify(['after-backup-site', 'android-smoke-vault-site'].sort());
+    if (JSON.stringify(await names()) !== expectedBefore) throw new Error('Backup precondition sites missing');
+    async function rejected(body, expected, label) {
+      let status;
+      try { await invoke('POST', '/api/backup/import', body); } catch (error) { status = error.status; }
+      if (status !== expected) throw new Error(label + ' returned unexpected status: ' + status);
+      if (JSON.stringify(await names()) !== expectedBefore) throw new Error(label + ' altered saved sites');
+    }
+    const good = {password: backupPassword, data_base64: backup.data_base64, confirm_replace: true};
+    await rejected({...good, confirm_replace: false}, 400, 'Unconfirmed restore');
+    await rejected({...good, password: 'incorrect backup password'}, 400, 'Wrong backup password');
+    const tamperedBytes = Uint8Array.from(encrypted, c => c.charCodeAt(0));
+    tamperedBytes[tamperedBytes.length - 1] ^= 1;
+    const tamperedBase64 = btoa(Array.from(tamperedBytes, b => String.fromCharCode(b)).join(''));
+    await rejected({...good, data_base64: tamperedBase64}, 400, 'Corrupted backup');
+    const connected = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!connected.tab?.connected) throw new Error('Cannot connect for active-session restore guard');
+    await rejected(good, 409, 'Restore with an active remote session');
+    await invoke('POST', '/api/tabs/close', {tab: connected.tab.id});
+    const restored = await invoke('POST', '/api/backup/import', good);
+    if (!restored.success || JSON.stringify(await names()) !== JSON.stringify(['android-smoke-vault-site'])) throw new Error('Restored saved sites differ from backup');
+    const reopened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!reopened.tab?.connected) throw new Error('Restored saved credentials cannot connect');
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    return {root, backupRestore: true, restoreRefusals: true};
+  }
+  if (${JSON.stringify(phase)} === 'backup-restore') return await verifyAndroidFullBackupRestore();
   if (${JSON.stringify(phase)} === 'reopen-vault') return await verifyAndroidVaultRestart();
   if (${JSON.stringify(phase)} === 'tampered-key' || ${JSON.stringify(phase)} === 'tampered-sessions') return await verifyAndroidVaultTampering();
   const caps = window.LinSCPCore.hostCapabilities({host: window});
@@ -216,7 +255,7 @@ for (let i = 0; i < 60 && stable < 2; i++) {
   if (stable < 2) await new Promise(resolve => setTimeout(resolve, 1000));
 }
 assert.equal(stable, 2, 'WebView did not become ready');
-const reply = await evaluate(expression, 120000);
+const reply = await evaluate(expression, phase === 'backup-restore' ? 300000 : 120000);
 socket.close();
 if (reply.error || reply.result?.exceptionDetails) throw new Error(JSON.stringify(reply));
 if (rootFile) writeFileSync(rootFile, String(reply.result.result.value.root));

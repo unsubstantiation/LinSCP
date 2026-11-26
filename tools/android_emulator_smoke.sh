@@ -136,4 +136,14 @@ PYCODE
 done
 # A clean restart must still recover and use the saved credential after restore.
 restart_and_run reopen-vault
+# Exercise backup restore in a fresh process and ensure its transaction keeps
+# the existing device-bound key. The next restart verifies persisted recovery.
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
+restart_and_run backup-restore
+adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$observed"
+cmp "$key_file" "$observed" || { echo "Full restore changed the destination Keystore-wrapped key" >&2; exit 1; }
+if adb shell run-as "$application" test -e "$sandbox/config/.full-restore-journal"; then
+  echo "Full restore left a pending journal" >&2; exit 1
+fi
+restart_and_run reopen-vault
 echo "Installed application ID and its install directory verified: $application ($sandbox)"
