@@ -124,6 +124,7 @@
   "Automatic": "Automático",
   "Automatic (MLSD when supported)": "Automático (MLSD si se admite)",
   "Automatic (decide per file)": "Automático (decidir por archivo)",
+  "Automatic (site and matching rules)": "Automático (sitio y reglas coincidentes)",
   "Automatic by mask": "Automático por máscara",
   "Automatic reconnection failed for {name}.": "Falló la reconexión automática de {name}.",
   "Automatically use saved user password for sudo prompts": "Usar automáticamente la contraseña de usuario guardada para solicitudes de sudo",

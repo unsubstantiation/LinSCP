@@ -2167,7 +2167,8 @@
           <div class="form-grid-2">
             <div class="field-stack"><label for="transferPresetSelect">Preset:</label>
               <select id="transferPresetSelect" class="select-field" onchange="selectTransferPreset()">
-                <option value="">None (manual settings)</option>
+                <option value="">Automatic (site and matching rules)</option>
+                <option value="off">None (manual settings)</option>
               </select>
             </div>
             <div class="field-stack"><label for="transferPresetName">Preset name:</label>
@@ -10980,8 +10981,12 @@
       sel.innerHTML = '';
       const noneOpt = document.createElement('option');
       noneOpt.value = '';
-      noneOpt.textContent = t('None (manual settings)');
+      noneOpt.textContent = t('Automatic (site and matching rules)');
       sel.appendChild(noneOpt);
+      const offOpt = document.createElement('option');
+      offOpt.value = 'off';
+      offOpt.textContent = t('None (manual settings)');
+      sel.appendChild(offOpt);
       for (const preset of transferPresets) {
         if (!preset || !preset.name) continue;
         const opt = document.createElement('option');
@@ -10989,7 +10994,7 @@
         opt.textContent = preset.name;
         sel.appendChild(opt);
       }
-      sel.value = transferPresets.some(p => p && p.name === current) ? current : '';
+      sel.value = current === 'off' || transferPresets.some(p => p && p.name === current) ? current : '';
     }
     const dl = $('transferPresetDatalist');
     if (dl) {
@@ -11046,9 +11051,9 @@
 
   function selectTransferPreset() {
     const name = ($('transferPresetSelect') && $('transferPresetSelect').value) || '';
-    if ($('transferPresetName')) $('transferPresetName').value = name;
+    if ($('transferPresetName')) $('transferPresetName').value = name === 'off' ? '' : name;
     transferSettings.preset = name;
-    if (!name) {
+    if (!name || name === 'off') {
       transferSettings.permissions = '';
       transferSettings.preserveTimeDirs = false;
       clearTransferPresetRuleFields();

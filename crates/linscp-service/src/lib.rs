@@ -4856,10 +4856,20 @@ impl CommanderService {
             Some(names) if !names.is_empty() && names.len() <= 1000 => names,
             _ => return api_error(400, "Select at least one file"),
         };
-        let cfg_root = self.config_root();
-        let preset_store = linscp_engine::presets::TransferPresetStore::load_from_dir(&cfg_root).unwrap_or_default();
         let requested_preset_raw = body.get("preset").and_then(Value::as_str).unwrap_or("").trim();
-        let matched_preset: Option<linscp_engine::presets::TransferPreset> = if requested_preset_raw.eq_ignore_ascii_case("off") || requested_preset_raw.eq_ignore_ascii_case("none") {
+        let presets_disabled = requested_preset_raw.eq_ignore_ascii_case("off") || requested_preset_raw.eq_ignore_ascii_case("none");
+        // A damaged preset store can contain safety-critical filters or transfer
+        // modes. Never silently substitute defaults. An explicit per-request
+        // opt-out does not depend on the stored settings.
+        let preset_store = if presets_disabled {
+            linscp_engine::presets::TransferPresetStore::default()
+        } else {
+            match linscp_engine::presets::TransferPresetStore::load_from_dir(&self.config_root()) {
+                Ok(store) => store,
+                Err(error) => return api_error(500, format!("Cannot load transfer presets: {error}")),
+            }
+        };
+        let matched_preset: Option<linscp_engine::presets::TransferPreset> = if presets_disabled {
             None
         } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
             match preset_store.find(requested_preset_raw).cloned() {
@@ -4869,7 +4879,10 @@ impl CommanderService {
         } else {
             let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
             if !site_preset_name.is_empty() && !site_preset_name.eq_ignore_ascii_case("off") && !site_preset_name.eq_ignore_ascii_case("none") {
-                preset_store.find(site_preset_name).cloned()
+                match preset_store.find(site_preset_name).cloned() {
+                    Some(preset) => Some(preset),
+                    None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
+                }
             } else {
                 let first_name = names.first().and_then(Value::as_str).unwrap_or("");
                 let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
@@ -4932,11 +4945,13 @@ impl CommanderService {
         }
         let parsed_mask = if mask_raw.is_empty() {
             if !move_item {
-                matched_preset
-                    .as_ref()
-                    .filter(|p| !p.mask.is_empty())
-                    .and_then(|p| linscp_engine::filemask::FileMask::parse(&p.mask).ok())
-                    .unwrap_or_default()
+                match matched_preset.as_ref().filter(|p| !p.mask.is_empty()) {
+                    Some(preset) => match linscp_engine::filemask::FileMask::parse(&preset.mask) {
+                        Ok(mask) => mask,
+                        Err(error) => return api_error(400, format!("Invalid transfer preset mask: {error}")),
+                    },
+                    None => linscp_engine::filemask::FileMask::default(),
+                }
             } else {
                 linscp_engine::filemask::FileMask::default()
             }
@@ -15266,6 +15281,49 @@ mod tests {
             mismatch.payload
         );
         let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn transfer_presets_fail_closed_on_corrupt_store_and_missing_site_preset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cfg = tmp.path().join("config");
+        let left = tmp.path().join("left");
+        let right = tmp.path().join("right");
+        for dir in [&cfg, &left, &right] { std::fs::create_dir_all(dir).unwrap(); }
+        std::fs::write(left.join("data.txt"), b"content").unwrap();
+        let preset_path = cfg.join("transfer-presets.ini");
+        let bad = b"[broken\nmask = *.txt\n";
+        std::fs::write(&preset_path, bad).unwrap();
+        let svc = CommanderService::new(cfg.clone(), Arc::new(NativeLocalFs::new()));
+        let id = svc.create_local_tab(left.to_string_lossy().into_owned(), right.to_string_lossy().into_owned()).payload["tab"]["id"].as_u64().unwrap();
+        let request = |preset: &str| ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": right, "names": ["data.txt"], "preset": preset}) };
+        for preset in ["", "auto", "missing"] {
+            let result = svc.dispatch_async(request(preset)).await;
+            assert_eq!(result.status, 500, "{}", result.payload);
+            assert!(result.payload["error"].as_str().unwrap().contains("Cannot load transfer presets"));
+            assert!(svc.queue.snapshot().0.is_empty());
+            assert!(!right.join("data.txt").exists());
+            assert_eq!(std::fs::read(&preset_path).unwrap(), bad);
+        }
+        std::fs::remove_file(&preset_path).unwrap();
+        {
+            let mut state = svc.state.lock().unwrap();
+            let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+            spec.preset_name = "deleted-preset".into();
+            state.tabs.get_mut(&id).unwrap().spec = Some(spec);
+        }
+        let missing = svc.dispatch_async(request("auto")).await;
+        assert_eq!(missing.status, 400, "{}", missing.payload);
+        assert!(missing.payload["error"].as_str().unwrap().contains("deleted-preset"));
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert!(!right.join("data.txt").exists());
+        // Explicit per-transfer opt-out is honored even with a damaged store.
+        std::fs::write(&preset_path, bad).unwrap();
+        let approved = svc.dispatch_async(request("off")).await;
+        assert_eq!(approved.status, 200, "{}", approved.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(std::fs::read(right.join("data.txt")).unwrap(), b"content");
+        assert_eq!(std::fs::read(&preset_path).unwrap(), bad);
     }
 
     #[tokio::test]

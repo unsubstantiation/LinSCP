@@ -586,6 +586,7 @@
     "Automatic": "Automatisch",
     "Automatic (MLSD when supported)": "Automatisch (MLSD wenn unterstützt)",
     "Automatic (decide per file)": "Automatisch (pro Datei entscheiden)",
+    "Automatic (site and matching rules)": "Automatisch (Server und passende Regeln)",
     "Automatic by mask": "Automatisch nach Maske",
     "Automatic reconnection failed for {name}.": "Automatische Wiederverbindung für {name} fehlgeschlagen.",
     "Automatically use saved user password for sudo prompts": "Gespeichertes Benutzerpasswort automatisch für sudo-Abfragen verwenden",

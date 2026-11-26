@@ -5642,6 +5642,15 @@ function options(id) {
     check('loadTransferPresets renders auto-matched preset banner for current tab',
       doc.getElementById('transferPresetMatchedHint').style.display === 'flex' &&
       doc.getElementById('transferPresetMatchedHint').textContent.includes('ProdWeb'));
+    const presetSelect = doc.getElementById('transferPresetSelect');
+    presetSelect.value = 'off';
+    window.selectTransferPreset();
+    check('manual preset opt-out sends off to the backend', window.transferOptions().preset === 'off');
+    await window.loadTransferPresets();
+    check('manual preset opt-out survives reloading presets', presetSelect.value === 'off');
+    presetSelect.value = '';
+    window.selectTransferPreset();
+    check('automatic preset selection leaves matching enabled', !('preset' in window.transferOptions()));
     window.applyMatchedTransferPreset();
     check('applyMatchedTransferPreset populates permissions, octal mode, EOL, preserve_time=all, and auto-selection rules',
       doc.getElementById('transferPresetSelect').value === 'ProdWeb' &&
