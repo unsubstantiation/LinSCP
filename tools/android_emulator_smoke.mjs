@@ -93,11 +93,56 @@ const expression = `
   const resumedTab = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-resume', remote_dir: root});
   const resumed = await invoke('GET', '/api/local/edit?tab=' + resumedTab.tab.id + '&path=smoke-upload.txt');
   if (resumed.content !== 'Android Rust-backed transfer') throw new Error('Resumed bytes differ');
+  // A stale checkpoint and a changed ETag must leave the checkpoint intact
+  // and never publish a final file. These calls run inside the Android APK
+  // against the disposable WebDAV fixture, not the host-side mock bridge.
+  async function verifyAndroidWebDavResumeRefusals() {
+    async function waitFailed(index) {
+      for (let i = 0; i < 120; i++) {
+        const task = (await invoke('GET', '/api/transfers')).transfers[index];
+        if (task?.status === 'Failed') return task;
+        if (task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Expected resume refusal: ' + JSON.stringify(task));
+        await sleep(250);
+      }
+      throw new Error('Expected failed resume task timed out');
+    }
+    async function makeCheckpoint(dir, partial) {
+      const made = await invoke('POST', '/api/local/mkdir', {tab, name: dir});
+      if (!made.success) throw new Error('Cannot create resume safety directory: ' + dir);
+      const saved = await invoke('POST', '/api/local/save', {path: root + '/' + dir + '/smoke-upload.txt.filepart', content: partial});
+      if (!saved.success) throw new Error('Cannot create resume safety checkpoint');
+    }
+    async function assertCheckpointUnchanged(dir, expected) {
+      const dirPath = root + '/' + dir;
+      const listing = await invoke('GET', '/api/local/list?path=' + encodeURIComponent(dirPath));
+      if (listing.entries?.some(entry => entry.name === 'smoke-upload.txt')) throw new Error('Rejected resume published a final file');
+      const localTab = await invoke('POST', '/api/tabs/local', {local_dir: dirPath, remote_dir: root});
+      const checkpoint = await invoke('GET', '/api/local/edit?tab=' + localTab.tab.id + '&path=smoke-upload.txt.filepart');
+      if (checkpoint.content !== expected) throw new Error('Rejected resume changed its checkpoint');
+    }
+    await makeCheckpoint('smoke-stale', 'incorrect');
+    await invoke('POST', '/api/transfer/download', {tab, local_dir: root + '/smoke-stale', remote_dir: '/', names: ['smoke-upload.txt'], resume: true});
+    const stale = await waitFailed(3);
+    if (!String(stale.error || '').toLowerCase().includes('match')) throw new Error('Stale prefix failed for an unexpected reason: ' + JSON.stringify(stale));
+    await assertCheckpointUnchanged('smoke-stale', 'incorrect');
+
+    await makeCheckpoint('smoke-changed', 'Android');
+    await invoke('POST', '/api/queue/pause');
+    await invoke('POST', '/api/transfer/download', {tab, local_dir: root + '/smoke-changed', remote_dir: '/', names: ['smoke-upload.txt'], resume: true});
+    // Change the remote bytes after the task pins the ETag but before it runs.
+    const changed = await invoke('POST', '/api/remote/save', {tab, path: '/smoke-upload.txt', content: 'Android Xust-backed transfer'});
+    if (!changed.success) throw new Error('Cannot change the remote fixture: ' + JSON.stringify(changed));
+    await invoke('POST', '/api/queue/resume');
+    const changedTask = await waitFailed(4);
+    if (!/etag|precondition|changed/i.test(String(changedTask.error || ''))) throw new Error('Changed representation failed for an unexpected reason: ' + JSON.stringify(changedTask));
+    await assertCheckpointUnchanged('smoke-changed', 'Android');
+  }
+  await verifyAndroidWebDavResumeRefusals();
   const local = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-download', remote_dir: root});
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, conflict: true, externalUriValidation: true};
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {
