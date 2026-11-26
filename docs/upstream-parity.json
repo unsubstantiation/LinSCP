@@ -193,7 +193,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing, properties, WebDAV transfers and synchronization and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing, properties, WebDAV transfers and synchronization and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals, real SSH agent refusal and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -3194,13 +3194,16 @@
     {
       "id": "security.agent-android-refusal",
       "area": "Security/authentication",
-      "status": "partial",
-      "notes": "Agent authentication explains itself when there is no agent to ask. The auth chain asks the connector for a missing reason when its stream comes back empty: SshAgentConnector gains a defaulted missing_reason, SystemSshAgentConnector answers with a platform reason (SSH_AGENT_MISSING_MESSAGE on Android, none where the build probes for a socket), and the reason becomes the terminal error instead of the generic auth failure. The site dialog shows the same story up front through a hostDifferenceReason-backed hint wired to a new bundle sshAgent flag; the hint fails open (any non-Android host is assumed to have an agent) because the page cannot see the server OS, so the backend refusal is the layer that cannot be skipped.",
+      "status": "verified",
+      "notes": "Agent authentication explains itself when there is no agent to ask. The auth chain asks the connector for a missing reason when its stream comes back empty: SshAgentConnector gains a defaulted missing_reason, SystemSshAgentConnector answers with a platform reason (SSH_AGENT_MISSING_MESSAGE on Android, none where the build probes for a socket), and the reason becomes the terminal error instead of the generic auth failure. The site dialog shows the same story up front through a hostDifferenceReason-backed hint wired to a new bundle sshAgent flag; the hint fails open (any non-Android host is assumed to have an agent) because the page cannot see the server OS, so the backend refusal is the layer that cannot be skipped. A packaged Android emulator connects to a disposable SSH fixture, handles its host-key challenge, and confirms the real agent-only authentication path returns the Android-specific missing-agent and private-key guidance. Physical devices and real SSH authentication using a private key are outside this scoped check.",
       "source": [
         "crates/linscp-proto/src/ssh.rs",
         "crates/linscp-platform/src/lib.rs",
         "ui/src/platform/capabilities.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "tools/android_emulator_smoke.mjs",
+        "tools/android_emulator_smoke.sh",
+        "source/linux/tests/TestSftpServer.py"
       ],
       "checks": {
         "proto-ssh": [
@@ -3213,6 +3216,9 @@
           "the site dialog explains a missing SSH agent",
           "the agent hint hides when the host has an agent",
           "the agent gap asks the bundle for the reason"
+        ],
+        "android-emulator": [
+          "verifyAndroidAgentRefusal"
         ]
       },
       "verified_on": {
@@ -3228,13 +3234,10 @@
         ],
         "android": [
           "ui-transport",
-          "gui"
+          "gui",
+          "android-emulator"
         ]
-      },
-      "gap": "The Android-Rust arm — the real connector reporting the platform message through the real chain — executes in no step: Android runs no Rust tests, and the emulator smoke does not attempt agent authentication. Message selection on device is review-level.",
-      "acceptance": [
-        "An emulator or device run attempting agent authentication and showing the platform reason instead of the generic failure."
-      ]
+      }
     },
     {
       "id": "security.curl-pins-and-tls",
