@@ -579,7 +579,7 @@ const expression = `
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
   async function verifyAndroidSiteManager() {
     const session = {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'};
-    for (const name of ['android-site-manager/team', 'android-site-manager/team/one', 'android-site-manager/team/nested/two', 'android-site-manager/teamwork/other']) {
+    for (const name of ['android-site-manager/team', 'android-site-manager/team/one', 'android-site-manager/team/nested/two', 'android-site-manager/teamwork/one']) {
       await invoke('POST', '/api/sessions/save', {name, session});
     }
     const names = async () => (await invoke('GET', '/api/sessions')).sessions.map(site => site.name).sort();
@@ -591,7 +591,7 @@ const expression = `
     if (renamed.renamed !== 2) throw new Error('Unexpected folder rename count: ' + JSON.stringify(renamed));
     await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/edge/one', new_name: 'android-site-manager/edge/primary'});
     const found = await names();
-    for (const name of ['android-site-manager/team', 'android-site-manager/edge/primary', 'android-site-manager/edge/nested/two', 'android-site-manager/teamwork/other']) {
+    for (const name of ['android-site-manager/team', 'android-site-manager/edge/primary', 'android-site-manager/edge/nested/two', 'android-site-manager/teamwork/one']) {
       if (!found.includes(name)) throw new Error('Site rename lost ' + name);
     }
     if (found.includes('android-site-manager/team/one') || found.includes('android-site-manager/edge/one')) throw new Error('Old site name survived rename');
@@ -600,7 +600,7 @@ const expression = `
     await invoke('POST', '/api/tabs/close', {tab: connected.tab.id});
     await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/edge', folder: true});
     const remaining = await names();
-    if (remaining.some(name => name.startsWith('android-site-manager/edge/')) || !remaining.includes('android-site-manager/team') || !remaining.includes('android-site-manager/teamwork/other')) throw new Error('Folder delete affected wrong sites');
+    if (remaining.some(name => name.startsWith('android-site-manager/edge/')) || !remaining.includes('android-site-manager/team') || !remaining.includes('android-site-manager/teamwork/one')) throw new Error('Folder delete affected wrong sites');
     await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/team'});
     await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/teamwork', folder: true});
     if ((await names()).some(name => name.startsWith('android-site-manager/'))) throw new Error('Site deletion failed');
