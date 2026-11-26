@@ -2589,7 +2589,7 @@
       "id": "transfer.presets",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out and persists the selection. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings can override preset fields.",
+      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out, persists the selection, and keeps a missing saved preset visibly selected instead of silently switching it to automatic. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings can override preset fields.",
       "source": [
         "crates/linscp-engine/src/presets.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2617,7 +2617,8 @@
           "manual preset opt-out sends off to the backend",
           "manual preset opt-out survives reloading presets",
           "manual preset opt-out persists through preferences",
-          "automatic preset selection leaves matching enabled"
+          "automatic preset selection leaves matching enabled",
+          "unavailable saved preset is not silently changed to automatic"
         ],
         "android-emulator": [
           "verifyAndroidTransferPreset"

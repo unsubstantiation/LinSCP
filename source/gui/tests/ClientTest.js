@@ -5653,6 +5653,13 @@ function options(id) {
     presetSelect.value = '';
     window.selectTransferPreset();
     check('automatic preset selection leaves matching enabled', !('preset' in window.transferOptions()));
+    window.eval("transferSettings.preset = 'deleted-preset'");
+    window.openTransferSettings();
+    await window.loadTransferPresets();
+    check('unavailable saved preset is not silently changed to automatic',
+      presetSelect.value === 'deleted-preset' && presetSelect.selectedOptions[0].textContent.includes('deleted-preset'));
+    presetSelect.value = '';
+    window.selectTransferPreset();
     window.applyMatchedTransferPreset();
     check('applyMatchedTransferPreset populates permissions, octal mode, EOL, preserve_time=all, and auto-selection rules',
       doc.getElementById('transferPresetSelect').value === 'ProdWeb' &&

@@ -1522,6 +1522,7 @@
   "URLs & Import": "URLs & Sitzungsimport",
   "UTF-8": "UTF-8",
   "Unavailable": "Nicht verfügbar",
+  "Unavailable preset: {name}": "Nicht verfügbare Voreinstellung: {name}",
   "Unit": "Einheit",
   "Unknown host key": "Unbekannter Hostschlüssel",
   "Unlock": "Entsperren",

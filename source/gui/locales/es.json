@@ -1522,6 +1522,7 @@
   "URLs & Import": "URL e importación",
   "UTF-8": "UTF-8",
   "Unavailable": "No disponible",
+  "Unavailable preset: {name}": "Preajuste no disponible: {name}",
   "Unit": "Unidad",
   "Unknown host key": "Clave del servidor desconocida",
   "Unlock": "Desbloquear",
