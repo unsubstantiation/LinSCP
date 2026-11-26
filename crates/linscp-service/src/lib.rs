@@ -4878,7 +4878,9 @@ impl CommanderService {
             }
         } else {
             let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
-            if !site_preset_name.is_empty() && !site_preset_name.eq_ignore_ascii_case("off") && !site_preset_name.eq_ignore_ascii_case("none") {
+            if site_preset_name.eq_ignore_ascii_case("off") || site_preset_name.eq_ignore_ascii_case("none") {
+                None
+            } else if !site_preset_name.is_empty() {
                 match preset_store.find(site_preset_name).cloned() {
                     Some(preset) => Some(preset),
                     None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
@@ -15351,6 +15353,25 @@ mod tests {
         assert_eq!(std::fs::read(right.join("allowed.txt")).unwrap(), b"allowed");
         assert!(!right.join("excluded.bin").exists());
         assert_eq!(svc.queue.snapshot().0.len(), 1);
+        // Site-level opt-out must not fall through to a matching file rule.
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        {
+            let mut state = svc.state.lock().unwrap();
+            state.tabs.get_mut(&id).unwrap().spec.as_mut().unwrap().preset_name = "off".into();
+        }
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": id, "local_dir": left, "remote_dir": other, "names": ["allowed.txt", "excluded.bin"]}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            if tasks.len() == 3 && tasks.iter().all(|task| task["status"] == "Completed") { done = true; break; }
+            assert!(!tasks.iter().any(|task| task["status"] == "Failed"), "{tasks:?}");
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done, "site opt-out transfers did not complete");
+        assert_eq!(std::fs::read(other.join("allowed.txt")).unwrap(), b"allowed");
+        assert_eq!(std::fs::read(other.join("excluded.bin")).unwrap(), b"excluded");
     }
 
     #[tokio::test]
@@ -19450,6 +19471,7 @@ mod tests {
         assert_eq!(read.payload["preferences"]["permissions"], "0644");
         assert_eq!(read.payload["preferences"]["preset"], "off");
         assert_eq!(read.payload["preferences"]["preserve_time_dirs"], true);
+        drop(svc);
         let reopened = CommanderService::new(temp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
         assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset"], "off");
     }
