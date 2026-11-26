@@ -206,9 +206,31 @@ const expression = `
       if (created.content !== 'created via SAF') throw new Error('SAF created bytes differ');
       const properties = await invoke('POST', '/api/local/properties', {tab, names: ['created.txt']});
       if (properties.properties?.[0]?.name !== 'created.txt' || properties.properties[0].size !== 15 || properties.properties[0].is_dir) throw new Error('SAF file properties differ: ' + JSON.stringify(properties));
+      await verifyAndroidSafEditorBoundary(tree, tab, root);
       await verifyAndroidGrantedSafTransfers(tree, tab, root);
     }
     return {root, safEditing: phase};
+  }
+  async function verifyAndroidSafEditorBoundary(tree, tab, root) {
+    await invoke('POST', '/api/local/mkdir', {tab, name: 'editor-boundary'});
+    const subdir = tree + '/document/editor-boundary';
+    const nested = await invoke('POST', '/api/tabs/local', {local_dir: subdir, remote_dir: root});
+    const nestedTab = nested.tab.id;
+    await invoke('POST', '/api/local/save', {tab: nestedTab, path: 'inside.txt', content: 'inside'});
+    const own = subdir + '/document/inside.txt';
+    const read = await invoke('GET', '/api/local/edit?tab=' + nestedTab + '&path=' + encodeURIComponent(own));
+    if (read.content !== 'inside') throw new Error('SAF pane cannot open its direct child');
+    const sibling = tree + '/document/marker.txt';
+    for (const method of ['read', 'save']) {
+      let refused = false;
+      try {
+        if (method === 'read') await invoke('GET', '/api/local/edit?tab=' + nestedTab + '&path=' + encodeURIComponent(sibling));
+        else await invoke('POST', '/api/local/save', {tab: nestedTab, path: sibling, content: 'outside overwrite'});
+      } catch (error) { refused = error.status === 400; }
+      if (!refused) throw new Error('SAF pane accepted a sibling editor ' + method);
+    }
+    const unchanged = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=marker.txt');
+    if (unchanged.content !== 'saf-edited') throw new Error('Refused sibling save changed provider bytes');
   }
   async function verifyAndroidGrantedSafTransfers(tree, localTab, root) {
     const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
@@ -247,6 +269,38 @@ const expression = `
     if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
+    await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
+  }
+  async function verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask) {
+    // Isolate the fixture so the delete test cannot touch the grant marker.
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'sync-fixture'});
+    const localDir = tree + '/document/sync-fixture';
+    const local = await invoke('POST', '/api/tabs/local', {local_dir: localDir, remote_dir: root});
+    const syncTab = local.tab.id;
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'sync-fixture'});
+    const remoteDir = '/sync-fixture';
+    const sync = {tab, local_dir: localDir, remote_dir: remoteDir};
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'upload.txt', content: 'from provider'});
+    await invoke('POST', '/api/remote/save', {tab, path: remoteDir + '/download.txt', content: 'from webdav'});
+    const preview = await invoke('POST', '/api/sync/preview', {...sync, mode: 'local'});
+    if (!preview.plan?.items?.some(item => item.action === 'download' && item.path === 'download.txt')) throw new Error('SAF sync preview omitted remote file: ' + JSON.stringify(preview));
+    await runTask('/api/sync/run', {...sync, mode: 'local'});
+    const downloaded = await invoke('GET', '/api/local/edit?tab=' + syncTab + '&path=download.txt');
+    if (downloaded.content !== 'from webdav') throw new Error('SAF synchronization download differs');
+    await runTask('/api/sync/run', {...sync, mode: 'remote'});
+    const uploaded = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/upload.txt'));
+    if (uploaded.content !== 'from provider') throw new Error('SAF synchronization upload differs');
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'upload.txt', content: 'new provider!'});
+    const checksum = await invoke('POST', '/api/sync/preview', {...sync, mode: 'remote', criteria: 'checksum'});
+    if (!checksum.plan?.items?.some(item => item.action === 'upload' && item.path === 'upload.txt')) throw new Error('SAF checksum missed changed bytes: ' + JSON.stringify(checksum));
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'delete-me.txt', content: 'obsolete'});
+    await runTask('/api/sync/run', {...sync, mode: 'local', delete: true});
+    const localList = await invoke('GET', '/api/local/list?tab=' + syncTab + '&path=' + encodeURIComponent(localDir));
+    if (localList.entries?.some(entry => entry.name === 'delete-me.txt')) throw new Error('SAF synchronization did not delete obsolete local file');
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'watch.txt', content: 'watched provider file'});
+    await runTask('/api/transfer/keepuptodate', {...sync, count: 1});
+    const watched = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/watch.txt'));
+    if (watched.content !== 'watched provider file') throw new Error('SAF keep-up-to-date missed the file');
   }
   if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();

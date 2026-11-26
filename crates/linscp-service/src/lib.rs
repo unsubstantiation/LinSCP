@@ -13497,8 +13497,13 @@ fn resolve_editor_local_path(base: &str, raw_path: &str) -> Result<String, Strin
                 .map_err(|error| error.to_string())?;
         let parsed_target = linscp_platform::parse_saf_document_uri(raw_path)
             .map_err(|error| error.to_string())?;
-        if parsed_target.documents.is_empty()
-            || parsed_target.tree_uri() != parsed_base.tree_uri()
+        // Like a native path, an absolute SAF editor target must be a direct
+        // child of this pane, not merely somewhere under the same tree grant.
+        // Compare the URI's structured document segments; string-prefix checks
+        // would confuse sibling names and escaped separators.
+        if parsed_target.tree_uri() != parsed_base.tree_uri()
+            || parsed_target.documents.len() != parsed_base.documents.len() + 1
+            || parsed_target.documents[..parsed_base.documents.len()] != parsed_base.documents[..]
         {
             return Err("The path is outside the panel directory.".to_string());
         }
@@ -19661,6 +19666,44 @@ mod tests {
         let created = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/local/save".into(), body: json!({"tab": id, "path": "fresh.txt", "content": "new\n"}) });
         assert_eq!(created.status, 200, "{}", created.payload);
         assert_eq!(bridge.bytes_of("fresh.txt").as_deref(), Some(b"new\n".as_slice()), "a missing document is created");
+        let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    #[tokio::test]
+    async fn saf_editor_refuses_outside_the_active_pane() {
+        let tmp = std::env::temp_dir().join(format!("linscp-saf-boundary-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir_all(tmp.join("plain")).unwrap();
+        let bridge = Arc::new(MockBridge::with_file("secret.txt", b"outside"));
+        let inside = format!("{SAF_GRANTED_DIR}/document/folder");
+        let child = format!("{inside}/document/child.txt");
+        let sibling = format!("{SAF_GRANTED_DIR}/document/secret.txt");
+        let nested = format!("{inside}/document/sub/document/deep.txt");
+        bridge.add_dir(&inside);
+        bridge.add_file(&child, b"inside");
+        let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
+        let open = |left: String, right: String| ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": right}}) };
+        let plain = tmp.join("plain").to_string_lossy().into_owned();
+        let left = svc.dispatch_async(open(inside.clone(), plain.clone())).await;
+        assert_eq!(left.status, 200, "{}", left.payload);
+        let left_id = left.payload["tab"]["id"].as_u64().unwrap();
+        let right = svc.dispatch_async(open(plain, inside.clone())).await;
+        assert_eq!(right.status, 200, "{}", right.payload);
+        let right_id = right.payload["tab"]["id"].as_u64().unwrap();
+        for (id, side) in [(left_id, "local"), (right_id, "remote")] {
+            let get = |path: &str| ApiEnvelope { method: "GET".into(), path: format!("/api/{side}/edit?tab={id}&path={}", tabs::percent_encode_userinfo(path)), body: json!({}) };
+            let save = |path: &str| ApiEnvelope { method: "POST".into(), path: format!("/api/{side}/save"), body: json!({"tab": id, "path": path, "content": "replacement"}) };
+            let valid = svc.dispatch_async(get(&child)).await;
+            assert_eq!(valid.status, 200, "{}", valid.payload);
+            for outside in [&sibling, &nested] {
+                let read = svc.dispatch_async(get(outside)).await;
+                assert_eq!(read.status, 400, "{}", read.payload);
+                let write = svc.dispatch_async(save(outside)).await;
+                assert_eq!(write.status, 400, "{}", write.payload);
+                assert!(write.payload["error"].as_str().unwrap_or("").contains("outside the panel directory"));
+            }
+        }
+        assert_eq!(bridge.bytes_of("secret.txt").as_deref(), Some(b"outside".as_slice()));
+        assert_eq!(bridge.bytes_of_uri(&child).as_deref(), Some(b"inside".as_slice()));
         let _ = std::fs::remove_dir_all(tmp);
     }
 
