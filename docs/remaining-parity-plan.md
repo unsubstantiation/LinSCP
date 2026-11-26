@@ -584,9 +584,9 @@ Encrypted portable full application backup (`LSCPBAK1`, independent password, Ar
 
 **Area:** Desktop integration · **Status:** partial
 
-RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}).
+RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}). Android viewer launch is restricted in both the frontend and native bridge to allowed schemes and no userinfo; RDP/VNC/SPICE viewer URIs additionally refuse paths, queries and fragments. The debug APK emulator smoke invokes the native bridge directly to test unsafe URI refusals.
 
-**Next:** Live desktop server validation (xrdp, TigerVNC, SPICE, and live X2Go KDrive server) and gateway security review remain open.
+**Next:** The Android emulator tests specific native URI refusals, not external viewer interoperability or every possible malformed URI. Live desktop server validation (xrdp, TigerVNC, SPICE, and live X2Go KDrive server) and gateway security review remain open.
 
 **Acceptance criteria:**
 
