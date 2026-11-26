@@ -570,15 +570,14 @@ Remote deletes walk the selected tree, unlink symlinks without following them, r
 
 **Area:** Sessions/configuration · **Status:** partial
 
-Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs.
+Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs. A packaged Android debug APK emulator test exports an encrypted backup, checks refusal of unconfirmed, wrong-password and corrupted imports and active-session restore, then restores over a changed site list. It verifies the existing Keystore-wrapped key stays unchanged, no restore journal remains, and restored credentials reconnect after process restart.
 
-**Next:** The script and backup suites run on Linux and Windows; the Android build runs these Rust tests on its Linux host, not on Android. Actual Android runtime restore and cross-device portability remain unverified.
+**Next:** The Android emulator exercises same-install export and restore of saved sites through the service, including several refusal paths, destination key preservation and restart. Actual cross-device portability, Android SSH-key rewrapping, interrupted-restore recovery and physical-device behavior remain unverified; the Rust backup format tests run on CI hosts.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Extend the runnable residue (backup) to Android, or cite additional runnable suites there.
+- [ ] Test backup portability across real Linux, Windows and Android installations with different destination vault keys, including SSH-key rewrapping.
+- [ ] Exercise Android interrupted-restore recovery and physical-device behavior.
 
 ## desktop.remote
 
