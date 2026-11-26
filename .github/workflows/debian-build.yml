@@ -158,6 +158,10 @@ jobs:
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
+          if echo "$contents" | grep -qx usr/bin/linscp; then
+            echo "::error::The retired console executable must not be packaged"
+            exit 1
+          fi
           cp "$deb" "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke test the package

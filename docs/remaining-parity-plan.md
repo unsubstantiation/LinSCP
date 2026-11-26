@@ -322,9 +322,9 @@ The GUI can parse a manually pasted session URL through /api/session/url, includ
 
 **Area:** Desktop integration · **Status:** partial
 
-Installed, Makefile and CMake binaries select their own GUI launcher; the GUI finds the matching core under a relocatable prefix.
+The native GUI embeds its frontend and engine in one executable; there is no separate core or GUI launcher to locate. Linux Make and CMake builds have been launched from staged custom prefixes under Xvfb, with the prefix bin directory in PATH.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The historical separate-core launcher no longer exists; desktop menu resolution and scheme selection at a custom prefix have not been tested. The old Python tests require the retired CLI.
 
 **Acceptance criteria:**
 
@@ -390,22 +390,22 @@ CMake wraps the native Tauri build, registers Rust and UI CTest entries, and ins
 
 **Area:** Packaging/platforms · **Status:** partial
 
-debian/rules and debian/control package the CLI, GUI, desktop entry, icons and man page matching the staged Linux install tree.
+debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged.
 
-**Next:** No runnable suite evidences this: script needs a `linscp` binary this repo does not build.
+**Next:** The Linux CI package smoke passed on one branch run after an earlier unexplained GUI-launch failure. Desktop menu integration, upgrades/removal and other Debian versions are not validated; the upstream CLI is deliberately omitted.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Investigate the intermittent launch-smoke failure and exercise package upgrade/removal and desktop integration on supported Debian environments.
+- [ ] Do not claim the retired console client is shipped.
 
 ## platform.prefix-lookup
 
 **Area:** Packaging/platforms · **Status:** partial
 
-An arbitrary PREFIX/share/linscp/gui resolves PREFIX/bin/linscp before /usr/bin.
+The GUI embeds its engine and does not look up a separate PREFIX/bin/linscp core. The Make and CMake wrappers stage the GUI under custom prefixes, and the Linux desktop entry resolves linscp-gui through PATH.
 
-**Next:** No runnable suite evidences this: the Python GUI harness the ledger used to cite is retired, and no shipped suite replaces it yet.
+**Next:** The separate-core prefix lookup described by the retired Python harness is not part of the GUI-only product. Desktop menu and scheme-handler discovery under a custom prefix remain unverified.
 
 **Acceptance criteria:**
 
