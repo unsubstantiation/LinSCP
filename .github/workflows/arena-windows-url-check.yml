@@ -26,3 +26,22 @@ jobs:
         run: python tools/run_cargo_ci.py cargo test -p linscp-platform
       - name: Build native shell
         run: python tools/run_cargo_ci.py cargo build -p linscp-tauri --features native-shell
+      - name: Exercise built URL registration commands
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'target/debug/linscp-gui.exe').Path
+          try {
+            $p = Start-Process -FilePath $exe -ArgumentList '--install-url-handlers' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "URL registration failed: $($p.ExitCode)" }
+            & reg.exe query 'HKCU\Software\Classes\LinSCP.Url\shell\open\command'
+            if ($LASTEXITCODE -ne 0) { throw 'URL command missing' }
+            & reg.exe query 'HKCU\Software\LinSCP\UrlHandlers\Capabilities\URLAssociations' /v sftp
+            if ($LASTEXITCODE -ne 0) { throw 'SFTP association missing' }
+          } finally {
+            $p = Start-Process -FilePath $exe -ArgumentList '--uninstall-url-handlers' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "URL unregister failed: $($p.ExitCode)" }
+          }
+          & reg.exe query 'HKCU\Software\Classes\LinSCP.Url' 2>$null
+          if ($LASTEXITCODE -eq 0) { throw 'URL registration was not removed' }
+          exit 0
