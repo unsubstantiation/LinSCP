@@ -262,6 +262,23 @@ class AndroidApplicationIdTests(unittest.TestCase):
         self.assertIn("{tab, name: 'smoke-resume'}", between)
         self.assertNotIn("{name: 'smoke-resume'}", smoke)
 
+    @unittest.skipUnless(shutil.which('node'), 'Node.js is needed to parse the WebView smoke expression')
+    def test_emulator_smoke_template_expands_to_valid_javascript(self):
+        # Node's --check parses the outer template, not its interpolated
+        # contents; escaped slashes and other template escapes can break only
+        # after it is sent to the WebView. Compile representative expansions.
+        script = r"""
+const fs = require('fs'), vm = require('vm');
+const source = fs.readFileSync('tools/android_emulator_smoke.mjs', 'utf8');
+const match = source.match(/const expression = (`[\s\S]*?`);\nlet nextId/);
+if (!match) throw new Error('Cannot find smoke expression');
+const build = Function('phase', 'portableBackup', 'application', 'port', 'return ' + match[1]);
+for (const phase of ['initial', 'portable-import', 'portable-reopen']) {
+  new vm.Script(build(phase, {backupBase64: 'Zm9v', keyReference: 'vaultkey://abc'}, 'com.example.app', 8080));
+}
+"""
+        subprocess.run(['node', '-e', script], cwd=ROOT, check=True, capture_output=True, text=True)
+
     def test_android_navigation_bar_is_hidden_while_app_is_active(self):
         kotlin = (ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt').read_text(encoding='utf-8')
         self.assertIn('internal fun hideAndroidNavigationBar(activity: Activity)', kotlin)
