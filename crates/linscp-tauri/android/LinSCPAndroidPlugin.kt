@@ -794,9 +794,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
    * provider refuses it. Every command below therefore resolves a name against
    * the provider's own child listing before it builds a URI.
    *
-   * A segment that already matches a document id is used as it stands, which
-   * keeps the shared-storage form - and every path the page builds after
-   * listing a folder through this plugin - working unchanged.
+   * Document ids are accepted only when listed as children of the current
+   * parent. A provider can resolve a descendant's opaque id anywhere under a
+   * tree grant, so querying that id directly would bypass the pane boundary.
    */
   private fun resolveDocument(uri: Uri): Uri {
     if (!DocumentsContract.isTreeUri(uri)) {
@@ -805,22 +805,12 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     val segments = uri.pathSegments
     val treeIndex = segments.indexOf("tree")
     val childIndex = segments.indexOf("document")
-    // The tree itself, or a URI that already names one document by id.
+    // A tree root can also be spelled /tree/<id>/document/<id>.
     if (treeIndex < 0 || treeIndex + 1 >= segments.size || childIndex < 0) return documentUri(uri)
-    if (segments.size == childIndex + 2) {
-      val direct = DocumentsContract.buildDocumentUriUsingTree(uri, segments[childIndex + 1])
-      val existsDirectly = try {
-        activity.contentResolver.query(
-          direct,
-          arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
-          null, null, null
-        )?.use { it.moveToFirst() } == true
-      } catch (_: Exception) {
-        false
-      }
-      if (existsDirectly) return direct
-    }
     val grantId = segments[treeIndex + 1]
+    if (segments.size == childIndex + 2 && segments[childIndex + 1] == grantId) {
+      return DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
+    }
     var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
     var i = childIndex + 1
     while (i < segments.size) {

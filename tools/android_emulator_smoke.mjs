@@ -229,6 +229,18 @@ const expression = `
       } catch (error) { refused = error.status === 400; }
       if (!refused) throw new Error('SAF pane accepted a sibling editor ' + method);
     }
+    // Shared storage IDs are absolute within the grant. A provider can resolve
+    // a grandchild's ID directly, even though it is not a direct child of the
+    // root pane. The bridge must walk the root's child listing instead.
+    const grantId = decodeURIComponent(tree.split('/tree/')[1]);
+    const directChild = tree + '/document/' + encodeURIComponent(grantId + '/marker.txt');
+    const marker = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=' + encodeURIComponent(directChild));
+    if (marker.content !== 'saf-edited') throw new Error('Direct child provider ID did not resolve');
+    const descendantAlias = tree + '/document/' + encodeURIComponent(grantId + '/editor-boundary/inside.txt');
+    let aliasRefused = false;
+    try { await invoke('GET', '/api/local/edit?tab=' + tab + '&path=' + encodeURIComponent(descendantAlias)); }
+    catch (error) { aliasRefused = error.status === 400; }
+    if (!aliasRefused) throw new Error('SAF pane accepted a descendant document ID as a direct child');
     const unchanged = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=marker.txt');
     if (unchanged.content !== 'saf-edited') throw new Error('Refused sibling save changed provider bytes');
   }
