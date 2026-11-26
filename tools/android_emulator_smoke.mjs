@@ -123,7 +123,7 @@ const expression = `
     const keyFixture = 'android portable backup private key fixture';
     if (phase === 'portable-export') {
       const key = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
-      if (!key.success || !/^vaultkey:\/\/[a-f0-9]{32}$/.test(key.reference)) throw new Error('Fixture key import failed');
+      if (!key.success || !(key.reference?.startsWith('vaultkey://') && /^[a-f0-9]{32}$/.test(key.reference.slice(11)))) throw new Error('Fixture key import failed');
       await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: 'fixture.invalid', username: 'test', keyfile: key.reference}});
       const exported = await invoke('POST', '/api/backup/export', {password: 'portable android backup password'});
       if (!exported.success || !atob(exported.data_base64).startsWith('LSCPBAK1')) throw new Error('Portable backup export failed');
