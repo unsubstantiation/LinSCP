@@ -142,7 +142,9 @@ pub fn is_session_url(url: &str) -> bool {
 }
 
 fn has_session_url_scheme(url: &str) -> bool {
-    let Some((scheme, _)) = url.split_once("://") else { return false; };
+    // A Windows scheme handler can receive malformed URLs without //; they
+    // still must never cause later arguments to be interpreted as actions.
+    let Some((scheme, _)) = url.split_once(':') else { return false; };
     crate::url_registration::SCHEMES.iter().any(|s| scheme.eq_ignore_ascii_case(s))
 }
 
@@ -197,6 +199,7 @@ mod tests {
         for flag in [INSTALL, UNINSTALL, INSTALL_URLS, UNINSTALL_URLS, SHELL_UPLOAD, HELP] {
             assert_eq!(parse(&["sftp://example.com/", flag, "file.txt"]), Action::OpenWindow);
             assert_eq!(parse(&["sftp://", flag, "file.txt"]), Action::OpenWindow);
+            assert_eq!(parse(&["sftp:malformed", flag, "file.txt"]), Action::OpenWindow);
         }
         assert!(!is_session_url(&format!("sftp://{}", "x".repeat(8192))));
         assert!(!format!("{:?}", parse(&["sftp://user:secret@example.com"])).contains("secret"));

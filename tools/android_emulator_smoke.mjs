@@ -518,6 +518,55 @@ const expression = `
     await assertCheckpointUnchanged('smoke-changed', 'Android');
   }
   await verifyAndroidWebDavResumeRefusals();
+  async function verifyAndroidSftpResume() {
+    // The fixture key is accepted for this test only, not saved as trusted.
+    let challenge;
+    try {
+      await invoke('POST', '/api/tabs/open', {session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+    } catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      challenge = error.payload.challenge;
+    }
+    if (!challenge || challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort}) throw new Error('Expected SFTP fixture host-key challenge');
+    const verified = await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    if (!verified.tab?.connected) throw new Error('SFTP fixture did not authenticate');
+    const sftpTab = verified.tab.id;
+    await invoke('POST', '/api/remote/save', {tab: sftpTab, path: '/resume-fixture.txt', content: 'Android SFTP resume fixture'});
+    async function checkpoint(dir, bytes) {
+      await invoke('POST', '/api/local/mkdir', {tab: sftpTab, name: dir});
+      await invoke('POST', '/api/local/save', {path: root + '/' + dir + '/resume-fixture.txt.filepart', content: bytes});
+      return root + '/' + dir;
+    }
+    async function waitTask(previous, expected) {
+      for (let i = 0; i < 120; i++) {
+        const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !previous.has(item.id));
+        if (task?.status === expected) return task;
+        if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Unexpected SFTP resume result: ' + JSON.stringify(task));
+        await sleep(250);
+      }
+      throw new Error('SFTP resume timed out');
+    }
+    const goodDir = await checkpoint('sftp-resume-good', 'Android SFTP');
+    const body = {tab: sftpTab, local_dir: goodDir, remote_dir: '/', names: ['resume-fixture.txt'], resume: true};
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/download', body); }
+    catch (error) { refused = error.status === 409 && error.payload?.best_effort_resume_risk === true; }
+    if (!refused) throw new Error('SFTP resume did not require explicit best-effort consent');
+    const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(item => item.id));
+    await invoke('POST', '/api/transfer/download', {...body, accept_best_effort_resume_risk: true});
+    await waitTask(previous, 'Completed');
+    const goodTab = (await invoke('POST', '/api/tabs/local', {local_dir: goodDir, remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + goodTab + '&path=resume-fixture.txt')).content !== 'Android SFTP resume fixture') throw new Error('SFTP resumed bytes differ');
+    const staleDir = await checkpoint('sftp-resume-stale', 'wrong prefix');
+    const beforeStale = new Set((await invoke('GET', '/api/transfers')).transfers.map(item => item.id));
+    await invoke('POST', '/api/transfer/download', {...body, local_dir: staleDir, accept_best_effort_resume_risk: true});
+    await waitTask(beforeStale, 'Failed');
+    const listing = await invoke('GET', '/api/local/list?path=' + encodeURIComponent(staleDir));
+    if (listing.entries?.some(entry => entry.name === 'resume-fixture.txt')) throw new Error('Rejected SFTP resume published a destination');
+    const staleTab = (await invoke('POST', '/api/tabs/local', {local_dir: staleDir, remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + staleTab + '&path=resume-fixture.txt.filepart')).content !== 'wrong prefix') throw new Error('Rejected SFTP resume changed the checkpoint');
+  }
+  await verifyAndroidSftpResume();
   const local = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-download', remote_dir: root});
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
