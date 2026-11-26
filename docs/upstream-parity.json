@@ -193,7 +193,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing, properties and WebDAV transfers and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV verified-resume refusals and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -4761,7 +4761,7 @@
       "id": "platform.android-saf-editing",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks the edited bytes outside the app, and reopens the granted folder after a process restart.",
+      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks file properties and the edited bytes outside the app, and reopens the granted folder after a process restart.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/ops.rs",
@@ -4798,7 +4798,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Other providers, properties rows, revoked access races, large documents and physical-device behavior are unverified.",
+      "gap": "The emulator exercises the Android external-storage DocumentsProvider for a single granted folder, including stale-save refusal and grant persistence. Other providers, directory properties, revoked access races, large documents and physical-device behavior are unverified.",
       "acceptance": [
         "Validate properties and provider error cases, including revoked permissions and large files, on different DocumentsProviders and physical Android devices."
       ]
@@ -4848,7 +4848,7 @@
       "id": "platform.android-saf-session-transfers",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file.",
+      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file. A packaged Android emulator test uses a DocumentsUI grant and a WebDAV fixture to upload, download, move, protect an existing destination and refuse verified resume.",
       "source": [
         "crates/linscp-engine/src/transfer.rs",
         "crates/linscp-service/src/lib.rs",
@@ -4856,7 +4856,10 @@
         "ui/src/platform/capabilities.ts",
         "source/gui/web/index.html",
         "crates/linscp-platform/src/android.rs",
-        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt"
+        "crates/linscp-tauri/android/LinSCPAndroidPlugin.kt",
+        "tools/android_emulator_smoke.mjs",
+        "tools/android_emulator_smoke.sh",
+        "tools/android_select_saf_folder.py"
       ],
       "checks": {
         "service": [
@@ -4867,6 +4870,9 @@
         "gui": [
           "a granted folder is offered transfers",
           "a granted folder is offered moves"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafTransfers"
         ]
       },
       "verified_on": {
@@ -4879,12 +4885,13 @@
           "gui"
         ],
         "android": [
-          "gui"
+          "gui",
+          "android-emulator"
         ]
       },
-      "gap": "Both remotes are in-memory mocks: no suite has uploaded from or downloaded into a real DocumentsProvider, so provider behaviour (nested document URIs, large-document memory pressure, concurrent writers during a merge) is unproven on a device.",
+      "gap": "Single-file transfers and move are exercised on an Android emulator with the external-storage DocumentsProvider and a WebDAV fixture; tree transfers, document-cap refusal, other providers, large-document memory pressure, concurrent writers and physical devices remain unverified.",
       "acceptance": [
-        "Upload, download and move files between a granted folder and a server on an Android device or emulator, covering a tree transfer, the document-cap refusal and the resume refusal."
+        "Validate tree transfers and document-cap refusal between a granted folder and a server on an Android device or emulator, including other providers and physical devices."
       ]
     },
     {
