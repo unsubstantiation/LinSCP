@@ -386,6 +386,33 @@ const expression = `
       await sleep(250);
     }
     if (!failed || (await invoke('GET', '/api/local/edit?tab=' + mergeTab + '&path=keep.txt')).content !== 'keep provider bytes') throw new Error('SAF conflicting tree merge did not preserve destination');
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-merge-up'});
+    const mergeUpDir = tree + '/document/transfer-merge-up';
+    const mergeUpTab = (await invoke('POST', '/api/tabs/local', {local_dir: mergeUpDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: mergeUpTab, path: 'new.txt', content: 'merged provider bytes'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-merge-up'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-merge-up/keep.txt', content: 'keep server bytes'});
+    const mergeUp = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-merge-up'], accept_directory_copy_risk: true};
+    refused = false;
+    try { await invoke('POST', '/api/transfer/upload', mergeUp); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_conflicts?.includes('transfer-merge-up'); }
+    if (!refused) throw new Error('SAF upload tree merge did not require confirmation');
+    await runTask('/api/transfer/upload', {...mergeUp, merge_directories: ['transfer-merge-up']});
+    const remoteKeep = '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-merge-up/keep.txt');
+    const remoteNew = '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-merge-up/new.txt');
+    if ((await invoke('GET', remoteKeep)).content !== 'keep server bytes' || (await invoke('GET', remoteNew)).content !== 'merged provider bytes') throw new Error('SAF upload tree merge did not preserve and add files');
+    await invoke('POST', '/api/local/save', {tab: mergeUpTab, path: 'keep.txt', content: 'must not overwrite server'});
+    const beforeUploadConflict = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    const conflictUpload = await invoke('POST', '/api/transfer/upload', {...mergeUp, merge_directories: ['transfer-merge-up']});
+    if (!conflictUpload.success) throw new Error('Conflicting SAF upload merge was not queued');
+    failed = false;
+    for (let i = 0; i < 120; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !beforeUploadConflict.has(item.id));
+      if (task?.status === 'Failed') { failed = true; break; }
+      if (task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Conflicting SAF upload merge unexpectedly finished: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!failed || (await invoke('GET', remoteKeep)).content !== 'keep server bytes') throw new Error('Conflicting SAF upload merge did not preserve destination');
   }
   async function verifyAndroidGrantedSafLocalCopyMove(tree, safTab, root, runTask) {
     const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: tree})).tab.id;
