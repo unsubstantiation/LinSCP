@@ -1181,6 +1181,11 @@ async fn test_xml_log_matches_the_upstream_schema() {
     interp.shutdown().await;
 
     let text = std::fs::read_to_string(&log).expect("the log was written");
+    // The CI schema test validates this actual logger output independently of
+    // the namespace/structure assertions below. Normal test runs need no file.
+    if let Some(path) = std::env::var_os("LINSCP_XML_SCHEMA_TEST_OUTPUT") {
+        std::fs::write(path, &text).expect("write schema validation sample");
+    }
     assert!(!text.contains("secret"), "the secret is not in the log: {text}");
     assert!(
         !text.contains("also-secret"),

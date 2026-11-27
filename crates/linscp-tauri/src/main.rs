@@ -28,6 +28,7 @@ fn main() {
     let action = cli_args::parse(&std::env::args().skip(1).collect::<Vec<_>>());
     match action {
         Action::OpenWindow => linscp_tauri::run_native_app(tauri::generate_context!()),
+        Action::OpenSessionUrl(url) => linscp_tauri::run_native_app_with_url(tauri::generate_context!(), Some(url)),
         Action::Help => {
             // `Help` is printed, not run: it must never depend on a running window.
             let mut out = Output::open();
@@ -99,6 +100,14 @@ fn run_action(action: Action) -> ActionOutcome {
             linscp_service::cli_actions::install_shell_integration(&launcher)
         }
         Action::UninstallShellIntegration => linscp_service::cli_actions::uninstall_shell_integration(),
+        Action::InstallUrlHandlers => {
+            let result = match std::env::current_exe() {
+                Ok(launcher) => linscp_platform::url_registration::install(&launcher),
+                Err(error) => Err(format!("Cannot find the application executable: {error}")),
+            };
+            url_registration_outcome(result)
+        }
+        Action::UninstallUrlHandlers => url_registration_outcome(linscp_platform::url_registration::uninstall()),
         Action::ShellUpload(files) => {
             // A file manager passes absolute paths; a script may not, and this
             // process's working directory is not necessarily where the user was.
@@ -111,10 +120,17 @@ fn run_action(action: Action) -> ActionOutcome {
         }
         // Already handled above; kept so this function cannot silently do nothing
         // if a future action is added without a branch here.
-        Action::OpenWindow | Action::Help => ActionOutcome {
+        Action::OpenWindow | Action::OpenSessionUrl(_) | Action::Help => ActionOutcome {
             exit_code: 0,
             stdout: Vec::new(),
             stderr: Vec::new(),
         },
+    }
+}
+
+fn url_registration_outcome(result: Result<String, String>) -> ActionOutcome {
+    match result {
+        Ok(message) => ActionOutcome { exit_code: 0, stdout: vec![message], stderr: Vec::new() },
+        Err(message) => ActionOutcome { exit_code: 1, stdout: Vec::new(), stderr: vec![message] },
     }
 }

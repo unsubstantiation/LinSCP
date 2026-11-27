@@ -38,6 +38,20 @@ class ConversionCheckTests(unittest.TestCase):
     def test_the_real_tree_has_no_windows_construct(self):
         self.assertEqual(check.collect(), [])
 
+    def test_unreadable_utf8_source_is_reported_not_silently_skipped(self):
+        path = self.root / 'source/linux/Bad.cpp'
+        path.write_bytes(b'\xff\xfe\x00')
+        findings = check.collect(self.root)
+        self.assertTrue(any(p == path and name == 'unreadable-source'
+                            for p, _, name, _, _ in findings), findings)
+
+    def test_platform_host_exclusions_are_explicit(self):
+        for name in ('crates/linscp-platform/src/windows.rs',
+                     'crates/linscp-platform/src/android.rs',
+                     'crates/linscp-tauri/src/windows.rs'):
+            path = self.write(name, 'int f() { return CreateFile(); }')
+            self.assertEqual(check.find_windows_constructs(path, path.read_text(), self.root), [])
+
     def test_a_stale_upstream_product_reference_is_found(self):
         stale = 'Win' + 'SCP-style interface'
         self.write('docs/brand.md', stale + '\n')

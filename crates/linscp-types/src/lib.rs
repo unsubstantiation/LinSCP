@@ -287,6 +287,9 @@ pub enum TransferMode {
 /// Persisted Commander user preferences (`preferences.json` shape).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserPreferences {
+    /// Empty selects site/rule matching; "off" disables presets.
+    #[serde(default)]
+    pub preset: String,
     pub transfer: TransferMode,
     pub filemask: String,
     pub speed: u32,
@@ -319,6 +322,7 @@ pub struct UserPreferences {
 impl Default for UserPreferences {
     fn default() -> Self {
         Self {
+            preset: String::new(),
             transfer: TransferMode::Binary,
             filemask: String::new(),
             speed: 0,

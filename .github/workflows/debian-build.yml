@@ -41,13 +41,14 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
-            pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             python3-paramiko python3-pyftpdlib python3-openssl
 
       - name: Check GUI distribution, workflow triggers, and X2Go
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+          python3 -m unittest discover -s tools/tests -p test_native_listeners.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
           python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
@@ -92,6 +93,15 @@ jobs:
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
+      - name: Validate XML action log against the pinned schema
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/linscp-xmlschema
+          /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
+          export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
+
       - name: Exercise live protocol integration tests
         env:
           LSCP_LIVE_SFTP: "1"
@@ -102,6 +112,15 @@ jobs:
           LSCP_LIVE_S3: "1"
           RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ -- --nocapture --test-threads=1
+
+      - name: Validate live WebDAV action log against the pinned schema
+        run: |
+          set -euo pipefail
+          export LSCP_LIVE_WEBDAV=1
+          export RUST_MIN_STACK=16777216
+          export LINSCP_XML_LIVE_OUTPUT="$RUNNER_TEMP/linscp-live-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture --test-threads=1
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
   build:
     name: Debian package (.deb)
     runs-on: ubuntu-24.04
@@ -126,7 +145,7 @@ jobs:
           set -euo pipefail
           sudo apt-get -o Acquire::Retries=3 update -qq
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
-            build-essential dpkg-dev debhelper pkg-config \
+            build-essential cmake dpkg-dev debhelper pkg-config \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
             xvfb xdotool xauth openbox x11-utils
 
@@ -158,6 +177,10 @@ jobs:
             echo "$contents" | grep -qx "$path" ||
               { echo "::error::$path is missing from the package"; exit 1; }
           done
+          if echo "$contents" | grep -qx usr/bin/linscp; then
+            echo "::error::The retired console executable must not be packaged"
+            exit 1
+          fi
           cp "$deb" "$GITHUB_WORKSPACE/"
 
       - name: Install and smoke test the package
@@ -169,6 +192,8 @@ jobs:
       - name: Smoke test the native window
         run: |
           set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR"' EXIT
           if xvfb-run -a bash -euo pipefail -c '
             export WEBKIT_DISABLE_COMPOSITING_MODE=1
             export WEBKIT_DISABLE_DMABUF_RENDERER=1
@@ -186,6 +211,7 @@ jobs:
                 exit 1
               fi
               if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
+                python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
                 echo "LinSCP window opened"
                 exit 0
               fi
@@ -199,6 +225,53 @@ jobs:
             cat native-smoke.log
             exit 1
           fi
+
+      - name: Build and smoke test a custom-prefix Make install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          make -C source/linux install PREFIX="$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >make-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat make-smoke.log
+            exit 1
+          '
+
+      - name: Build and smoke test a custom-prefix CMake install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          build=$(mktemp -d)
+          trap 'rm -rf "$stage" "$build"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          cmake -S . -B "$build" -DCMAKE_INSTALL_PREFIX=/opt/linscp
+          cmake --build "$build"
+          cmake --install "$build" --prefix "$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >cmake-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat cmake-smoke.log
+            exit 1
+          '
 
       - name: Smoke test the file-manager actions
         run: |

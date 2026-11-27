@@ -3,6 +3,7 @@ TOP := ../..
 CARGO ?= cargo
 NPM ?= npm
 PYTHON ?= python3
+PREFIX ?= /usr
 .PHONY: all check clean install
 all:
 	cd $(TOP) && $(NPM) --prefix ui ci --no-audit --no-fund
@@ -12,10 +13,10 @@ check:
 	cd $(TOP) && $(CARGO) test --workspace --all-targets
 	cd $(TOP) && $(NPM) --prefix ui test
 install: all
-	install -d $(DESTDIR)/usr/bin $(DESTDIR)/usr/share/applications $(DESTDIR)/usr/share/pixmaps $(DESTDIR)/usr/share/icons/hicolor/scalable/apps
-	install -m 0755 $(TOP)/target/release/linscp-gui $(DESTDIR)/usr/bin/linscp-gui
-	install -m 0644 $(TOP)/debian/linscp.desktop $(DESTDIR)/usr/share/applications/linscp.desktop
-	install -m 0644 $(TOP)/debian/linscp.png $(DESTDIR)/usr/share/pixmaps/linscp.png
-	install -m 0644 $(TOP)/debian/linscp.svg $(DESTDIR)/usr/share/icons/hicolor/scalable/apps/linscp.svg
+	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/share/applications" "$(DESTDIR)$(PREFIX)/share/pixmaps" "$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps"
+	install -m 0755 "$(TOP)/target/release/linscp-gui" "$(DESTDIR)$(PREFIX)/bin/linscp-gui"
+	$(PYTHON) "$(TOP)/tools/install_desktop_entry.py" --prefix "$(PREFIX)" --destdir "$(DESTDIR)" --template "$(TOP)/debian/linscp.desktop"
+	install -m 0644 "$(TOP)/debian/linscp.png" "$(DESTDIR)$(PREFIX)/share/pixmaps/linscp.png"
+	install -m 0644 "$(TOP)/debian/linscp.svg" "$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/linscp.svg"
 clean:
 	cd $(TOP) && $(CARGO) clean

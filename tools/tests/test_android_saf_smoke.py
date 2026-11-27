@@ -111,11 +111,8 @@ class AndroidSafSmokeTests(unittest.TestCase):
             if "tree" not in segments or "document" not in segments:
                 return "tree-root"
             current = segments[segments.index("tree") + 1]
-            i = segments.index("document") + 1
+            i = segments.index("tree") + 3
             while i < len(segments):
-                if segments[i] == "document":
-                    i += 1
-                    continue
                 wanted, found = segments[i], None
                 for child_id, name in listing.get(current, []):
                     if child_id == wanted:
@@ -127,6 +124,9 @@ class AndroidSafSmokeTests(unittest.TestCase):
                     found, f"expected {wanted!r} to resolve through its parent listing")
                 current = found
                 i += 1
+                if i < len(segments):
+                    self.assertEqual(segments[i], "document")
+                    i += 1
             return current
 
         # Shared storage: the id is the name, so the old form keeps working.
@@ -146,12 +146,22 @@ class AndroidSafSmokeTests(unittest.TestCase):
         # A URI that already carries a real id resolves to itself, which is the
         # shape the page builds after listing through this plugin.
         self.assertEqual(resolve(["tree", "treeId", "document", "9zY8x"], drive), "9zY8x")
+        # A real descendant ID is not a child of the root; accepting it by a
+        # direct provider query would skip the parent listing entirely.
+        with self.assertRaises(AssertionError):
+            resolve(["tree", "treeId", "document", "4kL5m"], drive)
+        self.assertEqual(resolve(["tree", "treeId", "document", "9zY8x", "document", "4kL5m"], drive), "4kL5m")
+        literal = {"document": [("folder-id", "document")], "folder-id": [("file-id", "document")]}
+        self.assertEqual(resolve(["tree", "document", "document", "document", "document", "document"], literal), "file-id")
 
     def test_the_plugin_resolves_before_it_builds_a_document_uri(self):
         """The five commands must not append a name to a parent URI unlooked-up."""
         plugin = (ROOT / "crates" / "linscp-tauri" / "android"
                   / "LinSCPAndroidPlugin.kt").read_text(encoding="utf-8")
         self.assertIn("private fun resolveDocument", plugin)
+        resolver = plugin[plugin.index("private fun resolveDocument"):plugin.index("private fun listChildren")]
+        self.assertNotIn("existsDirectly", resolver)
+        self.assertIn("buildChildDocumentsUriUsingTree", resolver)
         for command in ("writeUri", "mkdirUri", "deleteUri", "renameUri", "statUri"):
             start = plugin.index(f"fun {command}(")
             end = plugin.index("@Command", start) if "@Command" in plugin[start:] else len(plugin)

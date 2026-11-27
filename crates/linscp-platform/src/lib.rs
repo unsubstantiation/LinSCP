@@ -17,6 +17,7 @@ use thiserror::Error;
 use zeroize::Zeroizing;
 
 pub mod cli_args;
+pub mod url_registration;
 pub mod desktop;
 pub mod password_vault;
 pub mod gssapi_sys;
@@ -1126,6 +1127,19 @@ impl SingleInstanceServer {
     where
         F: Fn() + Send + Sync + 'static,
     {
+        Self::start_with_urls(config_dir, move |url| {
+            if url.is_some() { return false; }
+            on_activate();
+            true
+        })
+    }
+
+    /// Authenticated activation with an optional untrusted URL. The callback must
+    /// return false if it cannot retain the URL; credentials are never written to disk.
+    pub fn start_with_urls<F>(config_dir: &Path, on_activate: F) -> Result<Self, PlatformError>
+    where
+        F: Fn(Option<String>) -> bool + Send + Sync + 'static,
+    {
         create_private_dir(config_dir)?;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
         let addr = listener.local_addr()?;
@@ -1157,17 +1171,26 @@ impl SingleInstanceServer {
                     };
                     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(400)));
                     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(400)));
-                    let mut line = String::new();
+                    let mut line = Zeroizing::new(String::new());
                     let read_ok = {
-                        let mut reader = BufReader::new(&stream);
-                        reader.read_line(&mut line).is_ok()
+                        use std::io::Read;
+                        let mut reader = BufReader::new((&stream).take(12000));
+                        reader.read_line(&mut line).is_ok() && line.ends_with('\n')
                     };
-                    if !read_ok {
-                        continue;
-                    }
+                    if !read_ok { continue; }
                     let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-                    if constant_time_bytes_eq(trimmed.as_bytes(), expected_line.as_bytes()) {
-                        on_activate();
+                    let (auth, encoded) = trimmed.split_once(' ').and_then(|(command, rest)| {
+                        let (token, payload) = rest.split_once(' ').unwrap_or((rest, ""));
+                        (command == "ACTIVATE").then_some((format!("{command} {token}"), payload))
+                    }).unwrap_or_default();
+                    if !constant_time_bytes_eq(auth.as_bytes(), expected_line.as_bytes()) { continue; }
+                    let url = if encoded.is_empty() { None } else {
+                        let Ok(bytes) = BASE64.decode(encoded) else { continue; };
+                        let Ok(value) = String::from_utf8(bytes) else { continue; };
+                        if !cli_args::is_session_url(&value) { continue; }
+                        Some(value)
+                    };
+                    if on_activate(url) {
                         let _ = stream.write_all(b"OK\n");
                         let _ = stream.flush();
                     }
@@ -1197,6 +1220,12 @@ impl Drop for SingleInstanceServer {
 /// Signals an already-running primary desktop instance for `config_dir` to show
 /// and focus its main window, returning `true` when the primary acknowledged.
 pub fn try_signal_running_instance(config_dir: &Path) -> bool {
+    try_signal_running_instance_with_url(config_dir, None)
+}
+
+/// Deliver a URL in memory over the authenticated channel, never via the endpoint file.
+pub fn try_signal_running_instance_with_url(config_dir: &Path, url: Option<&str>) -> bool {
+    if url.is_some_and(|value| !cli_args::is_session_url(value)) { return false; }
     use std::io::{BufRead, BufReader, Read};
     let endpoint_file = config_dir.join(INSTANCE_IPC_FILE);
     let Ok(mut file) = open_private_file_no_follow(&endpoint_file) else {
@@ -1226,7 +1255,10 @@ pub fn try_signal_running_instance(config_dir: &Path) -> bool {
     };
     let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(350)));
     let _ = stream.set_write_timeout(Some(std::time::Duration::from_millis(350)));
-    let msg = Zeroizing::new(format!("ACTIVATE {token}\n"));
+    let msg = Zeroizing::new(match url {
+        Some(value) => format!("ACTIVATE {token} {}\n", BASE64.encode(value)),
+        None => format!("ACTIVATE {token}\n"),
+    });
     if stream.write_all(msg.as_bytes()).is_err() || stream.flush().is_err() {
         return false;
     }
@@ -1360,6 +1392,33 @@ mod tests {
         assert_eq!(hits.load(Ordering::SeqCst), 1);
         drop(server);
         assert!(!try_signal_running_instance(&root));
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn single_instance_delivers_urls_only_to_authenticated_listener() {
+        let root = std::env::temp_dir().join(format!("linscp-url-ipc-{}-{}", std::process::id(), rand::random::<u64>()));
+        let received = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured = received.clone();
+        let server = SingleInstanceServer::start_with_urls(&root, move |url| {
+            captured.lock().unwrap().push(url);
+            true
+        }).unwrap();
+        let url = "sftp://user:secret@example.test/path%20name";
+        assert!(try_signal_running_instance_with_url(&root, Some(url)));
+        assert!(!try_signal_running_instance_with_url(&root, Some("javascript://evil")));
+        assert_eq!(*received.lock().unwrap(), vec![Some(url.to_string())]);
+        let record = std::fs::read_to_string(root.join(INSTANCE_IPC_FILE)).unwrap();
+        assert!(!record.contains("secret"));
+        let addr: std::net::SocketAddr = record.split_whitespace().next().unwrap().parse().unwrap();
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        stream.write_all(b"ACTIVATE wrong c2Z0cDovL2V4YW1wbGUudGVzdA==\n").unwrap();
+        stream.shutdown(std::net::Shutdown::Write).unwrap();
+        let mut reply = String::new();
+        std::io::Read::read_to_string(&mut stream, &mut reply).unwrap();
+        assert!(reply.is_empty());
+        assert_eq!(received.lock().unwrap().len(), 1);
+        drop(server);
         let _ = std::fs::remove_dir_all(root);
     }
 

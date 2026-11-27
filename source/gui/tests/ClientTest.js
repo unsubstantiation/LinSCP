@@ -259,6 +259,7 @@ function vaultBackupBody(path, options) {
     return out;
   }
   if (path === '/api/vault/scan') {
+    if (keyOnlyScan) return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 0, entry_count: 0, vault_key_count: 1, entries: [] };
     return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 1,
       entry_count: 2,
       entries: [
@@ -281,6 +282,7 @@ const calls = [];
 const errors = [];
 const confirmMessages = [];
 let confirmResult = true;
+let keyOnlyScan = false;
 let delayedTabOpen = null;
 
 const dom = new JSDOM(html, {
@@ -2455,6 +2457,51 @@ function options(id) {
   doc.getElementById('vaultUnlockButton').disabled = false;
   doc.getElementById('vaultGateError').textContent = '';
 
+  {
+    const originalUserAgent = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+    Object.defineProperty(window.navigator, 'userAgent', {configurable: true, value: 'Android'});
+    const originalInvoke = window.__TAURI_INTERNALS__.invoke;
+    const bioCalls = [];
+    let bioStatus = {available: true, enabled: true};
+    let unlockSucceeds = false;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (!cmd.startsWith('linscp_biometric_')) return originalInvoke(cmd, args);
+      bioCalls.push({cmd, args});
+      if (cmd === 'linscp_biometric_status') return bioStatus;
+      if (cmd === 'linscp_biometric_unlock' && !unlockSucceeds) throw new Error('cancelled');
+      return {success: true};
+    };
+    responses['/api/vault/status'] = {success: true, vault: 'locked'};
+    let gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    check('Android vault offers biometric unlock only when enrolled', doc.getElementById('vaultBiometricButton').style.display !== 'none' && doc.getElementById('vaultBiometricEnrollRow').style.display === 'none');
+    await doc.getElementById('vaultBiometricButton').onclick();
+    check('cancelled biometric authentication keeps the password gate open', doc.getElementById('vaultGate').style.display === 'flex' && text('vaultGateError').includes('password'));
+    unlockSucceeds = true;
+    await doc.getElementById('vaultBiometricButton').onclick();
+    check('successful biometric unlock closes gate without passing a password to the page', await gatePromise && bioCalls.filter(c => c.cmd === 'linscp_biometric_unlock').every(c => !c.args));
+    bioStatus = {available: true, enabled: true};
+    gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    await doc.getElementById('vaultBiometricDisable').onclick();
+    check('biometric unlock can be disabled from the password gate', bioCalls.some(c => c.cmd === 'linscp_biometric_disable') && doc.getElementById('vaultBiometricButton').style.display === 'none');
+    doc.getElementById('vaultPassword').value = 'vault-password';
+    await doc.getElementById('vaultGateForm').onsubmit({preventDefault() {}});
+    await gatePromise;
+    bioStatus = {available: true, enabled: false};
+    gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    check('biometric enrollment is opt-in', doc.getElementById('vaultBiometricEnrollRow').style.display !== 'none' && !doc.getElementById('vaultBiometricEnroll').checked);
+    doc.getElementById('vaultBiometricEnroll').checked = true;
+    doc.getElementById('vaultPassword').value = 'vault-password';
+    await doc.getElementById('vaultGateForm').onsubmit({preventDefault() {}});
+    check('password unlock explicitly enrolls biometrics only after success', await gatePromise && bioCalls.some(c => c.cmd === 'linscp_biometric_enroll' && c.args.password === 'vault-password') && !doc.getElementById('vaultPassword').value);
+    responses['/api/vault/status'] = previousVaultStatus;
+    window.__TAURI_INTERNALS__.invoke = originalInvoke;
+    if (originalUserAgent) Object.defineProperty(window.navigator, 'userAgent', originalUserAgent);
+    else delete window.navigator.userAgent;
+  }
+
   window.openFullBackup();
   check('full backup dialog opens', doc.getElementById('fullBackupModal').classList.contains('open'));
   doc.getElementById('fullBackupPassword').value = 'long-backup-password';
@@ -2541,12 +2588,14 @@ function options(id) {
   const exportCalls = () => calls.filter(call => call.path === '/api/vault/export');
   const exportBaseline = exportCalls().length;
   doc.querySelector('#keyExportList input[type="checkbox"]').checked = false;
+  doc.getElementById('keyExportIncludeVaultKeys').checked = false;
   await window.exportKeySession();
   check('an empty selection exports nothing',
     exportCalls().length === exportBaseline &&
       text('keyExportStatus').includes('Select at least one session to export.'),
     text('keyExportStatus'));
   doc.querySelector('#keyExportList input[type="checkbox"]').checked = true;
+  doc.getElementById('keyExportIncludeVaultKeys').checked = true;
   doc.getElementById('keyExportPassword').value = 'backup-password';
   doc.getElementById('keyExportPasswordConfirm').value = 'different-password';
   const mismatchBaseline = exportCalls().length;
@@ -2560,7 +2609,7 @@ function options(id) {
   const exportCall = exportCalls().pop();
   const exportPayload = exportCall ? JSON.parse(exportCall.options.body) : {};
   check('a matching export posts the ticked sessions',
-    exportPayload.plain_text === false &&
+    exportPayload.plain_text === false && exportPayload.include_vault_keys === true &&
       exportPayload.password === 'backup-password' &&
       JSON.stringify(exportPayload.sessions) === JSON.stringify(['GUI/test']),
     JSON.stringify(exportPayload));
@@ -2650,6 +2699,22 @@ function options(id) {
       keyPickerCallsAfter > keyPickerCallsBefore,
     text('keyImportStatus'));
   window.closeModal('keySessionImportModal');
+  keyOnlyScan = true;
+  await window.openKeySessionImport();
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files', { value: [plainFile], configurable: true });
+  await window.scanKeySessionBackup();
+  check('a key-only backup displays its key count', text('keyImportVaultKeys').includes('1'), text('keyImportVaultKeys'));
+  doc.getElementById('sshKeyVaultModal').classList.add('open');
+  const keyOnlyPickerBefore = calls.filter(call => call.path === '/api/vault/keys').length;
+  const keyOnlyImportBefore = importCalls().length;
+  await window.importKeySession();
+  check('a key-only backup imports and refreshes the key picker',
+    importCalls().length === keyOnlyImportBefore + 1 &&
+      JSON.parse(importCalls().at(-1).options.body).sessions.length === 0 &&
+      calls.filter(call => call.path === '/api/vault/keys').length > keyOnlyPickerBefore);
+  doc.getElementById('sshKeyVaultModal').classList.remove('open');
+  window.closeModal('keySessionImportModal');
+  keyOnlyScan = false;
 
   /* Preferences: the defaults come from the backend, a save posts the whole
    * document, and the confirmation switches reach the copy and delete paths. */
@@ -5642,6 +5707,24 @@ function options(id) {
     check('loadTransferPresets renders auto-matched preset banner for current tab',
       doc.getElementById('transferPresetMatchedHint').style.display === 'flex' &&
       doc.getElementById('transferPresetMatchedHint').textContent.includes('ProdWeb'));
+    const presetSelect = doc.getElementById('transferPresetSelect');
+    presetSelect.value = 'off';
+    window.selectTransferPreset();
+    check('manual preset opt-out sends off to the backend', window.transferOptions().preset === 'off');
+    await window.loadTransferPresets();
+    check('manual preset opt-out survives reloading presets', presetSelect.value === 'off');
+    const offPreferences = window.settingsToPreferences(window.preferencesToSettings({preset: 'off'}));
+    check('manual preset opt-out persists through preferences', offPreferences.preset === 'off');
+    presetSelect.value = '';
+    window.selectTransferPreset();
+    check('automatic preset selection leaves matching enabled', !('preset' in window.transferOptions()));
+    window.eval("transferSettings.preset = 'deleted-preset'");
+    window.openTransferSettings();
+    await window.loadTransferPresets();
+    check('unavailable saved preset is not silently changed to automatic',
+      presetSelect.value === 'deleted-preset' && presetSelect.selectedOptions[0].textContent.includes('deleted-preset'));
+    presetSelect.value = '';
+    window.selectTransferPreset();
     window.applyMatchedTransferPreset();
     check('applyMatchedTransferPreset populates permissions, octal mode, EOL, preserve_time=all, and auto-selection rules',
       doc.getElementById('transferPresetSelect').value === 'ProdWeb' &&
@@ -6198,6 +6281,28 @@ function options(id) {
       doc.getElementById('siteRemoteDir').value === '/var/www');
     window.closeModal('siteModal');
     window.__TAURI_INTERNALS__.invoke = origInvokeHk;
+
+    // A native launch URL is offered for review, never connected implicitly.
+    let launchCalls = 0;
+    let pendingUrl = 'sftp://alice:launch-secret@example.test/path%20name';
+    const beforeLaunchInvoke = window.__TAURI_INTERNALS__.invoke;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (cmd === 'linscp_take_launch_url') { launchCalls++; const url = pendingUrl; pendingUrl = null; return url; }
+      return beforeLaunchInvoke(cmd, args);
+    };
+    // Ignore unrelated dialogs left by other fixture cases.
+    doc.querySelectorAll('.modal-overlay.open').forEach(el => el.classList.remove('open'));
+    window.openModal('helpModal');
+    await window.checkNativeLaunchUrl();
+    check('native launch URL waits while another dialog is open', launchCalls === 0);
+    window.closeModal('helpModal');
+    await window.checkNativeLaunchUrl();
+    check('native launch URL opens review without connecting',
+      launchCalls === 1 && doc.getElementById('sessionUrlModal').classList.contains('open') &&
+      doc.getElementById('pasteSessionUrlInput').value === 'sftp://alice:launch-secret@example.test/path%20name' &&
+      !doc.getElementById('siteModal').classList.contains('open'));
+    window.closeModal('sessionUrlModal');
+    window.__TAURI_INTERNALS__.invoke = beforeLaunchInvoke;
 
     // 14. New file (`newFilePrompt`) with `create_only: true` + Local `Save as` (`saveEditorFileAs`).
     const origInvokeEdit = window.__TAURI_INTERNALS__.invoke;

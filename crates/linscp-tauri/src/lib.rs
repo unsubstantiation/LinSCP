@@ -20,6 +20,7 @@ pub mod android;
 pub struct TauriBridge {
     service: CommanderService,
     android: std::sync::Arc<android::AndroidState>,
+    launch_urls: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
 }
 
 impl Default for TauriBridge {
@@ -45,11 +46,12 @@ impl TauriBridge {
         Self {
             service,
             android: std::sync::Arc::new(android::AndroidState::new()),
+            launch_urls: Default::default(),
         }
     }
 
     pub fn with_android_state(service: CommanderService, android: std::sync::Arc<android::AndroidState>) -> Self {
-        Self { service, android }
+        Self { service, android, launch_urls: Default::default() }
     }
 
     /// Bridge for a *windowed* host: the desktop app. A remote-desktop viewer
@@ -60,6 +62,7 @@ impl TauriBridge {
         Self {
             service: service.with_desktop_spawn(true),
             android: std::sync::Arc::new(android::AndroidState::new()),
+            launch_urls: Default::default(),
         }
     }
 
@@ -75,7 +78,16 @@ impl TauriBridge {
         Self {
             service: self.service.with_desktop_spawn(false),
             android: self.android,
+            launch_urls: self.launch_urls,
         }
+    }
+
+    fn enqueue_launch_url(&self, url: String) -> bool {
+        if !linscp_platform::cli_args::is_session_url(&url) { return false; }
+        let Ok(mut queue) = self.launch_urls.lock() else { return false; };
+        if queue.len() >= 16 { return false; }
+        queue.push_back(url);
+        true
     }
 
     /// Direct IPC entrypoint invoked by `TauriTransport` in `ui/src/transport/tauri.ts`.
@@ -122,6 +134,67 @@ pub mod commands {
         envelope: ApiEnvelope,
     ) -> Result<ApiReply, String> {
         Ok(state.invoke_async(envelope).await)
+    }
+
+    /// Biometric material stays inside the native bridge; the WebView never
+    /// receives the recovered password. The ordinary vault gate still checks
+    /// passwords, recovery journals, and configuration locking on both paths.
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_status(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let bridge = state.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || bridge.status().map_err(|e| e.to_string()))
+            .await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_enroll(state: tauri::State<'_, TauriBridge>, password: String) -> Result<serde_json::Value, String> {
+        let app = state.inner().clone();
+        let biometric = app.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        let password = zeroize::Zeroizing::new(password);
+        tauri::async_runtime::spawn_blocking(move || {
+            let status = app.invoke(ApiEnvelope { method: "GET".into(), path: "/api/vault/status".into(), body: json!({}) });
+            if status.status != 200 || status.payload["vault"] != "unlocked" { return Err("Unlock the vault with its password first".to_string()); }
+            let verified = app.invoke(ApiEnvelope { method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": &*password}) });
+            if verified.status != 200 { return Err("Vault password verification failed".to_string()); }
+            biometric.enroll(&password).map_err(|e| e.to_string())?;
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_unlock(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let app = state.inner().clone();
+        let biometric = app.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let status = app.invoke(ApiEnvelope { method: "GET".into(), path: "/api/vault/status".into(), body: json!({}) });
+            if status.status != 200 || status.payload["vault"] != "locked" { return Err("The vault is not locked; use your password".to_string()); }
+            let password = biometric.unlock().map_err(|e| e.to_string())?;
+            let reply = app.invoke(ApiEnvelope { method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": &*password}) });
+            if reply.status != 200 || reply.payload["success"] != true { return Err("Biometric unlock failed; use your vault password".to_string()); }
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_disable(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let bridge = state.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            bridge.disable().map_err(|e| e.to_string())?;
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    /// Only the main window may consume pending URLs. They are reviewed by the
+    /// user and never opened automatically, and are not persisted to disk.
+    #[cfg(not(target_os = "android"))]
+    #[tauri::command]
+    pub fn linscp_take_launch_url(window: tauri::WebviewWindow, state: tauri::State<'_, TauriBridge>) -> Option<String> {
+        if window.label() != "main" { return None; }
+        state.launch_urls.lock().ok()?.pop_front()
     }
 
     /// Opens one terminal in its own OS window.
@@ -509,13 +582,18 @@ fn build_native_app_with_bridge(
             use tauri::Manager;
             if app.state::<TauriBridge>().service.has_config_lock() {
                 let app_handle = app.handle().clone();
-                if let Ok(instance_guard) = linscp_platform::SingleInstanceServer::start(
+                let bridge = app.state::<TauriBridge>().inner().clone();
+                if let Ok(instance_guard) = linscp_platform::SingleInstanceServer::start_with_urls(
                     &linscp_platform::config_dir(),
-                    move || {
+                    move |url| {
+                        if let Some(url) = url {
+                            if !bridge.enqueue_launch_url(url) { return false; }
+                        }
                         let handle = app_handle.clone();
                         let _ = app_handle.run_on_main_thread(move || {
                             focus_or_recreate_main_window(&handle);
                         });
+                        true
                     },
                 ) {
                     app.manage(instance_guard);
@@ -572,6 +650,16 @@ fn build_native_app_with_bridge(
     });
     builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_status,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_enroll,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_unlock,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_disable,
+            #[cfg(not(target_os = "android"))]
+            commands::linscp_take_launch_url,
             #[cfg(not(target_os = "android"))]
             commands::linscp_open_terminal_window,
             commands::linscp_read_clipboard,
@@ -595,12 +683,17 @@ pub fn build_native_app() -> tauri::Builder<tauri::Wry> {
 
 #[cfg(feature = "native-shell")]
 pub fn run_native_app(context: tauri::Context<tauri::Wry>) {
+    run_native_app_with_url(context, None);
+}
+
+#[cfg(feature = "native-shell")]
+pub fn run_native_app_with_url(context: tauri::Context<tauri::Wry>, #[allow(unused_variables)] url: Option<String>) {
     #[cfg(not(target_os = "android"))]
     {
         let bridge = TauriBridge::default();
         if !bridge.service.has_config_lock() {
             let cfg_dir = linscp_platform::config_dir();
-            if linscp_platform::try_signal_running_instance(&cfg_dir) {
+            if linscp_platform::try_signal_running_instance_with_url(&cfg_dir, url.as_deref()) {
                 return;
             }
             for _ in 0..15 {
@@ -608,11 +701,12 @@ pub fn run_native_app(context: tauri::Context<tauri::Wry>) {
                 if bridge.service.retry_config_lock().is_ok() {
                     break;
                 }
-                if linscp_platform::try_signal_running_instance(&cfg_dir) {
+                if linscp_platform::try_signal_running_instance_with_url(&cfg_dir, url.as_deref()) {
                     return;
                 }
             }
         }
+        if let Some(url) = url { let _ = bridge.enqueue_launch_url(url); }
         build_native_app_with_bridge(Some(bridge))
             .run(context)
             .expect("failed to run LinSCP Tauri shell");
@@ -635,6 +729,17 @@ pub fn run() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn launch_url_queue_is_bounded_and_rejects_untrusted_schemes() {
+        let bridge = TauriBridge::new(CommanderService::default());
+        assert!(!bridge.enqueue_launch_url("https://example.test".into()));
+        for i in 0..16 { assert!(bridge.enqueue_launch_url(format!("sftp://host/{i}"))); }
+        assert!(!bridge.enqueue_launch_url("sftp://host/overflow".into()));
+        let mut queue = bridge.launch_urls.lock().unwrap();
+        assert_eq!(queue.pop_front().as_deref(), Some("sftp://host/0"));
+        assert_eq!(queue.len(), 15);
+    }
 
     /// A SAF tree that lives in memory, so the desktop test can drive the same
     /// `content://` listing and write paths the Android app uses.

@@ -3,6 +3,7 @@ cmake_minimum_required(VERSION 3.25)
 project(LinSCP VERSION 2026.11.15 LANGUAGES NONE)
 find_program(CARGO cargo REQUIRED)
 find_program(NPM npm REQUIRED)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
 add_custom_target(linscp ALL
   COMMAND ${NPM} --prefix ui ci --no-audit --no-fund
   COMMAND ${NPM} --prefix ui run build
@@ -15,6 +16,15 @@ set_tests_properties(rust-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
 add_test(NAME ui-tests COMMAND ${NPM} --prefix ui test)
 set_tests_properties(ui-tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 install(PROGRAMS ${CMAKE_SOURCE_DIR}/target/release/linscp-gui DESTINATION bin)
-install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.desktop DESTINATION share/applications)
+# Generate at install time so `cmake --install --prefix` also works. DESTDIR
+# stages files only; it must not appear in the runtime desktop launcher.
+install(CODE "
+  execute_process(COMMAND \"${Python3_EXECUTABLE}\" \"${CMAKE_SOURCE_DIR}/tools/install_desktop_entry.py\"
+    --prefix \"\${CMAKE_INSTALL_PREFIX}\" --destdir \"\$ENV{DESTDIR}\"
+    --template \"${CMAKE_SOURCE_DIR}/debian/linscp.desktop\" RESULT_VARIABLE result)
+  if(NOT result STREQUAL \"0\")
+    message(FATAL_ERROR \"Failed to install LinSCP desktop entry: \${result}\")
+  endif()
+")
 install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.png DESTINATION share/pixmaps)
 install(FILES ${CMAKE_SOURCE_DIR}/debian/linscp.svg DESTINATION share/icons/hicolor/scalable/apps)

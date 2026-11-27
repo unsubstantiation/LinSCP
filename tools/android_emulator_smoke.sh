@@ -1,9 +1,18 @@
 #!/usr/bin/env bash
 set -euo pipefail
 log=$(mktemp)
+ssh_log=$(mktemp)
+ssh_root=$(mktemp -d)
+ssh_key_dir=$(mktemp -d)
+ssh_server=''
+cleanup() {
+  kill "$server" ${ssh_server:+"$ssh_server"} 2>/dev/null || true
+  rm -f "${oversize_download_fixture:-}" "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
+  rm -rf -- "$ssh_root" "$ssh_key_dir"
+}
 LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
 server=$!
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}"' EXIT
+trap cleanup EXIT
 for _ in $(seq 1 60); do
   grep -q '^READY ' "$log" && break
   kill -0 "$server" || { cat "$log"; exit 1; }
@@ -11,6 +20,27 @@ for _ in $(seq 1 60); do
 done
 port=$(sed -n 's/^READY //p' "$log" | head -n 1)
 test -n "$port"
+# A disposable key is authorized only by the throwaway fixture. The private
+# key remains outside its SFTP root and is supplied to the test process in
+# memory; no production key or account is used.
+ssh-keygen -q -t ed25519 -N '' -f "$ssh_key_dir/backup-fixture"
+mkdir -p "$ssh_root/.ssh"
+cp "$ssh_key_dir/backup-fixture.pub" "$ssh_root/.ssh/authorized_keys"
+LINSCP_ANDROID_SSH_KEY_B64=$(base64 -w0 "$ssh_key_dir/backup-fixture")
+export LINSCP_ANDROID_SSH_KEY_B64
+# A throwaway SSH fixture makes the Android agent refusal traverse the real
+# handshake, host-key challenge and authentication path inside the APK.
+LSCP_TEST_PORT=0 LSCP_TEST_ROOT="$ssh_root" python3 source/linux/tests/TestSftpServer.py >"$ssh_log" 2>&1 &
+ssh_server=$!
+for _ in $(seq 1 60); do
+  grep -q '^READY ' "$ssh_log" && break
+  kill -0 "$ssh_server" || { cat "$ssh_log"; exit 1; }
+  sleep 1
+done
+LINSCP_ANDROID_SSH_PORT=$(sed -n 's/^READY //p' "$ssh_log" | head -n 1)
+test -n "$LINSCP_ANDROID_SSH_PORT"
+export LINSCP_ANDROID_SSH_PORT
+adb reverse "tcp:$LINSCP_ANDROID_SSH_PORT" "tcp:$LINSCP_ANDROID_SSH_PORT"
 # The package is the one the configuration names, read rather than repeated:
 # a rename that reaches only some of these places would leave the harness
 # driving an app that is not installed.
@@ -33,6 +63,52 @@ done
 if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
 adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
 app_root_file=$(mktemp)
+# Restart actually destroys the app process and its in-memory vault key.
+restart_and_run() {
+  local phase=$1
+  adb shell am force-stop "$application"
+  adb shell am start -n "$application/.MainActivity"
+  for _ in $(seq 1 90); do
+    pid=$(adb shell pidof "$application" | tr -d '\r' || true)
+    if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
+    sleep 1
+  done
+  if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
+  adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase" "${portable_file:-}"; then
+    adb logcat -d --pid="$pid" -t 200 || true
+    exit 1
+  fi
+}
+exercise_biometrics() {
+  python3 tools/android_enroll_emulator_fingerprint.py
+  restart_and_run bio-enroll-start
+  python3 tools/android_confirm_emulator_biometric.py 1
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish; then
+    adb logcat -d -s LinSCPBiometric:W || true
+    exit 1
+  fi
+  restart_and_run bio-unlock-start
+  python3 tools/android_confirm_emulator_biometric.py 2
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-wrong-check
+  python3 tools/android_confirm_emulator_biometric.py 1
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish; then
+    adb logcat -d -s LinSCPBiometric:W || true
+    exit 1
+  fi
+  # Re-enroll the application credential, then add another device fingerprint.
+  restart_and_run bio-enroll-start
+  python3 tools/android_confirm_emulator_biometric.py 1
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
+  python3 tools/android_enroll_emulator_fingerprint.py --additional
+  restart_and_run bio-invalidated
+}
+# A focused disposable-emulator run avoids unrelated provider/UI fixtures.
+if [[ ${LINSCP_BIOMETRIC_ONLY:-0} == 1 ]]; then
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-setup
+  exercise_biometrics
+  exit 0
+fi
 if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file"; then
   adb logcat -d --pid="$pid" -t 200 || true
   exit 1
@@ -75,7 +151,6 @@ fi
 # Inspect app-private bytes from the debug sandbox, without printing secrets.
 key_file=$(mktemp)
 sessions_file=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file"' EXIT
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_file"
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
 python3 - "$key_file" "$sessions_file" <<'PYCODE'
@@ -87,22 +162,7 @@ for secret in (b'android-smoke-vault-site', b'testuser', b'testpass', b'127.0.0.
     assert secret not in sessions, 'saved site metadata appeared in plaintext'
 PYCODE
 # Force-stop actually destroys the app process and its in-memory vault key.
-restart_and_run() {
-  local phase=$1
-  adb shell am force-stop "$application"
-  adb shell am start -n "$application/.MainActivity"
-  for _ in $(seq 1 90); do
-    pid=$(adb shell pidof "$application" | tr -d '\r' || true)
-    if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
-    sleep 1
-  done
-  if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
-  adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
-  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase" "${portable_file:-}"; then
-    adb logcat -d --pid="$pid" -t 200 || true
-    exit 1
-  fi
-}
+
 restart_and_run reopen-vault
 
 # Snapshot after reconnect, which may update the site's last-used metadata.
@@ -112,7 +172,6 @@ adb exec-out run-as "$application" cat "$sandbox/config/sessions.key" > "$key_fi
 adb exec-out run-as "$application" cat "$sandbox/config/sessions.ini" > "$sessions_file"
 tampered=$(mktemp)
 observed=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed"' EXIT
 for target in key sessions; do
   adb shell am force-stop "$application"
   if [[ "$target" == key ]]; then original=$key_file; dest=sessions.key; else original=$sessions_file; dest=sessions.ini; fi
@@ -158,7 +217,6 @@ restart_and_run reopen-vault
 portable_file=$(mktemp)
 source_key=$(mktemp)
 source_ssh_key=$(mktemp)
-trap 'kill "$server" 2>/dev/null || true; rm -f "$log" "${app_root_file:-}" "$key_file" "$sessions_file" "$tampered" "$observed" "$portable_file" "$source_key" "$source_ssh_key"' EXIT
 restart_and_run portable-export
 key_id=$(python3 - "$portable_file" <<'PYCODE'
 import json, re, sys
@@ -208,9 +266,24 @@ restart_and_run portable-reopen
 # Exercise a real persisted tree grant, obtained only through the OS picker.
 node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-start
 python3 tools/android_select_saf_folder.py
+# A provider-backed file one byte above the per-document cap, isolated so
+# other synchronization fixtures cannot accidentally traverse it.
+# A separate remote fixture tests WebDAV-to-provider refusal. A sparse host
+# file avoids checking a large binary into the repository; the server is the
+# disposable loopback fixture with test-only credentials.
+oversize_download_fixture=$(mktemp)
+truncate -s 67108865 "$oversize_download_fixture"
+curl --fail --silent --show-error --user testuser:testpass \
+  --upload-file "$oversize_download_fixture" "http://127.0.0.1:$port/oversize-download.bin" >/dev/null
+adb shell mkdir -p /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture
+adb shell "dd if=/dev/zero of=/sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin bs=1048576 count=64 && printf x >> /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin"
 node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-finish
+adb shell rm /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin
 if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-edited ]]; then
   echo "SAF provider did not persist edited bytes" >&2; exit 1
 fi
 restart_and_run saf-reopen
+# Enroll only on this disposable emulator, then exercise the real system
+# BiometricPrompt and Keystore CryptoObject across a process restart.
+exercise_biometrics
 echo "Installed application ID and its install directory verified: $application ($sandbox)"

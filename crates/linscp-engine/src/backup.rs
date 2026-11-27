@@ -28,6 +28,13 @@ pub struct BackupVaultKey {
     pub public_b64: Option<String>,
 }
 
+/// Public-only SSH key whose ID has no corresponding private vault key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BackupVaultPublicKey {
+    pub id: String,
+    pub public_b64: String,
+}
+
 /// Encrypted TLS certificate/CA/key blob stored under `keys/<id>.tls.vault`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BackupVaultTlsBlob {
@@ -122,6 +129,96 @@ fn validate_key_references(ini: &str, keys: &[BackupVaultKey]) -> Result<(), Str
     Ok(())
 }
 
+fn collect_public_only_keys(config_dir: &Path, private_keys: &[BackupVaultKey]) -> Result<Vec<BackupVaultPublicKey>, String> {
+    let dir = config_dir.join("keys");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => {},
+        Ok(_) => return Err("The vault keys path is not a directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
+    }
+    let private: BTreeSet<String> = private_keys.iter().map(|k| k.id.to_ascii_lowercase()).collect();
+    let mut names = BTreeSet::new();
+    let mut result = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let name = entry.file_name();
+        let name = name.to_str().ok_or("Invalid vault public key filename")?;
+        let Some(id) = name.strip_suffix(".pub") else { continue };
+        if !valid_key_id(id) || !names.insert(id.to_ascii_lowercase()) { return Err("Invalid or duplicate vault public key identifier.".into()); }
+        if private.contains(&id.to_ascii_lowercase()) {
+            if !private_keys.iter().any(|key| key.id == id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+            continue;
+        }
+        if result.len() >= KEY_COUNT_LIMIT { return Err("Too many vault public keys.".into()); }
+        let data = read_key_file(&entry.path(), PUBLIC_LIMIT)?.ok_or("Vault public key disappeared during backup")?;
+        if data.is_empty() { return Err("Vault public key is empty.".into()); }
+        result.push(BackupVaultPublicKey { id: id.into(), public_b64: BASE64.encode(data) });
+    }
+    result.sort_by(|a, b| a.id.cmp(&b.id));
+    Ok(result)
+}
+
+fn validate_public_key_references(ini: &str, keys: &[BackupVaultKey], public: &[BackupVaultPublicKey]) -> Result<(), String> {
+    let ids: BTreeSet<String> = keys.iter().filter(|k| k.public_b64.is_some()).map(|k| k.id.to_ascii_lowercase())
+        .chain(public.iter().map(|k| k.id.to_ascii_lowercase())).collect();
+    let store = SessionStore::parse_ini(ini, None)?;
+    for site in store.sites() {
+        for name in ["linscp_public_key_file", "linscp_tunnel_public_key_file"] {
+            if let Some(id) = site.extra_fields.get(name).and_then(|v| v.strip_prefix("vaultpub://")) {
+                if !valid_key_id(id) || !ids.contains(&id.to_ascii_lowercase()) {
+                    return Err(format!("Backup is missing a vault public key referenced by '{}'.", site.name));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn prepare_public_only_restore(config_dir: &Path, bundle: &BackupBundle) -> Result<Vec<(PathBuf, Vec<u8>)>, String> {
+    if bundle.vault_public_keys.len() > KEY_COUNT_LIMIT { return Err("Too many vault public keys in backup.".into()); }
+    let dir = config_dir.join("keys");
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.file_type().is_dir() => {},
+        Ok(_) => return Err("The vault keys path is not a directory.".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
+    }
+    let mut existing_names = BTreeSet::new();
+    match std::fs::read_dir(&dir) {
+        Ok(items) => for item in items { existing_names.insert(item.map_err(|e| e.to_string())?.file_name().to_string_lossy().to_ascii_lowercase()); },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
+    }
+    let mut seen = BTreeSet::new();
+    let mut prepared = Vec::new();
+    for item in &bundle.vault_public_keys {
+        if !valid_key_id(&item.id) || !seen.insert(item.id.to_ascii_lowercase())
+            || bundle.vault_keys.iter().any(|k| k.id.eq_ignore_ascii_case(&item.id)) {
+            return Err("Invalid or duplicate vault public key identifier in backup.".into());
+        }
+        if item.public_b64.len() > ((PUBLIC_LIMIT + 2) / 3) * 4 { return Err("Vault public key is too large.".into()); }
+        let bytes = BASE64.decode(&item.public_b64).map_err(|_| "Invalid vault public key encoding")?;
+        if bytes.is_empty() || bytes.len() > PUBLIC_LIMIT { return Err("Invalid vault public key size.".into()); }
+        let path = dir.join(format!("{}.pub", item.id));
+        match read_key_file(&path, PUBLIC_LIMIT)? {
+            Some(existing) if existing != bytes => return Err(format!("Public key metadata conflicts for {}.", item.id)),
+            Some(_) => {},
+            None => {
+                if existing_names.contains(&format!("{}.pub", item.id).to_ascii_lowercase()) {
+                    return Err(format!("Vault public key ID {} conflicts with an existing filename.", item.id));
+                }
+                // Do not attach a public-only record to an unrelated private key.
+                if existing_names.contains(&format!("{}.key.vault", item.id).to_ascii_lowercase()) {
+                    return Err(format!("Vault public key ID {} belongs to an existing private key.", item.id));
+                }
+                prepared.push((path, bytes));
+            }
+        }
+    }
+    Ok(prepared)
+}
+
 fn session_tls_references(ini: &str) -> Result<BTreeSet<String>, String> {
     let store = SessionStore::parse_ini(ini, None)?;
     let mut ids = BTreeSet::new();
@@ -208,6 +305,9 @@ pub struct BackupBundle {
     /// All local vault SSH keys, including unreferenced keys.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vault_keys: Vec<BackupVaultKey>,
+    /// Public-only SSH keys not represented by a private key record.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub vault_public_keys: Vec<BackupVaultPublicKey>,
     /// All local vault TLS certificate/CA/key blobs.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub vault_tls_blobs: Vec<BackupVaultTlsBlob>,
@@ -252,6 +352,7 @@ impl Default for BackupBundle {
             sessions_ini: String::new(),
             sessions_key_b64: None,
             vault_keys: Vec::new(),
+            vault_public_keys: Vec::new(),
             vault_tls_blobs: Vec::new(),
             workspaces: Vec::new(),
             commander_workspaces: None,
@@ -320,11 +421,13 @@ pub fn export_backup(
         return Err("Unlock the local vault before exporting a backup.".into());
     }
     let vault_keys = collect_vault_keys(config_dir, vault)?;
+    let vault_public_keys = collect_public_only_keys(config_dir, &vault_keys)?;
     let vault_tls_blobs = collect_vault_tls_blobs(config_dir, vault)?;
     let sessions_ini = SessionStore::read_ini_text(config_dir, vault)?
         .map(|s| normalize_to_lf(&s))
         .unwrap_or_default();
     validate_key_references(&sessions_ini, &vault_keys)?;
+    validate_public_key_references(&sessions_ini, &vault_keys, &vault_public_keys)?;
     validate_tls_references(&sessions_ini, &vault_tls_blobs)?;
 
     // Export the *unwrapped* master key as portable base64. This is what
@@ -378,6 +481,7 @@ pub fn export_backup(
         sessions_ini,
         sessions_key_b64,
         vault_keys,
+        vault_public_keys,
         vault_tls_blobs,
         workspaces,
         commander_workspaces,
@@ -617,6 +721,7 @@ fn prepare_restore_plan(
         return Err(format!("Unsupported backup version: {}", bundle.version));
     }
     validate_key_references(&bundle.sessions_ini, &bundle.vault_keys)?;
+    validate_public_key_references(&bundle.sessions_ini, &bundle.vault_keys, &bundle.vault_public_keys)?;
     validate_tls_references(&bundle.sessions_ini, &bundle.vault_tls_blobs)?;
 
     linscp_platform::create_private_dir(config_dir).map_err(|e| e.to_string())?;
@@ -679,6 +784,7 @@ fn prepare_restore_plan(
     }
 
     let mut restored_keys = prepare_vault_key_restore(config_dir, bundle, vault)?;
+    restored_keys.extend(prepare_public_only_restore(config_dir, bundle)?);
     restored_keys.extend(prepare_vault_tls_restore(config_dir, bundle, vault)?);
     let mut key_names = Vec::with_capacity(restored_keys.len());
     for (path, _) in &restored_keys {
@@ -946,6 +1052,7 @@ mod tests {
             sessions_ini: ini,
             sessions_key_b64: Some(raw_b64),
             vault_keys: Vec::new(),
+            vault_public_keys: Vec::new(),
             vault_tls_blobs: Vec::new(),
             workspaces: vec![WorkspaceSnapshot {
                 name: "Deploy".to_string(),

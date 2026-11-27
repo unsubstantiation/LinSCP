@@ -3,6 +3,10 @@
 import assert from 'node:assert/strict';
 import { readFileSync, writeFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
+const sshPort = Number(process.env.LINSCP_ANDROID_SSH_PORT);
+assert.ok(Number.isInteger(sshPort) && sshPort > 0 && sshPort < 65536, 'SSH fixture port is required');
+const fixtureKey = process.env.LINSCP_ANDROID_SSH_KEY_B64;
+assert.ok(fixtureKey && /^[A-Za-z0-9+/=]+$/.test(fixtureKey), 'disposable SSH fixture key is required');
 // The installed package, handed over by the harness that read it from the
 // configuration, so the storage this run finds is the storage of *this* app.
 const application = process.argv[3];
@@ -10,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -34,6 +38,73 @@ const expression = `
   for (let i = 0; i < 60 && !window.LinSCPTransport; i++) await sleep(1000);
   if (window.LinSCPTransport?.mode !== 'tauri') throw new Error('Tauri frontend transport not initialized');
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
+  async function verifyAndroidBiometrics() {
+    const phase = ${JSON.stringify(phase)};
+    const native = window.__TAURI_INTERNALS__;
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    if (phase === 'bio-setup') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'setup_required') throw new Error('Biometric fixture expected a fresh vault');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+      return {root, biometricFixture: true};
+    }
+    if (phase === 'bio-enroll-start') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric enrollment expected a locked vault');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      const status = await native.invoke('linscp_biometric_status');
+      if (!status.available || status.enabled) throw new Error('Enrolled emulator fingerprint unavailable: ' + JSON.stringify(status));
+      window.__bioResult = native.invoke('linscp_biometric_enroll', {password: 'different destination vault password'}).then(() => ({ok: true}), error => ({ok: false, error: String(error)}));
+      return {root, biometricPrompt: 'enroll'};
+    }
+    if (phase === 'bio-enroll-finish') {
+      const result = await window.__bioResult;
+      if (!result.ok || !(await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric enrollment failed: ' + JSON.stringify(result));
+      // The password-bearing native plugin must not be callable directly from
+      // the WebView; only the Rust command may consume the decrypted password.
+      const direct = await Promise.race([
+        native.invoke('plugin:linscp-android|biometricUnlock').then(() => 'accepted', () => 'refused'),
+        sleep(3000).then(() => 'pending'),
+      ]);
+      if (direct !== 'refused') throw new Error('WebView could invoke password-bearing biometric plugin: ' + direct);
+      return {root, biometricEnrolled: true, directPluginRefused: true};
+    }
+    if (phase === 'bio-invalidated') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Invalidation test expected locked vault');
+      let refused = false;
+      try { await native.invoke('linscp_biometric_unlock'); } catch (_) { refused = true; }
+      if (!refused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Enrollment change did not invalidate biometric unlock');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+      if (!opened.tab?.connected) throw new Error('Password recovery after biometric invalidation failed');
+      await invoke('POST', '/api/tabs/close', {tab: opened.tab.id});
+      await native.invoke('linscp_biometric_disable');
+      return {root, enrollmentChangeInvalidated: true, passwordRecovery: true};
+    }
+    if (phase === 'bio-unlock-start') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric unlock expected a locked vault');
+      if (!(await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric enrollment did not survive restart');
+      window.__bioResult = native.invoke('linscp_biometric_unlock').then(() => ({ok: true}), error => ({ok: false, error: String(error)}));
+      return {root, biometricPrompt: 'unlock'};
+    }
+    if (phase === 'bio-wrong-check') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Unenrolled fingerprint unlocked the vault');
+      return {root, wrongFingerprintRefused: true};
+    }
+    const result = await window.__bioResult;
+    if (!result.ok || (await invoke('GET', '/api/vault/status')).vault !== 'unlocked') throw new Error('Biometric vault unlock failed: ' + JSON.stringify(result));
+    const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!opened.tab?.connected) throw new Error('Biometric unlock did not recover saved credentials');
+    await invoke('POST', '/api/tabs/close', {tab: opened.tab.id});
+    await native.invoke('linscp_biometric_disable');
+    if ((await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric disable left the credential enabled');
+    await invoke('POST', '/api/vault/lock');
+    let refused = false;
+    try { await native.invoke('linscp_biometric_unlock'); } catch (_) { refused = true; }
+    if (!refused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Disabled biometrics still unlocked the vault');
+    await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+    return {root, biometricUnlock: true, savedCredentialRecovered: true, disableAndPasswordFallback: true};
+  }
+  if (${JSON.stringify(phase)}.startsWith('bio-')) return await verifyAndroidBiometrics();
   async function verifyAndroidVaultRestart() {
     const status = await invoke('GET', '/api/vault/status');
     if (status.vault !== 'locked') throw new Error('Restart did not lock vault: ' + JSON.stringify(status));
@@ -46,6 +117,7 @@ const expression = `
     await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
     const sessions = await invoke('GET', '/api/sessions');
     if (!sessions.sessions?.some(site => site.name === 'android-smoke-vault-site')) throw new Error('Saved site missing after restart');
+    if (sessions.sessions.some(site => site.name.startsWith('android-site-manager/'))) throw new Error('Deleted site manager fixtures returned after restart');
     if (JSON.stringify(sessions).includes('testpass')) throw new Error('Saved site listing exposed password');
     // Authentication against the fixture proves the password was recovered,
     // without exposing it through the list API.
@@ -118,13 +190,13 @@ const expression = `
     await invoke('POST', '/api/vault/unlock', {password});
     const root = (await invoke('GET', '/api/status')).local_dir;
     if (phase === 'portable-setup') return {root, destinationVaultSetUp: true};
-    // A deliberately nonfunctional private-key fixture: this exercises vault
-    // encryption and backup rewrapping, not SSH parsing or authentication.
-    const keyFixture = 'android portable backup private key fixture';
+    // This disposable key is authorized only by the test SFTP server. The
+    // backup must restore usable private key bytes, not just its metadata.
+    const keyFixture = atob(${JSON.stringify(fixtureKey)});
     if (phase === 'portable-export') {
       const key = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
       if (!key.success || !(key.reference?.startsWith('vaultkey://') && /^[a-f0-9]{32}$/.test(key.reference.slice(11)))) throw new Error('Fixture key import failed');
-      await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: 'fixture.invalid', username: 'test', keyfile: key.reference}});
+      await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', keyfile: key.reference, local_dir: root, initial_dir: '/'}});
       const exported = await invoke('POST', '/api/backup/export', {password: 'portable android backup password'});
       if (!exported.success || !atob(exported.data_base64).startsWith('LSCPBAK1')) throw new Error('Portable backup export failed');
       return {root, portableData: {backupBase64: exported.data_base64, keyReference: key.reference}};
@@ -145,6 +217,18 @@ const expression = `
     // destination vault without exposing private bytes through a read API.
     const duplicate = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
     if (!duplicate.deduplicated || duplicate.reference !== portable.keyReference) throw new Error('Restored key cannot be decrypted to the original fixture');
+    let sshConnection;
+    try { sshConnection = await invoke('POST', '/api/tabs/open', {site_name: 'portable-key-site'}); }
+    catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      const challenge = error.payload.challenge;
+      if (challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort}) throw new Error('Unexpected SSH fixture host-key challenge');
+      sshConnection = await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    }
+    if (!sshConnection.tab?.connected) throw new Error('Restored private key failed SFTP authentication');
+    const sshList = await invoke('GET', '/api/remote/list?tab=' + sshConnection.tab.id + '&path=' + encodeURIComponent('/'));
+    if (!Array.isArray(sshList.entries)) throw new Error('Restored SSH connection could not list the fixture');
+    await invoke('POST', '/api/tabs/close', {tab: sshConnection.tab.id});
     const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
     if (!opened.tab?.connected) throw new Error('Portable restored credential failed to authenticate');
     return {root, portableBackupPhase: phase};
@@ -204,8 +288,339 @@ const expression = `
       await invoke('POST', '/api/local/save', {tab, path: 'created.txt', content: 'created via SAF'});
       const created = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=created.txt');
       if (created.content !== 'created via SAF') throw new Error('SAF created bytes differ');
+      const properties = await invoke('POST', '/api/local/properties', {tab, names: ['created.txt']});
+      if (properties.properties?.[0]?.name !== 'created.txt' || properties.properties[0].size !== 15 || properties.properties[0].is_dir) throw new Error('SAF file properties differ: ' + JSON.stringify(properties));
+      await verifyAndroidSafEditorBoundary(tree, tab, root);
+      await verifyAndroidGrantedSafTransfers(tree, tab, root);
     }
     return {root, safEditing: phase};
+  }
+  async function verifyAndroidSafEditorBoundary(tree, tab, root) {
+    await invoke('POST', '/api/local/mkdir', {tab, name: 'editor-boundary'});
+    const subdir = tree + '/document/editor-boundary';
+    const nested = await invoke('POST', '/api/tabs/local', {local_dir: subdir, remote_dir: root});
+    const nestedTab = nested.tab.id;
+    await invoke('POST', '/api/local/save', {tab: nestedTab, path: 'inside.txt', content: 'inside'});
+    const own = subdir + '/document/inside.txt';
+    const read = await invoke('GET', '/api/local/edit?tab=' + nestedTab + '&path=' + encodeURIComponent(own));
+    if (read.content !== 'inside') throw new Error('SAF pane cannot open its direct child');
+    // A literal name equal to the URI separator is still a name.
+    await invoke('POST', '/api/local/mkdir', {tab: nestedTab, name: 'document'});
+    const documentDir = subdir + '/document/document';
+    const docTab = (await invoke('POST', '/api/tabs/local', {local_dir: documentDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: docTab, path: 'document', content: 'literal document'});
+    const literal = await invoke('GET', '/api/local/edit?tab=' + docTab + '&path=document');
+    if (literal.content !== 'literal document') throw new Error('SAF literal document name did not resolve');
+    const sibling = tree + '/document/marker.txt';
+    for (const method of ['read', 'save']) {
+      let refused = false;
+      try {
+        if (method === 'read') await invoke('GET', '/api/local/edit?tab=' + nestedTab + '&path=' + encodeURIComponent(sibling));
+        else await invoke('POST', '/api/local/save', {tab: nestedTab, path: sibling, content: 'outside overwrite'});
+      } catch (error) { refused = error.status === 400; }
+      if (!refused) throw new Error('SAF pane accepted a sibling editor ' + method);
+    }
+    // Shared storage IDs are absolute within the grant. A provider can resolve
+    // a grandchild's ID directly, even though it is not a direct child of the
+    // root pane. The bridge must walk the root's child listing instead.
+    const grantId = decodeURIComponent(tree.split('/tree/')[1]);
+    const directChild = tree + '/document/' + encodeURIComponent(grantId + '/marker.txt');
+    const marker = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=' + encodeURIComponent(directChild));
+    if (marker.content !== 'saf-edited') throw new Error('Direct child provider ID did not resolve');
+    const descendantAlias = tree + '/document/' + encodeURIComponent(grantId + '/editor-boundary/inside.txt');
+    let aliasRefused = false;
+    try { await invoke('GET', '/api/local/edit?tab=' + tab + '&path=' + encodeURIComponent(descendantAlias)); }
+    catch (error) { aliasRefused = error.status === 400; }
+    if (!aliasRefused) throw new Error('SAF pane accepted a descendant document ID as a direct child');
+    const unchanged = await invoke('GET', '/api/local/edit?tab=' + tab + '&path=marker.txt');
+    if (unchanged.content !== 'saf-edited') throw new Error('Refused sibling save changed provider bytes');
+  }
+  async function verifyAndroidGrantedSafTransfers(tree, localTab, root) {
+    const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+    if (!opened.tab?.connected) throw new Error('Cannot open WebDAV for SAF transfers');
+    const tab = opened.tab.id;
+    async function runTask(path, body) {
+      const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+      const reply = await invoke('POST', path, body);
+      if (!reply.success) throw new Error('SAF transfer was not queued');
+      for (let i = 0; i < 120; i++) {
+        const task = (await invoke('GET', '/api/transfers')).transfers.find(task => !previous.has(task.id));
+        if (task?.status === 'Completed') return;
+        if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('SAF transfer failed: ' + JSON.stringify(task));
+        await sleep(250);
+      }
+      throw new Error('SAF transfer timed out');
+    }
+    await verifyAndroidGrantedSafLocalCopyMove(tree, localTab, root, runTask);
+    await runTask('/api/transfer/upload', {tab, local_dir: tree, remote_dir: '/', names: ['created.txt']});
+    const remote = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/created.txt'));
+    if (remote.content !== 'created via SAF') throw new Error('SAF upload bytes differ on WebDAV');
+    await invoke('POST', '/api/remote/save', {tab, path: '/saf-down.txt', content: 'download into SAF'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt'], resume: true}); }
+    catch (error) { refused = error.status === 400 && /verified resume.*granted folders/i.test(error.message || ''); }
+    if (!refused) throw new Error('Verified resume into a granted folder was not refused');
+    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']});
+    const downloaded = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt');
+    if (downloaded.content !== 'download into SAF') throw new Error('SAF download bytes differ');
+    let conflict = false;
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']}); }
+    catch (error) { conflict = error.status === 409; }
+    if (!conflict || (await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt')).content !== 'download into SAF') throw new Error('Existing SAF destination was not protected');
+    await invoke('POST', '/api/remote/save', {tab, path: '/saf-move.txt', content: 'move into SAF'});
+    await runTask('/api/transfer/move', {tab, direction: 'download', local_dir: tree, remote_dir: '/', names: ['saf-move.txt']});
+    const moved = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-move.txt');
+    if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
+    const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
+    if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
+    await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafDocumentCap(tree, root, tab);
+  }
+  async function verifyAndroidGrantedSafDocumentCap(tree, root, tab) {
+    const dir = tree + '/document/cap-fixture';
+    const local = (await invoke('POST', '/api/tabs/local', {local_dir: dir, remote_dir: root})).tab.id;
+    const entries = (await invoke('GET', '/api/local/list?tab=' + local + '&path=' + encodeURIComponent(dir))).entries;
+    if (!entries?.some(entry => entry.name === 'oversize.bin' && entry.size === 67108865)) throw new Error('Provider cap fixture missing or wrong size: ' + JSON.stringify(entries));
+    async function expectCap(path, body) {
+      let refused = false;
+      try { await invoke('POST', path, body); }
+      catch (error) { refused = error.status === 400 && /oversize[.]bin/.test(error.message || '') && /64 MiB/.test(error.message || ''); }
+      if (!refused) throw new Error('Expected named provider document-cap refusal from ' + path);
+    }
+    // The remote fixture is independently served by WebDAV and is one byte
+    // over the provider limit. Refuse both copy and move before queuing, and
+    // ensure the source survives (especially the destructive move path).
+    const remoteName = 'oversize-download.bin';
+    const beforeQueue = (await invoke('GET', '/api/transfers')).transfers.length;
+    for (const [path, extra] of [['/api/transfer/download', {}], ['/api/transfer/move', {direction: 'download'}]]) {
+      let refused = false;
+      try { await invoke('POST', path, {tab, local_dir: tree, remote_dir: '/', names: [remoteName], ...extra}); }
+      catch (error) { refused = error.status === 400 && (error.message || '').includes(remoteName) && /64 MiB/.test(error.message || ''); }
+      if (!refused) throw new Error('Expected over-cap WebDAV to SAF refusal from ' + path);
+    }
+    if ((await invoke('GET', '/api/transfers')).transfers.length !== beforeQueue) throw new Error('Over-cap SAF download was queued');
+    const rootSafTab = (await invoke('POST', '/api/tabs/local', {local_dir: tree, remote_dir: root})).tab.id;
+    const target = (await invoke('GET', '/api/local/list?tab=' + rootSafTab + '&path=' + encodeURIComponent(tree))).entries;
+    if (target?.some(entry => entry.name === remoteName)) throw new Error('Over-cap download created a provider document');
+    const source = (await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'))).entries;
+    if (!source?.some(entry => entry.name === remoteName && entry.size === 67108865)) throw new Error('Over-cap move altered the WebDAV source');
+    await expectCap('/api/transfer/upload', {tab, local_dir: dir, remote_dir: '/', names: ['oversize.bin']});
+    await expectCap('/api/transfer/upload', {tab: local, local_dir: dir, remote_dir: root, names: ['oversize.bin']});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'cap-fixture'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/cap-fixture/oversize.bin', content: 'small remote fixture'});
+    await expectCap('/api/sync/preview', {tab, local_dir: dir, remote_dir: '/cap-fixture', mode: 'remote', criteria: 'checksum'});
+    const remote = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/cap-fixture/oversize.bin'));
+    if (remote.content !== 'small remote fixture') throw new Error('Cap refusal changed remote file');
+    const after = (await invoke('GET', '/api/local/list?tab=' + local + '&path=' + encodeURIComponent(dir))).entries;
+    if (!after?.some(entry => entry.name === 'oversize.bin' && entry.size === 67108865)) throw new Error('Cap refusal changed provider file');
+    const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: dir})).tab.id;
+    const privateFiles = (await invoke('GET', '/api/local/list?tab=' + rootTab + '&path=' + encodeURIComponent(root))).entries;
+    if (privateFiles?.some(entry => entry.name === 'oversize.bin')) throw new Error('Cap refusal left a local destination');
+  }
+  async function verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask) {
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-tree-up'});
+    const up = tree + '/document/transfer-tree-up';
+    const upTab = (await invoke('POST', '/api/tabs/local', {local_dir: up, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: upTab, name: 'nested'});
+    const child = (await invoke('POST', '/api/tabs/local', {local_dir: up + '/document/nested', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: child, path: 'up.txt', content: 'provider tree upload'});
+    const upload = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-up']};
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/upload', upload); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_copy_risk; }
+    if (!refused) throw new Error('WebDAV tree upload did not require risk confirmation');
+    await runTask('/api/transfer/upload', {...upload, accept_directory_copy_risk: true});
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-tree-up/nested/up.txt'))).content !== 'provider tree upload') throw new Error('SAF tree upload differs');
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-tree-down'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/transfer-tree-down', name: 'nested'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-tree-down/nested/down.txt', content: 'provider tree download'});
+    const download = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down']};
+    refused = false;
+    try { await invoke('POST', '/api/transfer/download', download); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_copy_risk; }
+    if (!refused) throw new Error('WebDAV tree download did not require risk confirmation');
+    await runTask('/api/transfer/download', {...download, accept_directory_copy_risk: true});
+    const down = (await invoke('POST', '/api/tabs/local', {local_dir: tree + '/document/transfer-tree-down/document/nested', remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + down + '&path=down.txt')).content !== 'provider tree download') throw new Error('SAF tree download differs');
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-merge'});
+    const mergeDir = tree + '/document/transfer-merge';
+    const mergeTab = (await invoke('POST', '/api/tabs/local', {local_dir: mergeDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: mergeTab, path: 'keep.txt', content: 'keep provider bytes'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-merge'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-merge/new.txt', content: 'merged server bytes'});
+    const merge = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-merge'], accept_directory_copy_risk: true};
+    refused = false;
+    try { await invoke('POST', '/api/transfer/download', merge); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_conflicts?.includes('transfer-merge'); }
+    if (!refused) throw new Error('SAF tree merge did not require confirmation');
+    await runTask('/api/transfer/download', {...merge, merge_directories: ['transfer-merge']});
+    if ((await invoke('GET', '/api/local/edit?tab=' + mergeTab + '&path=keep.txt')).content !== 'keep provider bytes' ||
+        (await invoke('GET', '/api/local/edit?tab=' + mergeTab + '&path=new.txt')).content !== 'merged server bytes') throw new Error('SAF tree merge did not preserve and add files');
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-merge/keep.txt', content: 'must not overwrite provider'});
+    const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    const reply = await invoke('POST', '/api/transfer/download', {...merge, merge_directories: ['transfer-merge']});
+    if (!reply.success) throw new Error('SAF conflicting tree merge was not queued');
+    let failed = false;
+    for (let i = 0; i < 120; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !previous.has(item.id));
+      if (task?.status === 'Failed') { failed = true; break; }
+      if (task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Conflicting SAF merge unexpectedly finished: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!failed || (await invoke('GET', '/api/local/edit?tab=' + mergeTab + '&path=keep.txt')).content !== 'keep provider bytes') throw new Error('SAF conflicting tree merge did not preserve destination');
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-merge-up'});
+    const mergeUpDir = tree + '/document/transfer-merge-up';
+    const mergeUpTab = (await invoke('POST', '/api/tabs/local', {local_dir: mergeUpDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: mergeUpTab, path: 'new.txt', content: 'merged provider bytes'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-merge-up'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-merge-up/keep.txt', content: 'keep server bytes'});
+    const mergeUp = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-merge-up'], accept_directory_copy_risk: true};
+    refused = false;
+    try { await invoke('POST', '/api/transfer/upload', mergeUp); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_conflicts?.includes('transfer-merge-up'); }
+    if (!refused) throw new Error('SAF upload tree merge did not require confirmation');
+    await runTask('/api/transfer/upload', {...mergeUp, merge_directories: ['transfer-merge-up']});
+    const remoteKeep = '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-merge-up/keep.txt');
+    const remoteNew = '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-merge-up/new.txt');
+    if ((await invoke('GET', remoteKeep)).content !== 'keep server bytes' || (await invoke('GET', remoteNew)).content !== 'merged provider bytes') throw new Error('SAF upload tree merge did not preserve and add files');
+    await invoke('POST', '/api/local/save', {tab: mergeUpTab, path: 'keep.txt', content: 'must not overwrite server'});
+    const beforeUploadConflict = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    const conflictUpload = await invoke('POST', '/api/transfer/upload', {...mergeUp, merge_directories: ['transfer-merge-up']});
+    if (!conflictUpload.success) throw new Error('Conflicting SAF upload merge was not queued');
+    failed = false;
+    for (let i = 0; i < 120; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !beforeUploadConflict.has(item.id));
+      if (task?.status === 'Failed') { failed = true; break; }
+      if (task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Conflicting SAF upload merge unexpectedly finished: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!failed || (await invoke('GET', remoteKeep)).content !== 'keep server bytes') throw new Error('Conflicting SAF upload merge did not preserve destination');
+  }
+  async function verifyAndroidGrantedSafLocalCopyMove(tree, safTab, root, runTask) {
+    const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: tree})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: rootTab, name: 'saf-local-copy'});
+    const plain = root + '/saf-local-copy';
+    const plainTab = (await invoke('POST', '/api/tabs/local', {local_dir: plain, remote_dir: tree})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: safTab, path: 'provider-copy.txt', content: 'provider copy bytes'});
+    await runTask('/api/transfer/upload', {tab: safTab, local_dir: tree, remote_dir: plain, names: ['provider-copy.txt']});
+    if ((await invoke('GET', '/api/local/edit?tab=' + plainTab + '&path=provider-copy.txt')).content !== 'provider copy bytes') throw new Error('SAF to local copy differs');
+    await invoke('POST', '/api/local/save', {tab: plainTab, path: 'plain-move.txt', content: 'plain move bytes'});
+    await runTask('/api/transfer/move', {tab: plainTab, direction: 'upload', local_dir: plain, remote_dir: tree, names: ['plain-move.txt']});
+    if ((await invoke('GET', '/api/local/edit?tab=' + safTab + '&path=plain-move.txt')).content !== 'plain move bytes') throw new Error('Local to SAF move differs');
+    const plainList = await invoke('GET', '/api/local/list?tab=' + plainTab + '&path=' + encodeURIComponent(plain));
+    if (plainList.entries?.some(entry => entry.name === 'plain-move.txt')) throw new Error('Local move source remains');
+    await invoke('POST', '/api/local/save', {tab: plainTab, path: 'provider-copy.txt', content: 'protected destination'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/move', {tab: safTab, direction: 'upload', local_dir: tree, remote_dir: plain, names: ['provider-copy.txt']}); }
+    catch (error) { refused = error.status === 409; }
+    if (!refused || (await invoke('GET', '/api/local/edit?tab=' + safTab + '&path=provider-copy.txt')).content !== 'provider copy bytes' || (await invoke('GET', '/api/local/edit?tab=' + plainTab + '&path=provider-copy.txt')).content !== 'protected destination') throw new Error('Conflicting SAF move did not preserve both files');
+    await runTask('/api/transfer/upload', {tab: safTab, local_dir: tree, remote_dir: plain, names: ['editor-boundary']});
+    const nested = (await invoke('POST', '/api/tabs/local', {local_dir: plain + '/editor-boundary', remote_dir: tree})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + nested + '&path=inside.txt')).content !== 'inside') throw new Error('Nested SAF copy differs');
+  }
+  async function verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask) {
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'nested-sync'});
+    const localDir = tree + '/document/nested-sync';
+    const local = (await invoke('POST', '/api/tabs/local', {local_dir: localDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: local, name: 'from-provider'});
+    const localChild = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-provider', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: localChild, name: 'nested'});
+    const localGrandchild = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-provider/document/nested', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: localGrandchild, path: 'up.txt', content: 'nested provider upload'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'nested-sync'});
+    const remoteDir = '/nested-sync';
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: remoteDir, name: 'from-server'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: remoteDir + '/from-server', name: 'nested'});
+    await invoke('POST', '/api/remote/save', {tab, path: remoteDir + '/from-server/nested/down.txt', content: 'nested server download'});
+    const sync = {tab, local_dir: localDir, remote_dir: remoteDir};
+    await runTask('/api/sync/run', {...sync, mode: 'local'});
+    const downloadTab = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-server/document/nested', remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + downloadTab + '&path=down.txt')).content !== 'nested server download') throw new Error('Nested provider sync download differs');
+    await runTask('/api/sync/run', {...sync, mode: 'remote'});
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/from-provider/nested/up.txt'))).content !== 'nested provider upload') throw new Error('Nested provider sync upload differs');
+    // A second pass must observe a file created after the first pass began;
+    // the external-storage provider has no native watcher and uses polling.
+    await invoke('POST', '/api/local/save', {tab: local, path: 'poll-first.txt', content: 'first poll'});
+    const result = await invoke('POST', '/api/transfer/keepuptodate', {...sync, count: 2, interval: 10});
+    if (!result.success || !result.task_id) throw new Error('Cannot start provider polling');
+    let firstSeen = false;
+    for (let i = 0; i < 120; i++) {
+      const list = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+      if (list.entries?.some(entry => entry.name === 'poll-first.txt')) { firstSeen = true; break; }
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === result.task_id);
+      if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Provider polling ended before first file: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!firstSeen) throw new Error('Initial provider polling pass timed out');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'poll-later.txt', content: 'second poll'});
+    let completed = false;
+    for (let i = 0; i < 180; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === result.task_id);
+      if (task?.status === 'Completed') { completed = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('Provider polling failed: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!completed) throw new Error('Second provider polling pass timed out');
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/poll-later.txt'))).content !== 'second poll') throw new Error('Second provider polling pass missed new file');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'cancel-first.txt', content: 'before cancellation'});
+    const watch = await invoke('POST', '/api/transfer/keepuptodate', {...sync, count: 0, interval: 60});
+    if (!watch.success || !watch.task_id) throw new Error('Cannot start cancellable provider polling');
+    let cancellationPassSeen = false;
+    for (let i = 0; i < 120; i++) {
+      const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+      if (listing.entries?.some(entry => entry.name === 'cancel-first.txt')) { cancellationPassSeen = true; break; }
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === watch.task_id);
+      if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Cancellable provider polling ended early: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!cancellationPassSeen) throw new Error('Cancellable provider polling initial pass timed out');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'cancel-later.txt', content: 'must remain local'});
+    const startedCancel = Date.now();
+    const cancelled = await invoke('POST', '/api/queue/cancel', {task_id: watch.task_id});
+    if (!cancelled.success) throw new Error('Provider polling cancellation was refused');
+    let stopped = false;
+    for (let i = 0; i < 40; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === watch.task_id);
+      if (task?.status === 'Cancelled') { stopped = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Completed') throw new Error('Unexpected cancelled polling status: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!stopped || Date.now() - startedCancel >= 12000) throw new Error('Provider polling did not cancel promptly');
+    const finalList = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+    if (finalList.entries?.some(entry => entry.name === 'cancel-later.txt')) throw new Error('Cancelled provider polling uploaded a later file');
+  }
+  async function verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask) {
+    // Isolate the fixture so the delete test cannot touch the grant marker.
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'sync-fixture'});
+    const localDir = tree + '/document/sync-fixture';
+    const local = await invoke('POST', '/api/tabs/local', {local_dir: localDir, remote_dir: root});
+    const syncTab = local.tab.id;
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'sync-fixture'});
+    const remoteDir = '/sync-fixture';
+    const sync = {tab, local_dir: localDir, remote_dir: remoteDir};
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'upload.txt', content: 'from provider'});
+    await invoke('POST', '/api/remote/save', {tab, path: remoteDir + '/download.txt', content: 'from webdav'});
+    const preview = await invoke('POST', '/api/sync/preview', {...sync, mode: 'local'});
+    if (!preview.plan?.items?.some(item => item.action === 'download' && item.path === 'download.txt')) throw new Error('SAF sync preview omitted remote file: ' + JSON.stringify(preview));
+    await runTask('/api/sync/run', {...sync, mode: 'local'});
+    const downloaded = await invoke('GET', '/api/local/edit?tab=' + syncTab + '&path=download.txt');
+    if (downloaded.content !== 'from webdav') throw new Error('SAF synchronization download differs');
+    await runTask('/api/sync/run', {...sync, mode: 'remote'});
+    const uploaded = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/upload.txt'));
+    if (uploaded.content !== 'from provider') throw new Error('SAF synchronization upload differs');
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'upload.txt', content: 'new provider!'});
+    const checksum = await invoke('POST', '/api/sync/preview', {...sync, mode: 'remote', criteria: 'checksum'});
+    if (!checksum.plan?.items?.some(item => item.action === 'upload' && item.path === 'upload.txt')) throw new Error('SAF checksum missed changed bytes: ' + JSON.stringify(checksum));
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'delete-me.txt', content: 'obsolete'});
+    await runTask('/api/sync/run', {...sync, mode: 'local', delete: true});
+    const localList = await invoke('GET', '/api/local/list?tab=' + syncTab + '&path=' + encodeURIComponent(localDir));
+    if (localList.entries?.some(entry => entry.name === 'delete-me.txt')) throw new Error('SAF synchronization did not delete obsolete local file');
+    await invoke('POST', '/api/local/save', {tab: syncTab, path: 'watch.txt', content: 'watched provider file'});
+    await runTask('/api/transfer/keepuptodate', {...sync, count: 1});
+    const watched = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/watch.txt'));
+    if (watched.content !== 'watched provider file') throw new Error('SAF keep-up-to-date missed the file');
   }
   if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
@@ -309,6 +724,22 @@ const expression = `
     }
   }
   await verifyAndroidWebViewRendering();
+  async function verifyAndroidAgentRefusal() {
+    let challenge;
+    try {
+      await invoke('POST', '/api/tabs/open', {session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', local_dir: root, initial_dir: '/'}});
+    } catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      challenge = error.payload.challenge;
+    }
+    if (!challenge || challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort} || !challenge.fingerprint) throw new Error('Expected SSH fixture host-key challenge');
+    let refusal;
+    try {
+      await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    } catch (error) { refusal = error; }
+    if (refusal?.status !== 400 || !/SSH agent authentication is not available on Android.*private key file/i.test(refusal.message || '')) throw new Error('Expected Android SSH agent refusal: ' + String(refusal?.message));
+  }
+  await verifyAndroidAgentRefusal();
   const opened = await invoke('POST', '/api/tabs/open', {session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!opened.success || !opened.tab?.connected) throw new Error('WebDAV connect failed: ' + JSON.stringify(opened));
   const tab = opened.tab.id;
@@ -386,18 +817,129 @@ const expression = `
     await assertCheckpointUnchanged('smoke-changed', 'Android');
   }
   await verifyAndroidWebDavResumeRefusals();
+  async function verifyAndroidSftpResume() {
+    // The fixture key is accepted for this test only, not saved as trusted.
+    let challenge;
+    try {
+      await invoke('POST', '/api/tabs/open', {session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+    } catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      challenge = error.payload.challenge;
+    }
+    if (!challenge || challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort}) throw new Error('Expected SFTP fixture host-key challenge');
+    const verified = await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    if (!verified.tab?.connected) throw new Error('SFTP fixture did not authenticate');
+    const sftpTab = verified.tab.id;
+    await invoke('POST', '/api/remote/save', {tab: sftpTab, path: '/resume-fixture.txt', content: 'Android SFTP resume fixture'});
+    async function checkpoint(dir, bytes) {
+      await invoke('POST', '/api/local/mkdir', {tab: sftpTab, name: dir});
+      await invoke('POST', '/api/local/save', {path: root + '/' + dir + '/resume-fixture.txt.filepart', content: bytes});
+      return root + '/' + dir;
+    }
+    async function waitTask(previous, expected) {
+      for (let i = 0; i < 120; i++) {
+        const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !previous.has(item.id));
+        if (task?.status === expected) return task;
+        if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Unexpected SFTP resume result: ' + JSON.stringify(task));
+        await sleep(250);
+      }
+      throw new Error('SFTP resume timed out');
+    }
+    const goodDir = await checkpoint('sftp-resume-good', 'Android SFTP');
+    const body = {tab: sftpTab, local_dir: goodDir, remote_dir: '/', names: ['resume-fixture.txt'], resume: true};
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/download', body); }
+    catch (error) { refused = error.status === 409 && error.payload?.best_effort_resume_risk === true; }
+    if (!refused) throw new Error('SFTP resume did not require explicit best-effort consent');
+    const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(item => item.id));
+    await invoke('POST', '/api/transfer/download', {...body, accept_best_effort_resume_risk: true});
+    await waitTask(previous, 'Completed');
+    const goodTab = (await invoke('POST', '/api/tabs/local', {local_dir: goodDir, remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + goodTab + '&path=resume-fixture.txt')).content !== 'Android SFTP resume fixture') throw new Error('SFTP resumed bytes differ');
+    const staleDir = await checkpoint('sftp-resume-stale', 'wrong prefix');
+    const beforeStale = new Set((await invoke('GET', '/api/transfers')).transfers.map(item => item.id));
+    await invoke('POST', '/api/transfer/download', {...body, local_dir: staleDir, accept_best_effort_resume_risk: true});
+    await waitTask(beforeStale, 'Failed');
+    const listing = await invoke('GET', '/api/local/list?path=' + encodeURIComponent(staleDir));
+    if (listing.entries?.some(entry => entry.name === 'resume-fixture.txt')) throw new Error('Rejected SFTP resume published a destination');
+    const staleTab = (await invoke('POST', '/api/tabs/local', {local_dir: staleDir, remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + staleTab + '&path=resume-fixture.txt.filepart')).content !== 'wrong prefix') throw new Error('Rejected SFTP resume changed the checkpoint');
+  }
+  await verifyAndroidSftpResume();
   const local = await invoke('POST', '/api/tabs/local', {local_dir: root + '/smoke-download', remote_dir: root});
   const contents = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=smoke-upload.txt');
   if (contents.content !== 'Android Rust-backed transfer') throw new Error('Downloaded bytes differ');
   await invoke('POST', '/api/local/rename', {tab: local.tab.id, old_name: 'smoke-upload.txt', new_name: 'renamed.txt'});
+  async function verifyAndroidTransferPreset() {
+    await invoke('POST', '/api/presets/save', {name: 'android-text-only', mask: '*.preset-txt'});
+    await invoke('POST', '/api/local/save', {path: root + '/allowed.preset-txt', content: 'preset allowed'});
+    await invoke('POST', '/api/local/save', {path: root + '/excluded.preset-bin', content: 'preset excluded'});
+    const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['allowed.preset-txt', 'excluded.preset-bin'], preset: 'android-text-only'});
+    let completed = false;
+    for (let i = 0; i < 120; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => !previous.has(item.id));
+      if (task?.status === 'Completed') { completed = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('Preset transfer failed: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!completed) throw new Error('Preset transfer timed out');
+    const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
+    if (!listing.entries?.some(entry => entry.name === 'allowed.preset-txt') || listing.entries.some(entry => entry.name === 'excluded.preset-bin')) throw new Error('Preset filter did not control WebDAV upload');
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/allowed.preset-txt'))).content !== 'preset allowed') throw new Error('Preset transfer content differs');
+    await invoke('POST', '/api/presets/delete', {name: 'android-text-only'});
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['excluded.preset-bin'], preset: 'android-text-only'}); }
+    catch (error) { refused = error.status === 400; }
+    if (!refused) throw new Error('Deleted explicit preset silently fell back to defaults');
+  }
+  await verifyAndroidTransferPreset();
   const vault = await invoke('GET', '/api/vault/status');
   if (vault.vault !== 'setup_required') throw new Error('Expected a fresh emulator vault: ' + JSON.stringify(vault));
   await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
+  const biometricStatus = await window.__TAURI_INTERNALS__.invoke('linscp_biometric_status');
+  if (biometricStatus.enabled !== false || typeof biometricStatus.available !== 'boolean') throw new Error('Fresh vault unexpectedly enabled biometrics');
+  let wrongEnrollmentRefused = false;
+  try { await window.__TAURI_INTERNALS__.invoke('linscp_biometric_enroll', {password: 'wrong vault password'}); }
+  catch (_) { wrongEnrollmentRefused = true; }
+  if (!wrongEnrollmentRefused || (await window.__TAURI_INTERNALS__.invoke('linscp_biometric_status')).enabled) throw new Error('Wrong password enabled biometrics');
   const savedSite = await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
+  async function verifyAndroidSiteManager() {
+    const session = {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'};
+    for (const name of ['android-site-manager/team', 'android-site-manager/team/one', 'android-site-manager/team/nested/two', 'android-site-manager/teamwork/one']) {
+      await invoke('POST', '/api/sessions/save', {name, session});
+    }
+    const names = async () => (await invoke('GET', '/api/sessions')).sessions.map(site => site.name).sort();
+    let conflict = false;
+    try { await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/team', new_name: 'android-site-manager/teamwork', folder: true}); }
+    catch (error) { conflict = error.status === 409; }
+    if (!conflict) throw new Error('Conflicting folder rename was not refused');
+    const renamed = await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/team', new_name: 'android-site-manager/edge', folder: true});
+    if (renamed.renamed !== 2) throw new Error('Unexpected folder rename count: ' + JSON.stringify(renamed));
+    await invoke('POST', '/api/sessions/rename', {old_name: 'android-site-manager/edge/one', new_name: 'android-site-manager/edge/primary'});
+    const found = await names();
+    for (const name of ['android-site-manager/team', 'android-site-manager/edge/primary', 'android-site-manager/edge/nested/two', 'android-site-manager/teamwork/one']) {
+      if (!found.includes(name)) throw new Error('Site rename lost ' + name);
+    }
+    if (found.includes('android-site-manager/team/one') || found.includes('android-site-manager/edge/one')) throw new Error('Old site name survived rename');
+    const connected = await invoke('POST', '/api/tabs/open', {site_name: 'android-site-manager/edge/primary'});
+    if (!connected.tab?.connected) throw new Error('Renamed site did not retain working credentials');
+    await invoke('POST', '/api/tabs/close', {tab: connected.tab.id});
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/edge', folder: true});
+    const remaining = await names();
+    if (remaining.some(name => name.startsWith('android-site-manager/edge/')) || !remaining.includes('android-site-manager/team') || !remaining.includes('android-site-manager/teamwork/one')) throw new Error('Folder delete affected wrong sites');
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/team'});
+    await invoke('POST', '/api/sessions/delete', {name: 'android-site-manager/teamwork', folder: true});
+    if ((await names()).some(name => name.startsWith('android-site-manager/'))) throw new Error('Site deletion failed');
+  }
+  await verifyAndroidSiteManager();
   const locked = await invoke('POST', '/api/vault/lock');
   if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true};
+  let biometricRefused = false;
+  try { await window.__TAURI_INTERNALS__.invoke('linscp_biometric_unlock'); } catch (_) { biometricRefused = true; }
+  if (!biometricRefused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Unenrolled biometric unlock did not fail closed');
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true, unenrolledBiometricsRefused: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {

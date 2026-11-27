@@ -13,6 +13,7 @@ export interface TauriInternalsLike {
 interface ErrorPayload {
   error?: string;
   hostkey_challenge?: HostKeyChallenge;
+  challenge?: HostKeyChallenge;
 }
 
 export class TauriTransport implements TransportClient {
@@ -46,7 +47,7 @@ export class TauriTransport implements TransportClient {
       throw new TransportError(
         errBody.error ?? `IPC error (${reply.status})`,
         reply.status,
-        { hostKeyChallenge: errBody.hostkey_challenge, payload: errBody as Record<string, unknown> },
+        { hostKeyChallenge: errBody.challenge ?? errBody.hostkey_challenge, payload: errBody as Record<string, unknown> },
       );
     }
     return reply.payload;

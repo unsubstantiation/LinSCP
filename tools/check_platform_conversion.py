@@ -1,33 +1,12 @@
 #!/usr/bin/env python3
-"""Check that the Windows-to-Linux conversion of LinSCP is complete.
+"""Check selected legacy Linux source and packaging conversion invariants.
 
-LinSCP is a Linux-only client; the Windows port is gone (see
-debian/changelog, 1.0-2). A claim like that decays quietly: a Windows
-API call creeps into the front end, a file manager extension is copied
-over half-translated, an installer ships a file another one does not.
-This check makes the claim testable instead of a matter of trust.
-
-It reads LinSCP's own sources - the console client, the graphical
-client, the automation wrapper, the packaging, the CI workflows and the
-documentation - and refuses:
-
-  * Windows API calls, Windows headers and Windows build settings,
-  * Windows environment variables, executables and path syntax,
-  * files that belong to another platform,
-  * an installed file that the Makefile, CMake or the Debian package
-    installs and the others do not, and the other way round,
-  * an error message whose wording contradicts the template it is
-    filled into, and
-  * an upstream product name outside the documented external-identifier
-    allowlist.
-
-The Windows-construct rules do not search comments or test fixtures:
-a comment may name a Windows path to say what the client does with one,
-and a test has to be able to hold a name that a POSIX file system allows
-and a Windows one does not. The product-name rule searches them, subject
-to the external-identifier allowlist below.
-
-Everything in the tree is this project's own code.
+LinSCP also ships native Windows and Android hosts. This repository-state
+checker does not certify those hosts, the entire codebase, or complete
+conversion: it scans selected text paths for legacy Windows constructs,
+retired artefacts, installer-list drift, error templates and unlisted product
+names. Platform-specific Rust/Tauri code and test fixtures have intentional
+exclusions; see the rules below. It does not execute the application.
 
 Usage:
     python3 tools/check_platform_conversion.py
@@ -321,7 +300,7 @@ def find_windows_constructs(path, text, root=ROOT):
 
 
 def check_windows_files(root=ROOT):
-    """No file of another platform may sit in the tree."""
+    """Find retired Windows project and script artefacts by suffix."""
     findings = []
     for path in root.rglob('*'):
         if not path.is_file():
@@ -363,7 +342,11 @@ def check_installed_files(root=ROOT):
                              'the %s installer is missing' % name,
                              relative))
             continue
-        texts[name] = path.read_text(encoding='utf-8')
+        try:
+            texts[name] = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as error:
+            findings.append((path, 0, 'unreadable-source',
+                             'installer could not be read as UTF-8', type(error).__name__))
     for source in INSTALLED_FILES:
         for name, text in texts.items():
             # The Makefile prefixes the repository root; the other two
@@ -385,7 +368,12 @@ def check_error_templates(root=ROOT):
     findings = []
     pattern = re.compile(r'Texts::LocalError\(\s*"([^"]+)"')
     for path in sorted((root / 'source/linux').glob('*.cpp')):
-        text = path.read_text(encoding='utf-8')
+        try:
+            text = path.read_text(encoding='utf-8')
+        except (OSError, UnicodeDecodeError) as error:
+            findings.append((path, 0, 'unreadable-source',
+                             'source could not be read as UTF-8', type(error).__name__))
+            continue
         for match in pattern.finditer(text):
             phrase = match.group(1)
             last = phrase.rsplit(' ', 1)[-1].lower()
@@ -436,7 +424,12 @@ def collect(root=ROOT):
     for path in scanned_files(root):
         try:
             text = path.read_text(encoding='utf-8')
-        except (OSError, UnicodeDecodeError):
+        except (OSError, UnicodeDecodeError) as error:
+            # Skipping a selected file would turn an incomplete scan into a
+            # successful report. Report the class without leaking file contents.
+            findings.append((path, 0, 'unreadable-source',
+                             'selected source could not be read as UTF-8',
+                             type(error).__name__))
             continue
         findings.extend(find_windows_constructs(
             path, strip_comments(path, text), root))
@@ -462,9 +455,8 @@ def main():
 
     findings = collect()
     if not findings:
-        print('The Windows-to-Linux conversion is complete: '
-              '%d conversion files read, '
-              'no Windows construct or unlisted upstream name left.'
+        print('Selected legacy conversion checks passed: '
+              '%d text files scanned; platform-specific exclusions apply.'
               % len(scanned_files()))
         return 0
     for path, line, name, description, text in findings:

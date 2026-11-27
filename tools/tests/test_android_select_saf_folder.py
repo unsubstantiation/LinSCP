@@ -27,6 +27,18 @@ class AndroidSafPickerTests(unittest.TestCase):
             picker.main()
         self.assertEqual(selected, ['Documents', 'LinSCP-Ungranted-Smoke', 'USE THIS FOLDER', 'ALLOW'])
 
+    def test_waits_for_transient_android_system_anr_before_navigating(self):
+        anr = ("<hierarchy><node text=\"Process system isn't responding\" />"
+               '<node text="Wait" bounds="[0,0][100,100]" /></hierarchy>')
+        screens = [anr, screen('Documents'), screen('LinSCP-Ungranted-Smoke'),
+                   screen('USE THIS FOLDER'), screen('ALLOW')]
+        selected = []
+        with patch.object(picker, 'dump', side_effect=screens), \
+             patch.object(picker.time, 'sleep'), \
+             patch.object(picker, 'click', side_effect=lambda node: selected.append(node.get('text'))):
+            picker.main()
+        self.assertEqual(selected, ['Wait', 'Documents', 'LinSCP-Ungranted-Smoke', 'USE THIS FOLDER', 'ALLOW'])
+
 
 if __name__ == '__main__':
     unittest.main()

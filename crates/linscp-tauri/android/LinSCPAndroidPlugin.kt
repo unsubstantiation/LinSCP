@@ -1,6 +1,11 @@
 package com.fairuniversal.linscp
 
 import android.app.Activity
+import android.hardware.biometrics.BiometricManager
+import android.hardware.biometrics.BiometricPrompt
+import android.hardware.fingerprint.FingerprintManager
+import android.os.CancellationSignal
+import android.util.AtomicFile
 import android.content.Intent
 import android.content.ClipData
 import android.content.ClipboardManager
@@ -50,6 +55,8 @@ import javax.crypto.spec.GCMParameterSpec
 
 @InvokeArg
 internal class KeystoreBlobArgs { lateinit var data_base64: String }
+@InvokeArg
+internal class BiometricPasswordArgs { lateinit var password: String }
 @InvokeArg
 internal class ClipboardTextArgs { var text: String = "" }
 
@@ -283,7 +290,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         ?: throw IllegalStateException("provider did not create the document")
       activity.contentResolver.openOutputStream(target, "wt")?.close()
         ?: throw IllegalStateException("provider returned no output stream")
-      mapOf("uri" to target.toString())
+      // Return the app's parent-relative path, not the provider's flattened
+      // document ID: later chunk writes must resolve through the same parent.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -333,7 +342,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val bytes = android.util.Base64.decode(args.data_base64, android.util.Base64.DEFAULT)
       activity.contentResolver.openOutputStream(target, "wt")?.use { it.write(bytes); it.flush() }
         ?: throw IllegalStateException("provider returned no output stream")
-      mapOf("uri" to target.toString())
+      // Return the app's parent-relative path, not the provider's flattened
+      // document ID: later chunk writes must resolve through the same parent.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -350,7 +361,8 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         DocumentsContract.createDocument(activity.contentResolver, parent, DocumentsContract.Document.MIME_TYPE_DIR, args.name)
           ?: throw IllegalStateException("provider did not create the directory")
       }
-      mapOf("uri" to result.toString())
+      // Keep the structured parent chain for subsequent nested operations.
+      mapOf("uri" to Uri.parse(args.parent_uri).buildUpon().appendPath("document").appendPath(args.name).build().toString())
     }
   }
 
@@ -597,6 +609,151 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     invoke.resolveObject(mapOf("running" to false))
   }
 
+  // The separate biometric key is usable only with a fresh, strong biometric
+  // CryptoObject authentication. It wraps the vault password, never the master
+  // key, and the password remains a recovery path when biometrics change.
+  private val biometricAlias = "linscp_biometric_password_v1"
+  private val biometricAad = "LinSCP biometric vault password v1".toByteArray(Charsets.US_ASCII)
+  private val biometricBusy = AtomicBoolean(false)
+  private val biometricFile: File get() = File(activity.noBackupFilesDir, "biometric-vault-v1")
+
+  @Suppress("DEPRECATION")
+  private fun biometricAvailable(): Boolean {
+    if (Build.VERSION.SDK_INT < 28) return false
+    if (Build.VERSION.SDK_INT >= 30) {
+      val manager = activity.getSystemService(BiometricManager::class.java) ?: return false
+      return manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG) == BiometricManager.BIOMETRIC_SUCCESS
+    }
+    if (Build.VERSION.SDK_INT >= 29) {
+      val manager = activity.getSystemService(BiometricManager::class.java) ?: return false
+      return manager.canAuthenticate() == BiometricManager.BIOMETRIC_SUCCESS
+    }
+    val manager = activity.getSystemService(FingerprintManager::class.java) ?: return false
+    return manager.isHardwareDetected && manager.hasEnrolledFingerprints()
+  }
+
+  private fun biometricKey(create: Boolean): SecretKey {
+    val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+    val existing = (store.getEntry(biometricAlias, null) as? KeyStore.SecretKeyEntry)?.secretKey
+    if (existing != null) return existing
+    if (!create) throw IllegalStateException("Biometric key is unavailable; use your vault password")
+    val builder = KeyGenParameterSpec.Builder(biometricAlias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
+      .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+      .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+      .setKeySize(256)
+      .setUserAuthenticationRequired(true)
+      .setInvalidatedByBiometricEnrollment(true)
+    if (Build.VERSION.SDK_INT >= 30) {
+      builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+    } else {
+      @Suppress("DEPRECATION")
+      builder.setUserAuthenticationValidityDurationSeconds(-1)
+    }
+    return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").run {
+      init(builder.build())
+      generateKey()
+    }
+  }
+
+  @Command
+  fun biometricStatus(invoke: Invoke) {
+    try { invoke.resolveObject(mapOf("available" to biometricAvailable(), "enabled" to biometricFile.isFile)) }
+    catch (_: Exception) { invoke.resolveObject(mapOf("available" to false, "enabled" to biometricFile.isFile)) }
+  }
+
+  @Command
+  fun biometricDisable(invoke: Invoke) {
+    if (!biometricBusy.compareAndSet(false, true)) { invoke.reject("A biometric operation is in progress"); return }
+    try {
+      if (biometricFile.exists() && !biometricFile.delete()) throw IllegalStateException("Cannot remove biometric credential")
+      KeyStore.getInstance("AndroidKeyStore").apply { load(null); deleteEntry(biometricAlias) }
+      invoke.resolveObject(mapOf("success" to true))
+    } catch (_: Exception) { invoke.reject("Could not disable biometric unlock") }
+    finally { biometricBusy.set(false) }
+  }
+
+  @Command
+  fun biometricEnroll(invoke: Invoke) {
+    val password = invoke.parseArgs(BiometricPasswordArgs::class.java).password
+    biometricPrompt(invoke, password)
+  }
+
+  @Command
+  fun biometricUnlock(invoke: Invoke) { biometricPrompt(invoke, null) }
+
+  private fun biometricPrompt(invoke: Invoke, password: String?) {
+    if (Build.VERSION.SDK_INT < 28 || !biometricAvailable()) {
+      invoke.reject("Strong biometrics are unavailable; use your vault password")
+      return
+    }
+    if (!biometricBusy.compareAndSet(false, true)) { invoke.reject("A biometric operation is in progress"); return }
+    val finished = AtomicBoolean(false)
+    val fail = { message: String ->
+      if (finished.compareAndSet(false, true)) { biometricBusy.set(false); invoke.reject(message) }
+    }
+    activity.runOnUiThread {
+      try {
+        val encrypting = password != null
+        val wrapped = if (encrypting) null else biometricFile.readBytes().also {
+          if (it.size < 28 || it.size > 8192) throw IllegalStateException("Invalid biometric credential")
+        }
+        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+        if (encrypting) cipher.init(Cipher.ENCRYPT_MODE, biometricKey(true))
+        else cipher.init(Cipher.DECRYPT_MODE, biometricKey(false), GCMParameterSpec(128, wrapped!!, 0, 12))
+        val builder = BiometricPrompt.Builder(activity)
+          .setTitle(if (encrypting) "Enable biometric vault unlock" else "Unlock LinSCP vault")
+          .setSubtitle("Your vault password remains available as a fallback")
+          .setNegativeButton("Use password", activity.mainExecutor) { _, _ -> fail("Biometric authentication cancelled; use your vault password") }
+        if (Build.VERSION.SDK_INT >= 30) builder.setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        val prompt = builder.build()
+        prompt.authenticate(BiometricPrompt.CryptoObject(cipher), CancellationSignal(), activity.mainExecutor,
+          object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationError(code: Int, message: CharSequence) {
+              fail("Biometric authentication cancelled or unavailable; use your vault password")
+            }
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+              if (finished.get()) return
+              var stage = "cipher"
+              try {
+                val authenticated = result.cryptoObject?.cipher ?: throw IllegalStateException("Missing authenticated cipher")
+                // A per-use Keystore key cannot process even AAD before the
+                // prompt supplies its authentication token.
+                stage = "aad"
+                authenticated.updateAAD(biometricAad)
+                if (encrypting) {
+                  stage = "iv"
+                  // Android Keystore may reset the cipher after doFinal, so
+                  // capture the generated IV while the operation is active.
+                  val iv = authenticated.iv ?: throw IllegalStateException("Missing IV")
+                  if (iv.size != 12) throw IllegalStateException("Invalid IV")
+                  stage = "encrypt"
+                  val bytes = password!!.toByteArray(Charsets.UTF_8)
+                  val ciphertext = try { authenticated.doFinal(bytes) } finally { bytes.fill(0) }
+                  stage = "persist"
+                  val atomic = AtomicFile(biometricFile)
+                  val stream = atomic.startWrite()
+                  try { stream.write(iv); stream.write(ciphertext); atomic.finishWrite(stream) }
+                  catch (e: Exception) { atomic.failWrite(stream); throw e }
+                  if (finished.compareAndSet(false, true)) { biometricBusy.set(false); invoke.resolveObject(mapOf("success" to true)) }
+                } else {
+                  val plaintext = authenticated.doFinal(wrapped!!, 12, wrapped.size - 12)
+                  try {
+                    if (finished.compareAndSet(false, true)) { biometricBusy.set(false); invoke.resolveObject(mapOf("password" to plaintext.toString(Charsets.UTF_8))) }
+                  } finally { plaintext.fill(0) }
+                }
+              } catch (error: Exception) {
+                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}")
+                fail("Biometric credential unavailable; use your vault password")
+              }
+            }
+          })
+      } catch (error: Exception) {
+        android.util.Log.w("LinSCPBiometric", "Biometric preparation failed: ${error.javaClass.simpleName}")
+        fail("Biometric credential unavailable; use your vault password")
+      }
+    }
+  }
+
   private val keystoreLock = Any()
   private val keystoreAlias = "linscp_master_key_v1"
   private val keystoreAad = "LSCPKST1".toByteArray(Charsets.US_ASCII)
@@ -794,9 +951,9 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
    * provider refuses it. Every command below therefore resolves a name against
    * the provider's own child listing before it builds a URI.
    *
-   * A segment that already matches a document id is used as it stands, which
-   * keeps the shared-storage form - and every path the page builds after
-   * listing a folder through this plugin - working unchanged.
+   * Document ids are accepted only when listed as children of the current
+   * parent. A provider can resolve a descendant's opaque id anywhere under a
+   * tree grant, so querying that id directly would bypass the pane boundary.
    */
   private fun resolveDocument(uri: Uri): Uri {
     if (!DocumentsContract.isTreeUri(uri)) {
@@ -804,28 +961,25 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     }
     val segments = uri.pathSegments
     val treeIndex = segments.indexOf("tree")
-    val childIndex = segments.indexOf("document")
-    // The tree itself, or a URI that already names one document by id.
-    if (treeIndex < 0 || treeIndex + 1 >= segments.size || childIndex < 0) return documentUri(uri)
-    if (segments.size == childIndex + 2) {
-      val direct = DocumentsContract.buildDocumentUriUsingTree(uri, segments[childIndex + 1])
-      val existsDirectly = try {
-        activity.contentResolver.query(
-          direct,
-          arrayOf(DocumentsContract.Document.COLUMN_DOCUMENT_ID),
-          null, null, null
-        )?.use { it.moveToFirst() } == true
-      } catch (_: Exception) {
-        false
-      }
-      if (existsDirectly) return direct
-    }
+    // The tree ID or a file name can itself be literally "document". Only
+    // the structural separator immediately after the tree ID starts children.
+    if (treeIndex < 0 || treeIndex + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF tree URI")
+    val childIndex = treeIndex + 2
+    if (childIndex >= segments.size) return documentUri(uri)
+    if (segments[childIndex] != "document") throw IllegalArgumentException("Invalid SAF document URI")
     val grantId = segments[treeIndex + 1]
     var current = DocumentsContract.buildDocumentUriUsingTree(uri, grantId)
     var i = childIndex + 1
+    if (segments[i] == grantId) {
+      i += 1
+      if (i < segments.size) {
+        if (segments[i] != "document" || i + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF document URI")
+        i += 1
+      }
+    }
     while (i < segments.size) {
-      // `document/id/document/id/...` - the pairs repeat, so skip the keyword.
-      if (segments[i] == "document") { i += 1; continue }
+      // Interpret alternating separators and names by position, not value:
+      // a real file or folder may itself be named "document".
       val wanted = segments[i]
       val children = DocumentsContract.buildChildDocumentsUriUsingTree(
         uri, DocumentsContract.getDocumentId(current))
@@ -847,6 +1001,10 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
       val id = found ?: throw IllegalStateException("no document named $wanted in this folder")
       current = DocumentsContract.buildDocumentUriUsingTree(uri, id)
       i += 1
+      if (i < segments.size) {
+        if (segments[i] != "document" || i + 1 >= segments.size) throw IllegalArgumentException("Invalid SAF document URI")
+        i += 1
+      }
     }
     return current
   }
