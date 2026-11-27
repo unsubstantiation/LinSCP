@@ -36,12 +36,12 @@ def main():
             adb('shell', 'input', 'keyevent', '66')
             continue
         done = find('DONE')
-        if done:
+        if done is not None:
             click(done)
             print('Enrolled emulator fingerprint')
             return
         button = find('MORE', 'I AGREE', 'AGREE', 'CONTINUE', 'NEXT', 'GOT IT')
-        if button:
+        if button is not None:
             click(button)
             continue
         if any('finger' in label.lower() or 'sensor' in label.lower() for label in labels):
