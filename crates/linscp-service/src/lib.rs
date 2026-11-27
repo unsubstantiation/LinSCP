@@ -5775,6 +5775,8 @@ impl CommanderService {
             let has_custom_scripts_field = prefs_val
                 .as_object()
                 .is_some_and(|m| m.contains_key("custom_install_scripts"));
+            let has_preset_overrides_field = prefs_val
+                .as_object().is_some_and(|m| m.contains_key("preset_overrides"));
             let parsed: Result<UserPreferences, _> = serde_json::from_value(prefs_val);
             let mut parsed = match parsed {
                 Ok(p) => p,
@@ -5785,6 +5787,9 @@ impl CommanderService {
                     }
                 }
             };
+            if !has_preset_overrides_field {
+                parsed.preset_overrides = self.state.lock().expect("m").preferences.preset_overrides.clone();
+            }
             if has_custom_scripts_field {
                 match linscp_engine::sanitize_custom_install_scripts_map(
                     &parsed.custom_install_scripts,
@@ -14773,6 +14778,26 @@ mod tests {
             assert_eq!(std::fs::metadata(dst.join("a.txt")).unwrap().permissions().mode() & 0o777, 0o600);
             assert_eq!(std::fs::metadata(dst.join("b.bin")).unwrap().permissions().mode() & 0o777, 0o640);
         }
+        // An explicit preset wins over the site's selection, and an explicit
+        // permission value wins over that preset.
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().spec.as_mut().unwrap().preset_name = "text".into();
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab":id,"local_dir":src,"remote_dir":other,"names":["b.bin"],"preset":"binary","permissions":"0604"}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            assert!(!tasks.iter().any(|task| task["status"] == "Failed"), "{tasks:?}");
+            if tasks.len() == 3 && tasks.iter().all(|task| task["status"] == "Completed") { done = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(other.join("b.bin")).unwrap(), b"binary");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(other.join("b.bin")).unwrap().permissions().mode() & 0o777, 0o604);
+        }
     }
 
     #[tokio::test]
@@ -18961,6 +18986,7 @@ mod tests {
         assert!(prefs.is_object(), "the preferences document is readable");
         prefs["permissions"] = json!("0644");
         prefs["preset"] = json!("off");
+        prefs["preset_overrides"] = json!(["transfer", "preserve_time"]);
         prefs["preserve_time_dirs"] = json!(true);
         let saved = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
@@ -18979,6 +19005,11 @@ mod tests {
         drop(svc);
         let reopened = CommanderService::new(temp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
         assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset"], "off");
+        assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset_overrides"], json!(["transfer", "preserve_time"]));
+        let mut old_client = reopened.handle_get_preferences().payload["preferences"].clone();
+        old_client.as_object_mut().unwrap().remove("preset_overrides");
+        assert_eq!(reopened.handle_save_preferences(json!({"preferences": old_client})).status, 200);
+        assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset_overrides"], json!(["transfer", "preserve_time"]));
     }
 
     /// `copyid` and keep-up-to-date both need a live server; with no tab they

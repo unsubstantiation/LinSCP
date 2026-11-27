@@ -20,5 +20,7 @@ jobs:
         run: cargo test -p linscp-engine --lib presets::tests
       - name: Service preset checks
         run: cargo test -p linscp-service --lib transfer_preset
+      - name: Service preference checks
+        run: cargo test -p linscp-service --lib preferences_keep_the_permission_mode
       - name: Types and preference checks
         run: cargo test -p linscp-types --lib
