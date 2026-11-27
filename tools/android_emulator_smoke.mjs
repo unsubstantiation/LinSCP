@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -38,6 +38,48 @@ const expression = `
   for (let i = 0; i < 60 && !window.LinSCPTransport; i++) await sleep(1000);
   if (window.LinSCPTransport?.mode !== 'tauri') throw new Error('Tauri frontend transport not initialized');
   const invoke = (method, path, body = {}) => window.LinSCPTransport.request(method, path, body);
+  async function verifyAndroidBiometrics() {
+    const phase = ${JSON.stringify(phase)};
+    const native = window.__TAURI_INTERNALS__;
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    if (phase === 'bio-enroll-start') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric enrollment expected a locked vault');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      const status = await native.invoke('linscp_biometric_status');
+      if (!status.available || status.enabled) throw new Error('Enrolled emulator fingerprint unavailable: ' + JSON.stringify(status));
+      window.__bioResult = native.invoke('linscp_biometric_enroll', {password: 'different destination vault password'}).then(() => ({ok: true}), error => ({ok: false, error: String(error)}));
+      return {root, biometricPrompt: 'enroll'};
+    }
+    if (phase === 'bio-enroll-finish') {
+      const result = await window.__bioResult;
+      if (!result.ok || !(await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric enrollment failed: ' + JSON.stringify(result));
+      return {root, biometricEnrolled: true};
+    }
+    if (phase === 'bio-unlock-start') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric unlock expected a locked vault');
+      if (!(await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric enrollment did not survive restart');
+      window.__bioResult = native.invoke('linscp_biometric_unlock').then(() => ({ok: true}), error => ({ok: false, error: String(error)}));
+      return {root, biometricPrompt: 'unlock'};
+    }
+    if (phase === 'bio-wrong-check') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Unenrolled fingerprint unlocked the vault');
+      return {root, wrongFingerprintRefused: true};
+    }
+    const result = await window.__bioResult;
+    if (!result.ok || (await invoke('GET', '/api/vault/status')).vault !== 'unlocked') throw new Error('Biometric vault unlock failed: ' + JSON.stringify(result));
+    const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+    if (!opened.tab?.connected) throw new Error('Biometric unlock did not recover saved credentials');
+    await invoke('POST', '/api/tabs/close', {tab: opened.tab.id});
+    await native.invoke('linscp_biometric_disable');
+    if ((await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric disable left the credential enabled');
+    await invoke('POST', '/api/vault/lock');
+    let refused = false;
+    try { await native.invoke('linscp_biometric_unlock'); } catch (_) { refused = true; }
+    if (!refused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Disabled biometrics still unlocked the vault');
+    await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+    return {root, biometricUnlock: true, savedCredentialRecovered: true, disableAndPasswordFallback: true};
+  }
+  if (${JSON.stringify(phase)}.startsWith('bio-')) return await verifyAndroidBiometrics();
   async function verifyAndroidVaultRestart() {
     const status = await invoke('GET', '/api/vault/status');
     if (status.vault !== 'locked') throw new Error('Restart did not lock vault: ' + JSON.stringify(status));

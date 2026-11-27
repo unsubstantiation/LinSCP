@@ -245,4 +245,15 @@ if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -
   echo "SAF provider did not persist edited bytes" >&2; exit 1
 fi
 restart_and_run saf-reopen
+# Enroll only on this disposable emulator, then exercise the real system
+# BiometricPrompt and Keystore CryptoObject across a process restart.
+python3 tools/android_enroll_emulator_fingerprint.py
+restart_and_run bio-enroll-start
+python3 tools/android_confirm_emulator_biometric.py 1
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
+restart_and_run bio-unlock-start
+python3 tools/android_confirm_emulator_biometric.py 2
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-wrong-check
+python3 tools/android_confirm_emulator_biometric.py 1
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish
 echo "Installed application ID and its install directory verified: $application ($sandbox)"
