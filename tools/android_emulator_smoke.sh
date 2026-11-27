@@ -84,12 +84,18 @@ exercise_biometrics() {
   python3 tools/android_enroll_emulator_fingerprint.py
   restart_and_run bio-enroll-start
   python3 tools/android_confirm_emulator_biometric.py 1
-  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish; then
+    adb logcat -d -s LinSCPBiometric:W || true
+    exit 1
+  fi
   restart_and_run bio-unlock-start
   python3 tools/android_confirm_emulator_biometric.py 2
   node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-wrong-check
   python3 tools/android_confirm_emulator_biometric.py 1
-  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish; then
+    adb logcat -d -s LinSCPBiometric:W || true
+    exit 1
+  fi
 }
 # A focused disposable-emulator run avoids unrelated provider/UI fixtures.
 if [[ ${LINSCP_BIOMETRIC_ONLY:-0} == 1 ]]; then

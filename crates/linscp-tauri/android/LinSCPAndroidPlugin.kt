@@ -714,13 +714,19 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
             }
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
               if (finished.get()) return
+              var stage = "cipher"
               try {
                 val authenticated = result.cryptoObject?.cipher ?: throw IllegalStateException("Missing authenticated cipher")
                 if (encrypting) {
-                  val bytes = password!!.toByteArray(Charsets.UTF_8)
-                  val ciphertext = try { authenticated.doFinal(bytes) } finally { bytes.fill(0) }
+                  stage = "iv"
+                  // Android Keystore may reset the cipher after doFinal, so
+                  // capture the generated IV while the operation is active.
                   val iv = authenticated.iv ?: throw IllegalStateException("Missing IV")
                   if (iv.size != 12) throw IllegalStateException("Invalid IV")
+                  stage = "encrypt"
+                  val bytes = password!!.toByteArray(Charsets.UTF_8)
+                  val ciphertext = try { authenticated.doFinal(bytes) } finally { bytes.fill(0) }
+                  stage = "persist"
                   val atomic = AtomicFile(biometricFile)
                   val stream = atomic.startWrite()
                   try { stream.write(iv); stream.write(ciphertext); atomic.finishWrite(stream) }
@@ -732,10 +738,14 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                     if (finished.compareAndSet(false, true)) { biometricBusy.set(false); invoke.resolveObject(mapOf("password" to plaintext.toString(Charsets.UTF_8))) }
                   } finally { plaintext.fill(0) }
                 }
-              } catch (_: Exception) { fail("Biometric credential unavailable; use your vault password") }
+              } catch (error: Exception) {
+                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}")
+                fail("Biometric credential unavailable; use your vault password")
+              }
             }
           })
-      } catch (_: Exception) {
+      } catch (error: Exception) {
+        android.util.Log.w("LinSCPBiometric", "Biometric preparation failed: ${error.javaClass.simpleName}")
         fail("Biometric credential unavailable; use your vault password")
       }
     }
