@@ -427,6 +427,32 @@ const expression = `
     }
     if (!completed) throw new Error('Second provider polling pass timed out');
     if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/poll-later.txt'))).content !== 'second poll') throw new Error('Second provider polling pass missed new file');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'cancel-first.txt', content: 'before cancellation'});
+    const watch = await invoke('POST', '/api/transfer/keepuptodate', {...sync, count: 0, interval: 60});
+    if (!watch.success || !watch.task_id) throw new Error('Cannot start cancellable provider polling');
+    let cancellationPassSeen = false;
+    for (let i = 0; i < 120; i++) {
+      const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+      if (listing.entries?.some(entry => entry.name === 'cancel-first.txt')) { cancellationPassSeen = true; break; }
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === watch.task_id);
+      if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Cancellable provider polling ended early: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!cancellationPassSeen) throw new Error('Cancellable provider polling initial pass timed out');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'cancel-later.txt', content: 'must remain local'});
+    const startedCancel = Date.now();
+    const cancelled = await invoke('POST', '/api/queue/cancel', {task_id: watch.task_id});
+    if (!cancelled.success) throw new Error('Provider polling cancellation was refused');
+    let stopped = false;
+    for (let i = 0; i < 40; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === watch.task_id);
+      if (task?.status === 'Cancelled') { stopped = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Completed') throw new Error('Unexpected cancelled polling status: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!stopped || Date.now() - startedCancel >= 12000) throw new Error('Provider polling did not cancel promptly');
+    const finalList = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+    if (finalList.entries?.some(entry => entry.name === 'cancel-later.txt')) throw new Error('Cancelled provider polling uploaded a later file');
   }
   async function verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask) {
     // Isolate the fixture so the delete test cannot touch the grant marker.
