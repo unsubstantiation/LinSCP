@@ -28,6 +28,7 @@ tokio.workspace = true
 zeroize.workspace = true
 
 [dev-dependencies]
+futures-util = "0.3"
 axum.workspace = true
 filetime.workspace = true
 linscp-test-support.workspace = true

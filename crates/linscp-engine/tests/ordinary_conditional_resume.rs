@@ -22,8 +22,19 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri
     }
     if method == Method::GET {
         if r.truncate_full && headers.get("range").is_none() {
+            let first = axum::body::Bytes::copy_from_slice(&r.data[..5]);
+            let body = futures_util::stream::unfold((0, first), |(step, first)| async move {
+                match step {
+                    0 => Some((Ok::<_, std::io::Error>(first.clone()), (1, first))),
+                    1 => {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        Some((Err(std::io::Error::other("fixture disconnect")), (2, first)))
+                    }
+                    _ => None,
+                }
+            });
             return Response::builder().status(StatusCode::OK).header("content-length", r.data.len())
-                .body(Body::from(r.data[..5].to_vec())).unwrap();
+                .body(Body::from_stream(body)).unwrap();
         }
         if headers.get("if-match").and_then(|x| x.to_str().ok()) != Some(r.etag.as_str()) { return StatusCode::PRECONDITION_FAILED.into_response(); }
         if headers.get("range").is_none() {
@@ -134,6 +145,7 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     std::fs::remove_file(&dest).unwrap();
     std::fs::write(&stage, b"01234").unwrap();
     state.lock().unwrap().swap_partial = Some(stage.clone());
+    state.lock().unwrap().etag = "\"v1\"".into();
     let verified = TransferFlags { no_clobber: true, source_etag: Some("\"v1\"".into()), ..direct };
     download_verified_resume(session, path, &entry, &dest, &verified, &mut logger, None).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
