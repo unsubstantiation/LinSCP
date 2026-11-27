@@ -1,0 +1,29 @@
+name: Arena biometric emulator probe
+on:
+  push:
+    branches: [arena/c4f5bb7a-linscp]
+jobs:
+  probe:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Enable emulator acceleration
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+      - name: Inspect fingerprint enrollment
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          arch: x86_64
+          target: google_apis
+          disable-animations: true
+          script: |
+            adb shell locksettings set-pin 1234
+            adb shell am start -a android.settings.FINGERPRINT_ENROLL
+            sleep 8
+            adb shell uiautomator dump /sdcard/probe.xml
+            adb exec-out cat /sdcard/probe.xml > probe.xml
+            python3 -c "from pathlib import Path; print('::warning::' + Path('probe.xml').read_text().replace('%','%25').replace('\\n','%0A').replace('\\r','%0D'))"
