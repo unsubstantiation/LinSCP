@@ -59,7 +59,14 @@ const expression = `
     if (phase === 'bio-enroll-finish') {
       const result = await window.__bioResult;
       if (!result.ok || !(await native.invoke('linscp_biometric_status')).enabled) throw new Error('Biometric enrollment failed: ' + JSON.stringify(result));
-      return {root, biometricEnrolled: true};
+      // The password-bearing native plugin must not be callable directly from
+      // the WebView; only the Rust command may consume the decrypted password.
+      const direct = await Promise.race([
+        native.invoke('plugin:linscp-android|biometricUnlock').then(() => 'accepted', () => 'refused'),
+        sleep(3000).then(() => 'pending'),
+      ]);
+      if (direct !== 'refused') throw new Error('WebView could invoke password-bearing biometric plugin: ' + direct);
+      return {root, biometricEnrolled: true, directPluginRefused: true};
     }
     if (phase === 'bio-unlock-start') {
       if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric unlock expected a locked vault');
