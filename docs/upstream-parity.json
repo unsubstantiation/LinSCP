@@ -4855,7 +4855,7 @@
       "id": "platform.android-saf-local-copy-move",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies walk nested files through the bridge. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) avoids whole-file Base64/JSON heap spikes. A packaged Android emulator exercises a real external-storage provider for a nested copy from a granted folder into app storage, a move from app storage into a grant, and an existing-destination move refusal that preserves both files.",
+      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies walk nested files through the bridge. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) avoids whole-file Base64/JSON heap spikes. A packaged Android emulator exercises a real external-storage provider for a nested copy from a granted folder into app storage, a move from app storage into a grant, and an existing-destination move refusal that preserves both files. The emulator also refuses a provider file one byte above the 64 MiB cap when copying it into app storage, preserving the source and leaving no destination.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/queue.rs",
@@ -4875,7 +4875,8 @@
           "a local tab offers moves out of a granted folder"
         ],
         "android-emulator": [
-          "verifyAndroidGrantedSafLocalCopyMove"
+          "verifyAndroidGrantedSafLocalCopyMove",
+          "verifyAndroidGrantedSafDocumentCap"
         ]
       },
       "verified_on": {
@@ -4892,7 +4893,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator covers the external-storage DocumentsProvider in one granted tree, including nested copy and a move conflict. Two separate granted trees, document-cap refusal on the real provider, other providers, large-document memory pressure, concurrent-creator races and physical devices remain unverified.",
+      "gap": "The emulator covers the external-storage DocumentsProvider in one granted tree, including nested copy, over-cap copy refusal and a move conflict. Two separate granted trees, other providers, large-document memory pressure, concurrent-creator races and physical devices remain unverified.",
       "acceptance": [
         "Copy and move files between a granted folder and app storage and between two granted trees on an Android device or emulator, covering the document-cap refusal and a move onto an existing name."
       ]
@@ -4901,7 +4902,7 @@
       "id": "platform.android-saf-session-transfers",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file. A packaged Android emulator test uses a DocumentsUI grant and a WebDAV fixture to upload, download, move, protect an existing destination, refuse verified resume, and transfer nested trees in both directions after explicit WebDAV directory-copy risk confirmation.",
+      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file. A packaged Android emulator test uses a DocumentsUI grant and a WebDAV fixture to upload, download, move, protect an existing destination, refuse verified resume, and transfer nested trees in both directions after explicit WebDAV directory-copy risk confirmation. The emulator refuses upload of a provider file one byte above the cap and preserves it.",
       "source": [
         "crates/linscp-engine/src/transfer.rs",
         "crates/linscp-service/src/lib.rs",
@@ -4926,7 +4927,8 @@
         ],
         "android-emulator": [
           "verifyAndroidGrantedSafTransfers",
-          "verifyAndroidGrantedSafTreeTransfers"
+          "verifyAndroidGrantedSafTreeTransfers",
+          "verifyAndroidGrantedSafDocumentCap"
         ]
       },
       "verified_on": {
@@ -4943,7 +4945,7 @@
           "android-emulator"
         ]
       },
-      "gap": "Single-file transfers, move, and nested tree upload/download are exercised on an Android emulator with the external-storage DocumentsProvider and a WebDAV fixture; document-cap refusal, tree merges, other providers, large-document memory pressure, concurrent writers and physical devices remain unverified.",
+      "gap": "Single-file transfers, move, nested tree upload/download and over-cap upload refusal are exercised on an Android emulator with the external-storage DocumentsProvider and a WebDAV fixture; over-cap download, tree merges, other providers, large-document memory pressure, concurrent writers and physical devices remain unverified.",
       "acceptance": [
         "Validate tree transfers and document-cap refusal between a granted folder and a server on an Android device or emulator, including other providers and physical devices."
       ]
@@ -5671,7 +5673,7 @@
       "id": "platform.android-saf-synchronization",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and nested synchronization in both directions. A two-pass keep-up-to-date run uploads a file created after the first pass started, exercising interval polling with the external-storage provider.",
+      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and nested synchronization in both directions. A two-pass keep-up-to-date run uploads a file created after the first pass started, exercising interval polling with the external-storage provider. A checksum preview against WebDAV refuses a real provider file one byte over the cap and preserves both files.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/keepuptodate.rs",
@@ -5697,7 +5699,8 @@
         ],
         "android-emulator": [
           "verifyAndroidGrantedSafSync",
-          "verifyAndroidGrantedSafNestedSync"
+          "verifyAndroidGrantedSafNestedSync",
+          "verifyAndroidGrantedSafDocumentCap"
         ]
       },
       "verified_on": {
@@ -5714,7 +5717,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator exercises nested synchronization and repeated polling with the external-storage DocumentsProvider and a WebDAV fixture. Over-cap files, polling cancellation with a real provider, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.",
+      "gap": "The emulator exercises nested synchronization, repeated polling and checksum preview over-cap refusal with the external-storage DocumentsProvider and a WebDAV fixture. Other over-cap paths, polling cancellation with a real provider, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.",
       "acceptance": [
         "Validate nested-tree synchronization, document-cap refusal, timed repeated polling and cancellation with real providers and physical devices."
       ]
