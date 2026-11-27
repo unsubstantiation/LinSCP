@@ -1,0 +1,223 @@
+name: Arena native listener validation
+
+on:
+  push:
+    branches: [arena/c4f5bb7a-linscp]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Debian package (.deb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-deb-release
+
+      - name: Install packaging and smoke-test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
+            build-essential cmake dpkg-dev debhelper pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            xvfb xdotool xauth openbox x11-utils
+
+      - name: Build the frontend bundle
+        run: |
+          set -euo pipefail
+          npm --prefix ui ci --no-audit --no-fund
+          npm --prefix ui run build
+
+      - name: Build the binary package
+        env:
+          DEB_BUILD_OPTIONS: "nocheck"
+        run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc -d -j$(nproc)
+
+      - name: Check the package contents
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(../linscp_*_*.deb)
+          test "${#debs[@]}" -eq 1 || { echo "::error::Expected exactly one .deb, found ${#debs[@]}"; exit 1; }
+          deb="${debs[0]}"
+          echo "Built $deb"
+          dpkg-deb --contents "$deb"
+          contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
+          for path in usr/bin/linscp-gui \
+                      usr/share/applications/linscp.desktop \
+                      usr/share/pixmaps/linscp.png \
+                      usr/share/icons/hicolor/scalable/apps/linscp.svg; do
+            echo "$contents" | grep -qx "$path" ||
+              { echo "::error::$path is missing from the package"; exit 1; }
+          done
+          if echo "$contents" | grep -qx usr/bin/linscp; then
+            echo "::error::The retired console executable must not be packaged"
+            exit 1
+          fi
+          cp "$deb" "$GITHUB_WORKSPACE/"
+
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          sudo dpkg -i ../linscp_*_*.deb
+          test -x /usr/bin/linscp-gui
+
+      - name: Smoke test the native window
+        run: |
+          set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR"' EXIT
+          if xvfb-run -a bash -euo pipefail -c '
+            export WEBKIT_DISABLE_COMPOSITING_MODE=1
+            export WEBKIT_DISABLE_DMABUF_RENDERER=1
+            export LIBGL_ALWAYS_SOFTWARE=1
+            openbox >/dev/null 2>&1 &
+            wm=$!
+            sleep 1
+            linscp-gui &
+            app=$!
+            trap "kill $app $wm 2>/dev/null || true" EXIT
+            for i in $(seq 1 120); do
+              if ! kill -0 "$app" 2>/dev/null; then
+                wait "$app" || true
+                echo "Application exited before opening a window" >&2
+                exit 1
+              fi
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
+                python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
+                echo "LinSCP window opened"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "The LinSCP window did not open within 120 seconds" >&2
+            exit 1
+          ' > native-smoke.log 2>&1; then
+            cat native-smoke.log
+          else
+            cat native-smoke.log
+            exit 1
+          fi
+
+      - name: Build and smoke test a custom-prefix Make install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          make -C source/linux install PREFIX="$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >make-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat make-smoke.log
+            exit 1
+          '
+
+      - name: Build and smoke test a custom-prefix CMake install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          build=$(mktemp -d)
+          trap 'rm -rf "$stage" "$build"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          cmake -S . -B "$build" -DCMAKE_INSTALL_PREFIX=/opt/linscp
+          cmake --build "$build"
+          cmake --install "$build" --prefix "$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >cmake-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat cmake-smoke.log
+            exit 1
+          '
+
+      - name: Smoke test the file-manager actions
+        run: |
+          set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          export XDG_DATA_HOME=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR" "$XDG_DATA_HOME"' EXIT
+
+          linscp-gui --install-shell-integration
+          for path in "kio/servicemenus/linscp-upload.desktop" \
+                      "nautilus/scripts/Upload with LinSCP" \
+                      "nemo/actions/linscp-upload.nemo_action"; do
+            test -f "$XDG_DATA_HOME/$path" || { echo "::error::$path was not written"; exit 1; }
+          done
+          grep -q -- '--shell-upload' "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::the Dolphin action does not call --shell-upload"; exit 1; }
+
+          selection=$(mktemp)
+          timeout 60 linscp-gui --shell-upload "$selection"
+          manifests=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          test -n "$manifests" || { echo "::error::--shell-upload recorded no manifest"; exit 1; }
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['items'], d" "$manifests"
+
+          first="$PWD/first file&odd.txt"
+          second="$PWD/second*.glob"
+          : > "$first"
+          : > "$second"
+          rm -rf "$LINSCP_CONFIG_DIR"/shell-manifests
+          selected=$(printf '%s\n%s' "$first" "$second")
+          NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="$selected" \
+            timeout 60 "$XDG_DATA_HOME/nautilus/scripts/Upload with LinSCP"
+          staged=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); paths=sorted(i['path'] for i in d['items']); assert len(paths)==2, paths; assert paths[0].endswith('first file&odd.txt'), paths; assert paths[1].endswith('second*.glob'), paths" "$staged"
+          rm -f "$first" "$second" "$selection"
+
+          linscp-gui --uninstall-shell-integration
+          test ! -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::uninstall left the Dolphin action behind"; exit 1; }
+
+          usage=$(linscp-gui --help)
+          case "$usage" in
+            *--shell-upload*) ;;
+            *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
+          esac
+
+      - name: Upload the Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: linscp-debian
+          path: linscp_*_*.deb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
