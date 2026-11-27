@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config_stores::PreferencesStore;
 use crate::session_store::SessionStore;
+use crate::vault_keys::{valid_id as valid_key_id, read_file as read_key_file, list_ids};
 
 /// Original encrypted key blob and optional metadata. The blob remains
 /// encrypted under the source master key, itself inside the backup envelope.
@@ -50,25 +51,6 @@ const KEY_COUNT_LIMIT: usize = 2000;
 const LABEL_LIMIT: usize = 512;
 const PUBLIC_LIMIT: usize = 32 * 1024;
 
-fn valid_key_id(id: &str) -> bool {
-    id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())
-}
-
-// Bounded, no-follow reads avoid exporting arbitrary linked files from the key directory.
-fn read_key_file(path: &Path, limit: usize) -> Result<Option<Vec<u8>>, String> {
-    match std::fs::symlink_metadata(path) {
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(format!("Cannot inspect {}: {error}", path.display())),
-        Ok(metadata) if !metadata.file_type().is_file() || metadata.len() > limit as u64 => return Err(format!("Invalid vault key file: {}", path.display())),
-        Ok(_) => {},
-    }
-    let file = linscp_platform::open_private_file_no_follow(path).map_err(|e| e.to_string())?;
-    let mut bytes = Vec::new();
-    file.take(limit as u64 + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-    if bytes.len() > limit { return Err(format!("Vault key file is too large: {}", path.display())); }
-    Ok(Some(bytes))
-}
-
 fn session_key_references(ini: &str) -> Result<BTreeSet<String>, String> {
     let store = SessionStore::parse_ini(ini, None)?;
     let mut ids = BTreeSet::new();
@@ -85,29 +67,12 @@ fn session_key_references(ini: &str) -> Result<BTreeSet<String>, String> {
 
 fn collect_vault_keys(config_dir: &Path, vault: &dyn SecretVault) -> Result<Vec<BackupVaultKey>, String> {
     let key_dir = config_dir.join("keys");
-    match std::fs::symlink_metadata(&key_dir) {
-        Ok(metadata) if metadata.file_type().is_dir() => {},
-        Ok(_) => return Err("The vault keys path is not a directory.".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
-    }
-    let entries = match std::fs::read_dir(&key_dir) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
-    };
+    let ids = list_ids(&key_dir, ".key.vault", KEY_COUNT_LIMIT)?;
     let mut keys = Vec::new();
-    let mut names = BTreeSet::new();
     let mut total_bytes = 0usize;
-    for entry in entries {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        let name = name.to_str().ok_or_else(|| "Invalid vault key filename".to_string())?;
-        let Some(id) = name.strip_suffix(".key.vault") else { continue; };
-        if !valid_key_id(id) || !names.insert(id.to_ascii_lowercase()) || keys.len() >= KEY_COUNT_LIMIT {
-            return Err("Invalid or duplicate vault SSH key identifier.".into());
-        }
-        let encrypted = read_key_file(&entry.path(), KEY_BLOB_LIMIT)?.ok_or_else(|| "Vault key disappeared during backup.".to_string())?;
+    for id in &ids {
+        if keys.len() >= KEY_COUNT_LIMIT { return Err("Too many vault SSH keys.".into()); }
+        let encrypted = read_key_file(&key_dir.join(format!("{id}.key.vault")), KEY_BLOB_LIMIT)?.ok_or_else(|| "Vault key disappeared during backup.".to_string())?;
         total_bytes = total_bytes.checked_add(encrypted.len()).ok_or_else(|| "Vault keys exceed backup size limit.".to_string())?;
         // Leave space for base64 expansion and the rest of the configuration.
         if total_bytes > 32 * 1024 * 1024 { return Err("Vault keys exceed backup size limit.".into()); }
@@ -131,29 +96,18 @@ fn validate_key_references(ini: &str, keys: &[BackupVaultKey]) -> Result<(), Str
 
 fn collect_public_only_keys(config_dir: &Path, private_keys: &[BackupVaultKey]) -> Result<Vec<BackupVaultPublicKey>, String> {
     let dir = config_dir.join("keys");
-    match std::fs::symlink_metadata(&dir) {
-        Ok(meta) if meta.file_type().is_dir() => {},
-        Ok(_) => return Err("The vault keys path is not a directory.".into()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(e) => return Err(format!("Cannot inspect vault keys: {e}")),
-    }
+    let ids = list_ids(&dir, ".pub", KEY_COUNT_LIMIT)?;
     let private: BTreeSet<String> = private_keys.iter().map(|k| k.id.to_ascii_lowercase()).collect();
-    let mut names = BTreeSet::new();
     let mut result = Vec::new();
-    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
-        let entry = entry.map_err(|e| e.to_string())?;
-        let name = entry.file_name();
-        let name = name.to_str().ok_or("Invalid vault public key filename")?;
-        let Some(id) = name.strip_suffix(".pub") else { continue };
-        if !valid_key_id(id) || !names.insert(id.to_ascii_lowercase()) { return Err("Invalid or duplicate vault public key identifier.".into()); }
+    for id in &ids {
         if private.contains(&id.to_ascii_lowercase()) {
-            if !private_keys.iter().any(|key| key.id == id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+            if !private_keys.iter().any(|key| key.id == *id) { return Err("Vault public key ID differs in case from its private key.".into()); }
             continue;
         }
         if result.len() >= KEY_COUNT_LIMIT { return Err("Too many vault public keys.".into()); }
-        let data = read_key_file(&entry.path(), PUBLIC_LIMIT)?.ok_or("Vault public key disappeared during backup")?;
+        let data = read_key_file(&dir.join(format!("{id}.pub")), PUBLIC_LIMIT)?.ok_or("Vault public key disappeared during backup")?;
         if data.is_empty() { return Err("Vault public key is empty.".into()); }
-        result.push(BackupVaultPublicKey { id: id.into(), public_b64: BASE64.encode(data) });
+        result.push(BackupVaultPublicKey { id: id.clone(), public_b64: BASE64.encode(data) });
     }
     result.sort_by(|a, b| a.id.cmp(&b.id));
     Ok(result)

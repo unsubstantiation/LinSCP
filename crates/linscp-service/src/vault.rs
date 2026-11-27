@@ -156,7 +156,7 @@ impl CommanderService {
             if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) { continue; }
             let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue; };
             let Some(id) = file_name.strip_suffix(".key.vault") else { continue; };
-            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) { continue; }
+            if !valid_vault_key_id(id) { continue; }
             let label = read_vault_key_label(&key_dir, id);
             keys.push(json!({
                 "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{id}"),
@@ -182,7 +182,7 @@ impl CommanderService {
         }
         let Some(id) = body.get("reference").and_then(Value::as_str)
             .and_then(|reference| reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX))
-            .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())) else {
+            .filter(|id| valid_vault_key_id(id)) else {
             return api_error(400, "Invalid encrypted SSH key reference.");
         };
         let reference = format!("{LOCAL_VAULT_KEY_PREFIX}{id}");

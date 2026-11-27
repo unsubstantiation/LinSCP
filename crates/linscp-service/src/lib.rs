@@ -15,6 +15,7 @@ use linscp_engine::{
     filemask::FileMask, offlineotp_vault::{self, CredentialEntry, LoginRecord, SshKeyRecord},
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
+use linscp_engine::vault_keys::{valid_id as valid_vault_key_id, list_ids as list_vault_key_ids, read_file as read_vault_key_file};
 use linscp_platform::{
     config_dir, gui_os, write_exclusive_private_file, write_private_file_atomic, LocalFs,
     NativeLocalFs, NativeSecretVault, SecretVault,
@@ -11083,7 +11084,7 @@ fn find_existing_vault_key_id(
         let path = entry.path();
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue };
         let Some(id) = file_name.strip_suffix(".key.vault") else { continue };
-        if id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if valid_vault_key_id(id) {
             candidate_ids.push(id.to_string());
         }
     }
@@ -11289,7 +11290,7 @@ fn read_tls_blob_for_export(
     label: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(id) = path_or_ref.strip_prefix(LOCAL_VAULT_TLS_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err(format!("Saved {label} reference is invalid."));
         }
         let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -11666,49 +11667,22 @@ fn offlineotp_entries_from_sessions(
     }
     if include_vault_keys {
         let dir = config_root.join("keys");
-        let mut ids = Vec::new();
-        match std::fs::symlink_metadata(&dir) {
-            Ok(metadata) if metadata.file_type().is_dir() => {},
-            Ok(_) => return Err("Invalid vault key directory.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot inspect vault key directory: {error}")),
-        }
-        match std::fs::read_dir(&dir) {
-            Ok(items) => for item in items {
-                let item = item.map_err(|error| format!("Cannot list vault keys: {error}"))?;
-                let name = item.file_name();
-                let name = name.to_str().ok_or("Invalid vault key filename")?;
-                if let Some(id) = name.strip_suffix(".key.vault") {
-                    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())
-                        || !item.file_type().map_err(|e| e.to_string())?.is_file() {
-                        return Err("Invalid encrypted SSH key file in vault.".into());
-                    }
-                    ids.push(id.to_owned());
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot list vault keys: {error}")),
-        }
-        ids.sort();
+        let ids = list_vault_key_ids(&dir, ".key.vault", 2000)?;
+        let all_public_ids = list_vault_key_ids(&dir, ".pub", 2000)?;
         let private_ids: std::collections::HashSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
         let mut public_ids = Vec::new();
-        if let Ok(items) = std::fs::read_dir(&dir) {
-            for item in items {
-                let item = item.map_err(|e| format!("Cannot list vault keys: {e}"))?;
-                let name = item.file_name();
-                let name = name.to_str().ok_or("Invalid vault key filename")?;
-                let Some(id) = name.strip_suffix(".pub") else { continue };
-                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || !item.file_type().map_err(|e| e.to_string())?.is_file() {
-                    return Err("Invalid vault SSH public key file.".into());
-                }
-                if !private_ids.contains(&id.to_ascii_lowercase()) { public_ids.push(id.to_string()); }
+        for id in all_public_ids {
+            if private_ids.contains(&id.to_ascii_lowercase()) {
+                if !ids.contains(&id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+            } else {
+                public_ids.push(id);
             }
         }
-        public_ids.sort();
         for id in public_ids {
             let (public_key, _) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"), config_root, secret_vault)?;
+            let label = read_export_vault_key_label(&dir, &id, &public_key)?;
             entries.push(CredentialEntry::SshKey(SshKeyRecord {
-                label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{}", read_vault_key_label(&dir, &id)),
+                label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{label}"),
                 public_key, private_key: String::new(), host: String::new(), port: 0,
                 username: String::new(), password: String::new(),
             }));
@@ -11716,17 +11690,7 @@ fn offlineotp_entries_from_sessions(
         for id in ids {
             let (public_key, private_key) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_KEY_PREFIX}{id}"), config_root, secret_vault)?;
             if private_key.is_empty() { return Err("Saved vault SSH key is empty.".into()); }
-            let label_path = dir.join(format!("{id}.label"));
-            match std::fs::symlink_metadata(&label_path) {
-                Ok(meta) if meta.file_type().is_file() && meta.len() <= 512 => {
-                    let label = std::fs::read_to_string(&label_path).map_err(|e| format!("Cannot read vault key label: {e}"))?;
-                    if sanitize_vault_key_label(&label) != label { return Err("Vault SSH key label is invalid.".into()); }
-                },
-                Ok(_) => return Err("Invalid vault SSH key label file.".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return Err(format!("Cannot read vault key label: {error}")),
-            }
-            let label = read_vault_key_label(&dir, &id);
+            let label = read_export_vault_key_label(&dir, &id, &public_key)?;
             entries.push(CredentialEntry::SshKey(SshKeyRecord {
                 label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{label}"),
                 public_key, private_key, host: String::new(), port: 0,
@@ -11744,6 +11708,19 @@ fn offlineotp_entries_from_sessions(
     Ok(entries)
 }
 
+// Exported labels must be read with the same bounded, no-follow policy as
+// key metadata; the picker can continue to use its best-effort display label.
+fn read_export_vault_key_label(dir: &Path, id: &str, public_key: &str) -> Result<String, String> {
+    match read_vault_key_file(&dir.join(format!("{id}.label")), 512)? {
+        Some(bytes) => {
+            let label = String::from_utf8(bytes).map_err(|_| "Vault SSH key label is not UTF-8.")?;
+            if sanitize_vault_key_label(&label) != label { return Err("Vault SSH key label is invalid.".into()); }
+            if label.is_empty() { Ok(derive_vault_key_label("", public_key, id)) } else { Ok(label) }
+        }
+        None => Ok(derive_vault_key_label("", public_key, id)),
+    }
+}
+
 fn read_offlineotp_keypair(
     path: &str,
     config_root: &Path,
@@ -11751,23 +11728,12 @@ fn read_offlineotp_keypair(
 ) -> Result<(String, String), String> {
     const LIMIT: u64 = 32 * 1024;
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
         }
         let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
-        let metadata = std::fs::symlink_metadata(&encrypted_path)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        if !metadata.file_type().is_file() { return Err("Invalid encrypted SSH key file.".into()); }
-        if metadata.len() > 1024 * 1024 + 64 {
-            return Err("Encrypted SSH key file is unexpectedly large.".to_string());
-        }
-        use std::io::Read as _;
-        let file = linscp_platform::open_private_file_no_follow(&encrypted_path)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        let mut encrypted = Vec::new();
-        file.take(1024 * 1024 + 65).read_to_end(&mut encrypted)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        if encrypted.len() > 1024 * 1024 + 64 { return Err("Encrypted SSH key file is unexpectedly large.".into()); }
+        let encrypted = read_vault_key_file(&encrypted_path, 1024 * 1024 + 64)?
+            .ok_or("Saved encrypted SSH key is no longer in the vault.")?;
         let private = secret_vault.open_local_blob(&encrypted)
             .map_err(|error| error.to_string())?;
         if private.len() as u64 > LIMIT {
@@ -11776,21 +11742,20 @@ fn read_offlineotp_keypair(
         let private = String::from_utf8(private.to_vec())
             .map_err(|_| "SSH private key is not UTF-8 text.".to_string())?;
         let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        match std::fs::symlink_metadata(&public_path) {
-            Ok(meta) if meta.file_type().is_file() => {},
-            Ok(_) => return Err("Invalid vault SSH public key file.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot inspect vault SSH public key: {error}")),
-        }
-        let public = read_bounded_key_optional(&public_path, LIMIT)?;
+        let public = match read_vault_key_file(&public_path, LIMIT as usize)? {
+            Some(bytes) => String::from_utf8(bytes).map_err(|_| "Vault SSH public key is not UTF-8 text.")?,
+            None => String::new(),
+        };
         return Ok((public, private));
     }
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_PUBLIC_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved SSH public key reference is invalid.".to_string());
         }
         let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        let public = read_bounded_key(&public_path, LIMIT)?;
+        let public = String::from_utf8(read_vault_key_file(&public_path, LIMIT as usize)?
+            .ok_or("Saved SSH public key is no longer in the vault.")?)
+            .map_err(|_| "Vault SSH public key is not UTF-8 text.")?;
         if public.trim().is_empty() {
             return Err("Saved SSH public key contains no key text.".to_string());
         }
@@ -12002,7 +11967,7 @@ fn plan_offlineotp_import(
             CredentialEntry::SshKey(mut key) => {
                 if let Some(rest) = key.label.strip_prefix(OFFLINEOTP_VAULT_KEY_PREFIX) {
                     let (id, label) = rest.split_once(':').ok_or("Invalid standalone vault key label")?;
-                    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())
+                    if !valid_vault_key_id(id)
                         || label.is_empty() || (key.private_key.is_empty() && key.public_key.is_empty())
                         || !key.host.is_empty() || !key.username.is_empty() || !key.password.is_empty() {
                         return Err("Invalid standalone vault key entry.".into());
@@ -12127,7 +12092,7 @@ fn import_offlineotp_entries(
                             let item = item.map_err(|e| e.to_string())?;
                             let name = item.file_name();
                             let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".pub")) else { continue };
-                            if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                            if valid_vault_key_id(id)
                                 && item.file_type().map_err(|e| e.to_string())?.is_file()
                                 && read_bounded_key(&item.path(), 32 * 1024)? == key.public_key {
                                 found = true;
@@ -12393,7 +12358,7 @@ fn protect_stored_ssh_keys(
     });
     for field in ["ca_certificate_file", "tls_certificate_file", "tls_certificate_key_file"] {
         if let Some(id) = site.extra_fields.get(field).and_then(|v| v.strip_prefix(LOCAL_VAULT_TLS_PREFIX)) {
-            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if !valid_vault_key_id(id) {
                 return Err(format!("Saved vault TLS reference in '{field}' is invalid."));
             }
             let blob = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -12418,7 +12383,7 @@ fn protect_one_ssh_key(
     created: &mut Vec<PathBuf>,
 ) -> Result<String, String> {
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
         }
         let key = config_root.join("keys").join(format!("{id}.key.vault"));
@@ -12534,7 +12499,7 @@ fn find_existing_vault_tls_id(
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else { continue; };
         let Some(id) = name_str.strip_suffix(".tls.vault") else { continue; };
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue; };
@@ -12617,7 +12582,7 @@ fn materialize_one_vault_tls_blob(
 ) -> Result<(), String> {
     let Some(reference) = raw_fields.get(field).cloned() else { return Ok(()); };
     let Some(id) = reference.strip_prefix(LOCAL_VAULT_TLS_PREFIX) else { return Ok(()); };
-    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_vault_key_id(id) {
         return Err(format!("Saved vault TLS reference in '{field}' is invalid."));
     }
     let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -12660,7 +12625,7 @@ fn materialize_one_vault_key(
 ) -> Result<(), String> {
     let Some(reference) = keyfile.as_deref() else { return Ok(()); };
     let Some(id) = reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX) else { return Ok(()); };
-    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_vault_key_id(id) {
         return Err("Saved encrypted SSH key reference is invalid.".to_string());
     }
     let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
@@ -18407,6 +18372,35 @@ mod tests {
         let blocked = service.dispatch(request("/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
         assert_eq!(blocked.status, 409, "{}", blocked.payload);
         assert!(blocked.payload["error"].as_str().unwrap().contains("copy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_backup_formats_reject_symlinked_vault_key_metadata() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let imported = service.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/vault/keys/import".into(), body: json!({"name": "fixture", "private_key": "fixture private key"}) });
+        assert_eq!(imported.status, 200);
+        let id = imported.payload["reference"].as_str().unwrap().strip_prefix(LOCAL_VAULT_KEY_PREFIX).unwrap();
+        let dir = tmp.path().join("keys");
+        let target = tmp.path().join("outside");
+        std::fs::write(&target, "outside value").unwrap();
+        let public = dir.join(format!("{id}.pub"));
+        let label = dir.join(format!("{id}.label"));
+        let export = |path: &str| service.dispatch(ApiEnvelope { method: "POST".into(), path: path.into(), body: json!({"password": "backup-password", "include_vault_keys": true}) });
+        assert_eq!(export("/api/vault/export").status, 200);
+        assert_eq!(export("/api/backup/export").status, 200);
+        symlink(&target, &public).unwrap();
+        assert_ne!(export("/api/vault/export").status, 200);
+        assert_ne!(export("/api/backup/export").status, 200);
+        std::fs::remove_file(&public).unwrap();
+        std::fs::remove_file(&label).unwrap();
+        symlink(&target, &label).unwrap();
+        assert_ne!(export("/api/vault/export").status, 200);
+        assert_ne!(export("/api/backup/export").status, 200);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside value");
     }
 
     #[test]
