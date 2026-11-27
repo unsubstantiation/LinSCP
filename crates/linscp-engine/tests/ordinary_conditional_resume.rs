@@ -1,9 +1,9 @@
 //! Ordinary resumes must pin and compare the local prefix before appending.
 use std::sync::{Arc, Mutex};
 use axum::{body::Body, extract::State, http::{HeaderMap, Method, StatusCode, Uri}, response::{IntoResponse, Response}, Router};
-use linscp_engine::{presets::ResumeSupportMode, transfer::{download_single_file, TransferFlags}, xml_log::SessionLogger};
+use linscp_engine::{presets::ResumeSupportMode, transfer::{download_single_file, upload_single_file, TransferFlags}, xml_log::SessionLogger};
 use linscp_proto::{s3::{S3ConnectConfig, S3Session}, webdav::{WebDavConnectConfig, WebDavSession}, RemoteSession};
-use linscp_types::{FileEntry, ProtocolScheme};
+use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 use zeroize::Zeroizing;
 
 struct Resource { data: Vec<u8>, etag: String, change_after_prefix: bool, wrong_version_at: Option<&'static str>, bad_etag_at: Option<(&'static str, bool)>, version_requests: Vec<String> }
@@ -82,6 +82,23 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     let direct = TransferFlags { resume_support: ResumeSupportMode::Off, ..flags };
     assert!(download_single_file(session, path, Some(&entry), &dest, &direct, &mut logger, None).await.is_err());
     assert_eq!(std::fs::read(&dest).unwrap(), b"xxxxx");
+    for contents in [b"0123456789".as_slice(), b"0123456789extra".as_slice()] {
+        std::fs::write(&dest, contents).unwrap();
+        assert!(download_single_file(session, path, Some(&entry), &dest, &direct, &mut logger, None).await.is_err());
+        assert_eq!(std::fs::read(&dest).unwrap(), contents);
+    }
+    for mode in [TransferMode::Ascii, TransferMode::Automatic] {
+        let text_flags = TransferFlags { transfer_mode: mode, ..direct.clone() };
+        let err = download_single_file(session, "file.txt", Some(&entry), &dest, &text_flags, &mut logger, None).await.unwrap_err();
+        assert!(err.contains("binary transfer mode"), "{err}");
+        let source = tmp.path().join("file.txt");
+        std::fs::write(&source, b"local text").unwrap();
+        let err = upload_single_file(session, &source, "file.txt", &text_flags, &mut logger, None).await.unwrap_err();
+        assert!(err.contains("binary transfer mode"), "{err}");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789extra");
+    }
+    let err = download_single_file(session, path, Some(&entry), std::path::Path::new("-"), &direct, &mut logger, None).await.unwrap_err();
+    assert!(err.contains("standard output"), "{err}");
 }
 
 #[tokio::test]

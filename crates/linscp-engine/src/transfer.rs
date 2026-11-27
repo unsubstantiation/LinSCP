@@ -441,6 +441,13 @@ pub async fn download_single_file(
     logger: &mut SessionLogger,
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
+    if flags.resume && local_dest == Path::new("-") {
+        return Err("Resume requires a local file, not standard output.".to_string());
+    }
+    let source_leaf = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    if flags.resume && wants_ascii_conversion(flags.transfer_mode, source_leaf) {
+        return Err("Resume requires binary transfer mode; ASCII conversion cannot safely resume.".to_string());
+    }
     if flags.version_id.is_some() && flags.delete_source {
         return Err("Cannot delete a versioned download source without a conditional version delete.".to_string());
     }
@@ -618,6 +625,11 @@ pub async fn download_single_file(
     }
 
     let use_stage = should_use_filepart(flags, session.scheme(), false, false, info.size);
+    if flags.resume && !use_stage && local_stat.exists
+        && (local_stat.is_symlink || !local_stat.is_regular || local_stat.size >= info.size)
+    {
+        return Err(format!("Cannot safely resume from existing local file '{}'.", local_dest.display()));
+    }
     if flags.cleanup_download_stage && (flags.resume || flags.append) {
         return Err("Automatic cleanup requires a fresh staged download.".to_string());
     }
@@ -651,6 +663,7 @@ pub async fn download_single_file(
     // WebDAV/S3 use a strong ETag for both the comparison and the remaining GET.
     let mut resume_identity = None;
     let mut verified_partial = None;
+    let mut verified_file = None;
     if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())
         || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
         let candidate = if let Some(stage) = stage_opt.as_ref() {
@@ -673,6 +686,10 @@ pub async fn download_single_file(
         if let Some((partial, size)) = candidate {
             let input = linscp_platform::open_private_file_no_follow(partial)
                 .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
+            if input.metadata().map_err(|e| format!("Cannot inspect resume partial: {e}"))?.len() != size {
+                return Err("Resume partial changed before verification; retry the transfer.".to_string());
+            }
+            let mut input = tokio::fs::File::from_std(input);
             if size > 0 {
                 if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && !flags.allow_best_effort_resume {
                     return Err("FTP/SFTP resume cannot pin the source; explicit best-effort resume approval is required.".to_string());
@@ -694,13 +711,13 @@ pub async fn download_single_file(
                     let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
                     format!("\"{protocol}:{}:{}\"", info.size, info.mtime)
                 };
-                let input = tokio::fs::File::from_std(input);
-                let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+                let mut reader = InterruptibleReader { inner: &mut input, cancel_flag: flags.cancel_flag.clone() };
                 session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader, flags.version_id.as_deref(), speed_u32(flags.speed_kbytes_per_sec)).await
                     .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
                 resume_identity = Some(token);
-                verified_partial = Some((partial.to_path_buf(), size));
             }
+            verified_partial = Some((partial.to_path_buf(), size));
+            verified_file = Some(input);
         }
     }
     let (write_path, resume_offset) = if flags.no_clobber {
@@ -712,12 +729,17 @@ pub async fn download_single_file(
             (sp.clone(), 0u64)
         } else {
             let sp_meta = stat_local_path(sp);
+            if flags.resume && sp_meta.exists && (sp_meta.is_symlink || !sp_meta.is_regular) {
+                return Err("Resume staging file changed after verification; retry the transfer.".to_string());
+            }
             if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
                 if sp_meta.size < info.size {
-                    if flags.resume && sp_meta.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((sp.as_path(), sp_meta.size)) {
+                    if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((sp.as_path(), sp_meta.size)) {
                         return Err("Resume partial changed after verification; retry the transfer.".to_string());
                     }
                     (sp.clone(), sp_meta.size)
+                } else if flags.resume {
+                    return Err("Resume staging file changed after verification; retry the transfer.".to_string());
                 } else {
                     let _ = std::fs::remove_file(sp);
                     (sp.clone(), 0u64)
@@ -729,15 +751,18 @@ pub async fn download_single_file(
                 && local_stat.size < info.size
             {
                 // Do not adopt a partial that appeared after the verification pass.
-                if local_stat.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((local_dest, local_stat.size)) {
+                if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((local_dest, local_stat.size)) {
                     return Err("Resume partial changed after verification; retry the transfer.".to_string());
                 }
                 // Adopt existing partial target into stage path or resume directly
-                let _ = std::fs::rename(local_dest, sp);
-                let moved = stat_local_path(sp);
-                (sp.clone(), if moved.exists { moved.size } else { 0 })
+                std::fs::rename(local_dest, sp)
+                    .map_err(|e| format!("Cannot move resume partial into staging: {e}"))?;
+                (sp.clone(), local_stat.size)
             } else {
-                let _ = std::fs::remove_file(sp);
+                if flags.resume && sp_meta.exists {
+                    return Err("Resume staging file changed after verification; retry the transfer.".to_string());
+                }
+                if !flags.resume { let _ = std::fs::remove_file(sp); }
                 (sp.clone(), 0u64)
             }
         }
@@ -752,7 +777,13 @@ pub async fn download_single_file(
     let fresh_stage = stage_opt.is_some() && !flags.resume && !flags.append;
     let open_res = if let Some(file) = private_file.take() {
         Ok(file)
-    } else if flags.no_clobber || fresh_stage {
+    } else if let Some(mut file) = verified_file.take() {
+        // Keep writing to the descriptor whose bytes were verified, never to a
+        // replacement opened through the checkpoint pathname.
+        file.seek(std::io::SeekFrom::Start(resume_offset)).await
+            .map_err(|e| format!("Cannot seek resume partial: {e}"))?;
+        Ok(file)
+    } else if flags.no_clobber || fresh_stage || flags.resume {
         tokio::fs::OpenOptions::new().write(true).create_new(true).open(&write_path).await
     } else if resume_offset > 0 || flags.append {
         tokio::fs::OpenOptions::new()
@@ -787,6 +818,17 @@ pub async fn download_single_file(
         }
     };
     let flush_res = tokio::io::AsyncWriteExt::flush(&mut file).await;
+    // Detect path replacement before publishing (this is not an atomic
+    // check-and-rename; a trusted destination directory is still required).
+    #[cfg(unix)]
+    if flags.resume && resume_offset > 0 {
+        use std::os::unix::fs::MetadataExt;
+        let opened = file.metadata().await.map_err(|e| format!("Cannot inspect resume file: {e}"))?;
+        let named = std::fs::symlink_metadata(&write_path).map_err(|e| format!("Resume pathname changed: {e}"))?;
+        if !named.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+            return Err("Resume pathname changed; refusing publication.".to_string());
+        }
+    }
     drop(file);
 
     let bytes = match dl_res {
@@ -885,6 +927,14 @@ pub async fn upload_single_file(
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
     validate_protocol_transfer_flags(flags, session.scheme(), true)?;
+    let source_leaf = if local_src == Path::new("-") {
+        remote_dest.rsplit('/').next().unwrap_or(remote_dest).into()
+    } else {
+        local_src.file_name().map(|name| name.to_string_lossy()).unwrap_or_default()
+    };
+    if flags.resume && wants_ascii_conversion(flags.transfer_mode, &source_leaf) {
+        return Err("Resume requires binary transfer mode; ASCII conversion cannot safely resume.".to_string());
+    }
 
     // The legacy unguarded staging path can unlink or replace a pathname
     // another client has substituted. It is not an ownership proof and must

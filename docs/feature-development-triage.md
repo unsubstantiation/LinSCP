@@ -2,7 +2,7 @@
 
 This is an audit of the 45 non-verified capability rows in [upstream-parity.json](upstream-parity.json), not new runtime evidence or a parity certification. Statuses and platform citations remain in the ledger. “Evidence” means implementation exists but the stated acceptance still needs proof; it does not guarantee no bugs. “Development + evidence” identifies a plausible implementation or policy gap that still needs inspection. Optional and scope-decision items are not commitments to add features.
 
-Historical CLI-dependent suites and generic all-platform criteria in the generated plan may not apply to this GUI-only product. Use supported GUI/service harnesses and platform-specific acceptance instead; keep historical comparisons visible. FTP/SFTP resume without an atomic source snapshot remains refused by default, with explicit best-effort consent where offered.
+Historical CLI-dependent suites and generic all-platform criteria in the generated plan may not apply to this GUI-only product. Use supported GUI/service harnesses and platform-specific acceptance instead; keep historical comparisons visible. FTP/SFTP resume without an atomic source snapshot remains refused by default, with explicit best-effort consent where offered. See [transfer resume safety](transfer-resume-safety.md) for protocol limitations and the remaining legacy pathname race.
 
 ## Capability triage
 
