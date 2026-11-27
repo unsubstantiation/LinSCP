@@ -17,6 +17,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: Resume and protocol integration checks
-        run: cargo test -p linscp-engine --test ordinary_conditional_resume --test ftp_staged_ascii --test sftp_live_cases --test script_engine_cases
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test ordinary_conditional_resume --test ftp_staged_ascii --test sftp_live_cases --test script_engine_cases -- --nocapture
       - name: Service regression checks
-        run: cargo test -p linscp-service --lib -- --test-threads=1 --skip live_
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service --lib -- --test-threads=1 --skip live_
