@@ -259,6 +259,7 @@ function vaultBackupBody(path, options) {
     return out;
   }
   if (path === '/api/vault/scan') {
+    if (keyOnlyScan) return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 0, entry_count: 0, vault_key_count: 1, entries: [] };
     return { success: true, encrypted: false, fingerprint: 'b'.repeat(64), ignored_entries: 1,
       entry_count: 2,
       entries: [
@@ -281,6 +282,7 @@ const calls = [];
 const errors = [];
 const confirmMessages = [];
 let confirmResult = true;
+let keyOnlyScan = false;
 let delayedTabOpen = null;
 
 const dom = new JSDOM(html, {
@@ -2697,6 +2699,22 @@ function options(id) {
       keyPickerCallsAfter > keyPickerCallsBefore,
     text('keyImportStatus'));
   window.closeModal('keySessionImportModal');
+  keyOnlyScan = true;
+  await window.openKeySessionImport();
+  Object.defineProperty(doc.getElementById('keyImportFile'), 'files', { value: [plainFile], configurable: true });
+  await window.scanKeySessionBackup();
+  check('a key-only backup displays its key count', text('keyImportVaultKeys').includes('1'), text('keyImportVaultKeys'));
+  doc.getElementById('sshKeyVaultModal').classList.add('open');
+  const keyOnlyPickerBefore = calls.filter(call => call.path === '/api/vault/keys').length;
+  const keyOnlyImportBefore = importCalls().length;
+  await window.importKeySession();
+  check('a key-only backup imports and refreshes the key picker',
+    importCalls().length === keyOnlyImportBefore + 1 &&
+      JSON.parse(importCalls().at(-1).options.body).sessions.length === 0 &&
+      calls.filter(call => call.path === '/api/vault/keys').length > keyOnlyPickerBefore);
+  doc.getElementById('sshKeyVaultModal').classList.remove('open');
+  window.closeModal('keySessionImportModal');
+  keyOnlyScan = false;
 
   /* Preferences: the defaults come from the backend, a save posts the whole
    * document, and the confirmation switches reach the copy and delete paths. */

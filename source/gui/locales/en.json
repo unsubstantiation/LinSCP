@@ -1569,6 +1569,7 @@
   "VNC — TigerVNC :5900": "VNC — TigerVNC :5900",
   "VRAM": "VRAM",
   "Vault & Stored Data": "Vault & Stored Data",
+  "Vault SSH keys in backup: {count}": "Vault SSH keys in backup: {count}",
   "Vault password": "Vault password",
   "Verify": "Verify",
   "Version ID": "Version ID",

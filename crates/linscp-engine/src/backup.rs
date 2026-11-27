@@ -146,7 +146,10 @@ fn collect_public_only_keys(config_dir: &Path, private_keys: &[BackupVaultKey]) 
         let name = name.to_str().ok_or("Invalid vault public key filename")?;
         let Some(id) = name.strip_suffix(".pub") else { continue };
         if !valid_key_id(id) || !names.insert(id.to_ascii_lowercase()) { return Err("Invalid or duplicate vault public key identifier.".into()); }
-        if private.contains(&id.to_ascii_lowercase()) { continue; }
+        if private.contains(&id.to_ascii_lowercase()) {
+            if !private_keys.iter().any(|key| key.id == id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+            continue;
+        }
         if result.len() >= KEY_COUNT_LIMIT { return Err("Too many vault public keys.".into()); }
         let data = read_key_file(&entry.path(), PUBLIC_LIMIT)?.ok_or("Vault public key disappeared during backup")?;
         if data.is_empty() { return Err("Vault public key is empty.".into()); }
