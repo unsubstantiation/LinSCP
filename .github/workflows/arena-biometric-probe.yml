@@ -22,8 +22,10 @@ jobs:
           disable-animations: true
           script: |
             adb shell locksettings set-pin 1234
+            sleep 3
             adb shell input keyevent 224
             adb shell input swipe 160 550 160 100 300
+            sleep 2
             adb shell input text 1234
             adb shell input keyevent 66
             sleep 3
@@ -31,4 +33,4 @@ jobs:
             sleep 8
             adb shell uiautomator dump /sdcard/probe.xml
             adb exec-out cat /sdcard/probe.xml > probe.xml
-            python3 -c "from pathlib import Path; print('::warning::' + Path('probe.xml').read_text().replace('%','%25').replace('\\n','%0A').replace('\\r','%0D'))"
+            python3 -c "import xml.etree.ElementTree as E; r=E.parse('probe.xml'); print('::warning::' + str([(n.get('text'),n.get('content-desc'),n.get('bounds')) for n in r.iter('node') if n.get('text') or n.get('content-desc')]))"
