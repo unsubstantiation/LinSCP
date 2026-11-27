@@ -543,8 +543,8 @@ async fn test_staged_resume_continues_the_staging_file_not_the_old_final() {
         "the download continues the staging file and replaces the old destination"
     );
     assert!(
-        !stage.exists(),
-        "the staging file is gone once the download is published"
+        fs::read(&stage).unwrap() == b"01234",
+        "the original checkpoint remains unchanged"
     );
 
     sftp.close().await.unwrap();
@@ -1308,7 +1308,7 @@ async fn test_interrupted_staged_download_resumes_its_partial() {
     flags.allow_best_effort_resume = true;
     assert!(download_single_file(&*sftp, "/interrupt.bin", None, &destination, &flags, &mut logger, None).await.unwrap());
     assert_eq!(fs::read(&destination).unwrap(), payload);
-    assert!(!stage.exists(), "the completed stage was published");
+    assert_eq!(fs::read(&stage).unwrap(), partial, "the original checkpoint remains unchanged");
     sftp.close().await.unwrap();
 }
 

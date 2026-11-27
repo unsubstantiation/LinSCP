@@ -84,25 +84,25 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
     assert_eq!(std::fs::read(&dest).unwrap(), b"old");
     state.lock().unwrap().change_after_prefix = false;
-    // Replace the name after its prefix is read. On Unix the transfer must
-    // write through the verified handle and must not publish the substitute.
-    #[cfg(unix)]
-    {
-        state.lock().unwrap().swap_partial = Some(stage.clone());
-        let error = download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap_err();
-        assert!(error.contains("pathname changed"), "{error}");
-        assert_eq!(std::fs::read(&stage).unwrap(), b"xxxxx");
-        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
-        std::fs::write(&stage, b"01234").unwrap();
-    }
+    // Replacing the checkpoint after it has been copied cannot change the
+    // private bytes being verified or published, or cause the substitute to
+    // be deleted. The opened checkpoint is no longer held during verification.
+    state.lock().unwrap().swap_partial = Some(stage.clone());
+    download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap();
+    assert_eq!(std::fs::read(&stage).unwrap(), b"xxxxx");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    std::fs::write(&stage, b"01234").unwrap();
+    std::fs::write(&dest, b"old").unwrap();
     download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
-    // A stage created while verifying the destination is never replaced.
+    assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
+    std::fs::remove_file(&stage).unwrap();
+    // A stage created while verifying a destination partial is never touched.
     std::fs::write(&dest, b"01234").unwrap();
     state.lock().unwrap().create_partial = Some(stage.clone());
-    assert!(download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.is_err());
+    download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap();
     assert_eq!(std::fs::read(&stage).unwrap(), b"intruder");
-    assert_eq!(std::fs::read(&dest).unwrap(), b"01234");
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
     std::fs::remove_file(&stage).unwrap();
     // With staging disabled, the destination itself is the partial.
     std::fs::write(&dest, b"xxxxx").unwrap();
