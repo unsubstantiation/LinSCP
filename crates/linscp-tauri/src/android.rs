@@ -9,6 +9,14 @@
 //! drive letter is on Windows.
 
 #[cfg(target_os = "android")]
+pub trait BiometricBridge: Send + Sync {
+    fn status(&self) -> Result<serde_json::Value, linscp_platform::PlatformError>;
+    fn enroll(&self, password: &str) -> Result<(), linscp_platform::PlatformError>;
+    fn unlock(&self) -> Result<zeroize::Zeroizing<String>, linscp_platform::PlatformError>;
+    fn disable(&self) -> Result<(), linscp_platform::PlatformError>;
+}
+
+#[cfg(target_os = "android")]
 mod imp {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
@@ -28,6 +36,7 @@ mod imp {
         fg: Mutex<Option<Arc<dyn ForegroundServiceBridge>>>,
         keystore: Mutex<Option<Arc<dyn KeystoreBridge>>>,
         clipboard: Mutex<Option<Arc<dyn ClipboardBridge>>>,
+        biometric: Mutex<Option<Arc<dyn super::BiometricBridge>>>,
     }
 
     impl AndroidState {
@@ -57,6 +66,12 @@ mod imp {
         }
         pub fn keystore_bridge(&self) -> Option<Arc<dyn KeystoreBridge>> {
             self.keystore.lock().unwrap().clone()
+        }
+        pub fn set_biometric(&self, bridge: Arc<dyn super::BiometricBridge>) {
+            *self.biometric.lock().unwrap() = Some(bridge);
+        }
+        pub fn biometric_bridge(&self) -> Option<Arc<dyn super::BiometricBridge>> {
+            self.biometric.lock().unwrap().clone()
         }
         pub fn set_clipboard(&self, bridge: Arc<dyn ClipboardBridge>) {
             *self.clipboard.lock().unwrap() = Some(bridge);
@@ -521,6 +536,23 @@ mod mobile_plugin {
             Ok(zeroize::Zeroizing::new(decoded))
         }
     }
+    impl super::BiometricBridge for MobileBridge {
+        fn status(&self) -> Result<serde_json::Value, PlatformError> { self.call("biometricStatus", ()) }
+        fn enroll(&self, password: &str) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { password: &'a str }
+            let _: serde_json::Value = self.call("biometricEnroll", Args { password })?;
+            Ok(())
+        }
+        fn unlock(&self) -> Result<zeroize::Zeroizing<String>, PlatformError> {
+            #[derive(Deserialize)] struct Reply { password: String }
+            let reply: Reply = self.call("biometricUnlock", ())?;
+            Ok(zeroize::Zeroizing::new(reply.password))
+        }
+        fn disable(&self) -> Result<(), PlatformError> {
+            let _: serde_json::Value = self.call("biometricDisable", ())?;
+            Ok(())
+        }
+    }
     impl ClipboardBridge for MobileBridge {
         fn read_text(&self) -> Result<String, PlatformError> {
             #[derive(Deserialize)] struct Reply { text: Option<String> }
@@ -544,6 +576,7 @@ mod mobile_plugin {
                 state.set_external_uri(bridge.clone());
                 state.set_foreground_service(bridge.clone());
                 state.set_clipboard(bridge.clone());
+                state.set_biometric(bridge.clone());
                 state.set_keystore(bridge);
                 app.manage(state);
                 Ok(())

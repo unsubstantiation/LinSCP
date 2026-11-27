@@ -2455,6 +2455,51 @@ function options(id) {
   doc.getElementById('vaultUnlockButton').disabled = false;
   doc.getElementById('vaultGateError').textContent = '';
 
+  {
+    const originalUserAgent = Object.getOwnPropertyDescriptor(window.navigator, 'userAgent');
+    Object.defineProperty(window.navigator, 'userAgent', {configurable: true, value: 'Android'});
+    const originalInvoke = window.__TAURI_INTERNALS__.invoke;
+    const bioCalls = [];
+    let bioStatus = {available: true, enabled: true};
+    let unlockSucceeds = false;
+    window.__TAURI_INTERNALS__.invoke = async (cmd, args) => {
+      if (!cmd.startsWith('linscp_biometric_')) return originalInvoke(cmd, args);
+      bioCalls.push({cmd, args});
+      if (cmd === 'linscp_biometric_status') return bioStatus;
+      if (cmd === 'linscp_biometric_unlock' && !unlockSucceeds) throw new Error('cancelled');
+      return {success: true};
+    };
+    responses['/api/vault/status'] = {success: true, vault: 'locked'};
+    let gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    check('Android vault offers biometric unlock only when enrolled', doc.getElementById('vaultBiometricButton').style.display !== 'none' && doc.getElementById('vaultBiometricEnrollRow').style.display === 'none');
+    await doc.getElementById('vaultBiometricButton').onclick();
+    check('cancelled biometric authentication keeps the password gate open', doc.getElementById('vaultGate').style.display === 'flex' && text('vaultGateError').includes('password'));
+    unlockSucceeds = true;
+    await doc.getElementById('vaultBiometricButton').onclick();
+    check('successful biometric unlock closes gate without passing a password to the page', await gatePromise && bioCalls.filter(c => c.cmd === 'linscp_biometric_unlock').every(c => !c.args));
+    bioStatus = {available: true, enabled: true};
+    gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    await doc.getElementById('vaultBiometricDisable').onclick();
+    check('biometric unlock can be disabled from the password gate', bioCalls.some(c => c.cmd === 'linscp_biometric_disable') && doc.getElementById('vaultBiometricButton').style.display === 'none');
+    doc.getElementById('vaultPassword').value = 'vault-password';
+    await doc.getElementById('vaultGateForm').onsubmit({preventDefault() {}});
+    await gatePromise;
+    bioStatus = {available: true, enabled: false};
+    gatePromise = window.requireLocalVaultUnlock();
+    await wait(20);
+    check('biometric enrollment is opt-in', doc.getElementById('vaultBiometricEnrollRow').style.display !== 'none' && !doc.getElementById('vaultBiometricEnroll').checked);
+    doc.getElementById('vaultBiometricEnroll').checked = true;
+    doc.getElementById('vaultPassword').value = 'vault-password';
+    await doc.getElementById('vaultGateForm').onsubmit({preventDefault() {}});
+    check('password unlock explicitly enrolls biometrics only after success', await gatePromise && bioCalls.some(c => c.cmd === 'linscp_biometric_enroll' && c.args.password === 'vault-password') && !doc.getElementById('vaultPassword').value);
+    responses['/api/vault/status'] = previousVaultStatus;
+    window.__TAURI_INTERNALS__.invoke = originalInvoke;
+    if (originalUserAgent) Object.defineProperty(window.navigator, 'userAgent', originalUserAgent);
+    else delete window.navigator.userAgent;
+  }
+
   window.openFullBackup();
   check('full backup dialog opens', doc.getElementById('fullBackupModal').classList.contains('open'));
   doc.getElementById('fullBackupPassword').value = 'long-backup-password';

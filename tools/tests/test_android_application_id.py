@@ -186,6 +186,12 @@ class AndroidApplicationIdTests(unittest.TestCase):
                 subprocess.run(command, check=True, capture_output=True, text=True)
             android = '{http://schemas.android.com/apk/res/android}'
             manifest_root = ET.parse(manifest).getroot()
+            permissions = manifest_root.findall('uses-permission')
+            names = [item.get(android + 'name') for item in permissions]
+            self.assertEqual(names.count('android.permission.USE_BIOMETRIC'), 1)
+            self.assertEqual(names.count('android.permission.USE_FINGERPRINT'), 1)
+            fingerprint = next(item for item in permissions if item.get(android + 'name') == 'android.permission.USE_FINGERPRINT')
+            self.assertEqual(fingerprint.get(android + 'maxSdkVersion'), '28')
             main_activity = manifest_root.find('application').find('activity')
             config_changes = set((main_activity.get(android + 'configChanges') or '').split('|'))
             for required_flag in ('orientation', 'keyboardHidden', 'keyboard', 'screenSize',

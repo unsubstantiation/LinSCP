@@ -1760,5 +1760,12 @@
   "{size} ({files} files, {dirs} folders)": "{size} ({files} files, {dirs} folders)",
   "{size} bytes, modified {date}{readonly}": "{size} bytes, modified {date}{readonly}",
   "{upload} to upload, {download} to download, {local} local and {remote} remote deletions, {conflicts} conflict(s), {unchanged} unchanged.": "{upload} to upload, {download} to download, {local} local and {remote} remote deletions, {conflicts} conflict(s), {unchanged} unchanged.",
-  "🖥️ Remote desktop": "🖥️ Remote desktop"
+  "🖥️ Remote desktop": "🖥️ Remote desktop",
+  "Enable biometric unlock on this device": "Enable biometric unlock on this device",
+  "Your vault password remains required if biometrics are unavailable or changed.": "Your vault password remains required if biometrics are unavailable or changed.",
+  "Unlock with biometrics": "Unlock with biometrics",
+  "Disable biometric unlock": "Disable biometric unlock",
+  "Biometric unlock failed or was cancelled. Use your vault password.": "Biometric unlock failed or was cancelled. Use your vault password.",
+  "Could not disable biometric unlock.": "Could not disable biometric unlock.",
+  "Biometric setup failed or was cancelled. You can continue using your vault password.": "Biometric setup failed or was cancelled. You can continue using your vault password."
 }

@@ -1760,5 +1760,12 @@
   "{size} ({files} files, {dirs} folders)": "{size} ({files} Dateien, {dirs} Ordner)",
   "{size} bytes, modified {date}{readonly}": "{size} Bytes, geändert {date}{readonly}",
   "{upload} to upload, {download} to download, {local} local and {remote} remote deletions, {conflicts} conflict(s), {unchanged} unchanged.": "{upload} zum Hochladen, {download} zum Herunterladen, {local} lokale und {remote} entfernte Löschungen, {conflicts} Konflikt(e), {unchanged} unverändert.",
-  "🖥️ Remote desktop": "🖥️ Entfernter Desktop"
+  "🖥️ Remote desktop": "🖥️ Entfernter Desktop",
+  "Enable biometric unlock on this device": "Biometrisches Entsperren auf diesem Gerät aktivieren",
+  "Your vault password remains required if biometrics are unavailable or changed.": "Wenn die Biometrie nicht verfügbar ist oder geändert wurde, ist weiterhin das Tresorpasswort erforderlich.",
+  "Unlock with biometrics": "Biometrisch entsperren",
+  "Disable biometric unlock": "Biometrisches Entsperren deaktivieren",
+  "Biometric unlock failed or was cancelled. Use your vault password.": "Das biometrische Entsperren ist fehlgeschlagen oder wurde abgebrochen. Verwenden Sie Ihr Tresorpasswort.",
+  "Could not disable biometric unlock.": "Das biometrische Entsperren konnte nicht deaktiviert werden.",
+  "Biometric setup failed or was cancelled. You can continue using your vault password.": "Die biometrische Einrichtung ist fehlgeschlagen oder wurde abgebrochen. Sie können weiterhin Ihr Tresorpasswort verwenden."
 }

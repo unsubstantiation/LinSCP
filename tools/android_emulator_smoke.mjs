@@ -813,6 +813,12 @@ const expression = `
   const vault = await invoke('GET', '/api/vault/status');
   if (vault.vault !== 'setup_required') throw new Error('Expected a fresh emulator vault: ' + JSON.stringify(vault));
   await invoke('POST', '/api/vault/unlock', {password: 'android smoke vault password'});
+  const biometricStatus = await window.__TAURI_INTERNALS__.invoke('linscp_biometric_status');
+  if (biometricStatus.enabled !== false || typeof biometricStatus.available !== 'boolean') throw new Error('Fresh vault unexpectedly enabled biometrics');
+  let wrongEnrollmentRefused = false;
+  try { await window.__TAURI_INTERNALS__.invoke('linscp_biometric_enroll', {password: 'wrong vault password'}); }
+  catch (_) { wrongEnrollmentRefused = true; }
+  if (!wrongEnrollmentRefused || (await window.__TAURI_INTERNALS__.invoke('linscp_biometric_status')).enabled) throw new Error('Wrong password enabled biometrics');
   const savedSite = await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
   if (!savedSite.success) throw new Error('Cannot save Android vault site');
   async function verifyAndroidSiteManager() {
@@ -846,7 +852,10 @@ const expression = `
   await verifyAndroidSiteManager();
   const locked = await invoke('POST', '/api/vault/lock');
   if (!locked.success || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Vault did not lock');
-  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true};
+  let biometricRefused = false;
+  try { await window.__TAURI_INTERNALS__.invoke('linscp_biometric_unlock'); } catch (_) { biometricRefused = true; }
+  if (!biometricRefused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Unenrolled biometric unlock did not fail closed');
+  return {transport: window.LinSCPTransport.mode, root, title: document.title, upload: true, download: true, resume: true, resumeSafetyRefusals: true, conflict: true, externalUriValidation: true, webViewRendering: true, ungrantedSafRefused: true, unenrolledBiometricsRefused: true};
 })()`;
 let nextId = 0;
 async function evaluate(expression, timeout = 10000) {

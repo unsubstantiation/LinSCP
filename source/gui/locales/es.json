@@ -1760,5 +1760,12 @@
   "{size} ({files} files, {dirs} folders)": "{size} ({files} archivos, {dirs} carpetas)",
   "{size} bytes, modified {date}{readonly}": "{size} bytes, modificado {date}{readonly}",
   "{upload} to upload, {download} to download, {local} local and {remote} remote deletions, {conflicts} conflict(s), {unchanged} unchanged.": "{upload} por subir, {download} por descargar, {local} eliminaciones locales y {remote} remotas, {conflicts} conflicto(s), {unchanged} sin cambios.",
-  "🖥️ Remote desktop": "🖥️ Escritorio remoto"
+  "🖥️ Remote desktop": "🖥️ Escritorio remoto",
+  "Enable biometric unlock on this device": "Activar el desbloqueo biométrico en este dispositivo",
+  "Your vault password remains required if biometrics are unavailable or changed.": "Seguirás necesitando la contraseña del almacén si la biometría no está disponible o cambia.",
+  "Unlock with biometrics": "Desbloquear con biometría",
+  "Disable biometric unlock": "Desactivar el desbloqueo biométrico",
+  "Biometric unlock failed or was cancelled. Use your vault password.": "El desbloqueo biométrico falló o se canceló. Usa la contraseña del almacén.",
+  "Could not disable biometric unlock.": "No se pudo desactivar el desbloqueo biométrico.",
+  "Biometric setup failed or was cancelled. You can continue using your vault password.": "La configuración biométrica falló o se canceló. Puedes seguir usando la contraseña del almacén."
 }

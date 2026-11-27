@@ -136,6 +136,58 @@ pub mod commands {
         Ok(state.invoke_async(envelope).await)
     }
 
+    /// Biometric material stays inside the native bridge; the WebView never
+    /// receives the recovered password. The ordinary vault gate still checks
+    /// passwords, recovery journals, and configuration locking on both paths.
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_status(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let bridge = state.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || bridge.status().map_err(|e| e.to_string()))
+            .await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_enroll(state: tauri::State<'_, TauriBridge>, password: String) -> Result<serde_json::Value, String> {
+        let app = state.inner().clone();
+        let biometric = app.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        let password = zeroize::Zeroizing::new(password);
+        tauri::async_runtime::spawn_blocking(move || {
+            let status = app.invoke(ApiEnvelope { method: "GET".into(), path: "/api/vault/status".into(), body: json!({}) });
+            if status.status != 200 || status.payload["vault"] != "unlocked" { return Err("Unlock the vault with its password first".to_string()); }
+            let verified = app.invoke(ApiEnvelope { method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": &*password}) });
+            if verified.status != 200 { return Err("Vault password verification failed".to_string()); }
+            biometric.enroll(&password).map_err(|e| e.to_string())?;
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_unlock(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let app = state.inner().clone();
+        let biometric = app.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            let status = app.invoke(ApiEnvelope { method: "GET".into(), path: "/api/vault/status".into(), body: json!({}) });
+            if status.status != 200 || status.payload["vault"] != "locked" { return Err("The vault is not locked; use your password".to_string()); }
+            let password = biometric.unlock().map_err(|e| e.to_string())?;
+            let reply = app.invoke(ApiEnvelope { method: "POST".into(), path: "/api/vault/unlock".into(), body: json!({"password": &*password}) });
+            if reply.status != 200 || reply.payload["success"] != true { return Err("Biometric unlock failed; use your vault password".to_string()); }
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
+    #[cfg(target_os = "android")]
+    #[tauri::command]
+    pub async fn linscp_biometric_disable(state: tauri::State<'_, TauriBridge>) -> Result<serde_json::Value, String> {
+        let bridge = state.android_state().biometric_bridge().ok_or("Biometrics are unavailable")?;
+        tauri::async_runtime::spawn_blocking(move || {
+            bridge.disable().map_err(|e| e.to_string())?;
+            Ok(json!({"success": true}))
+        }).await.map_err(|e| e.to_string())?
+    }
+
     /// Only the main window may consume pending URLs. They are reviewed by the
     /// user and never opened automatically, and are not persisted to disk.
     #[cfg(not(target_os = "android"))]
@@ -598,6 +650,14 @@ fn build_native_app_with_bridge(
     });
     builder.invoke_handler(tauri::generate_handler![
             commands::linscp_invoke,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_status,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_enroll,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_unlock,
+            #[cfg(target_os = "android")]
+            commands::linscp_biometric_disable,
             #[cfg(not(target_os = "android"))]
             commands::linscp_take_launch_url,
             #[cfg(not(target_os = "android"))]

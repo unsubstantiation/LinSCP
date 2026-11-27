@@ -40,6 +40,16 @@ if 'android.permission.FOREGROUND_SERVICE_DATA_SYNC' not in text:
         '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />\n'
         '    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />\n'
         '    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />')
+if 'android.permission.USE_BIOMETRIC' not in text:
+    internet_permission = '    <uses-permission android:name="android.permission.INTERNET" />'
+    if internet_permission not in text:
+        raise SystemExit('Unexpected Android manifest permissions; add biometric permission')
+    text = text.replace(internet_permission, internet_permission + '\n    <uses-permission android:name="android.permission.USE_BIOMETRIC" />', 1)
+if 'android.permission.USE_FINGERPRINT' not in text:
+    internet_permission = '    <uses-permission android:name="android.permission.INTERNET" />'
+    if internet_permission not in text:
+        raise SystemExit('Unexpected Android manifest permissions; add fingerprint permission')
+    text = text.replace(internet_permission, internet_permission + '\n    <uses-permission android:name="android.permission.USE_FINGERPRINT" android:maxSdkVersion="28" />', 1)
 if text.count('android:name=".MainActivity"') != 1:
     raise SystemExit('Unexpected Android activity layout; review share intent filters')
 

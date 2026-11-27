@@ -1760,5 +1760,12 @@
   "{size} ({files} files, {dirs} folders)": "{size} ({files} fichiers, {dirs} dossiers)",
   "{size} bytes, modified {date}{readonly}": "{size} octets, modifié le {date}{readonly}",
   "{upload} to upload, {download} to download, {local} local and {remote} remote deletions, {conflicts} conflict(s), {unchanged} unchanged.": "{upload} à envoyer, {download} à télécharger, {local} suppressions locales et {remote} distantes, {conflicts} conflit(s), {unchanged} inchangé(s).",
-  "🖥️ Remote desktop": "🖥️ Bureau distant"
+  "🖥️ Remote desktop": "🖥️ Bureau distant",
+  "Enable biometric unlock on this device": "Activer le déverrouillage biométrique sur cet appareil",
+  "Your vault password remains required if biometrics are unavailable or changed.": "Le mot de passe du coffre reste nécessaire si la biométrie est indisponible ou modifiée.",
+  "Unlock with biometrics": "Déverrouiller par biométrie",
+  "Disable biometric unlock": "Désactiver le déverrouillage biométrique",
+  "Biometric unlock failed or was cancelled. Use your vault password.": "Le déverrouillage biométrique a échoué ou a été annulé. Utilisez le mot de passe du coffre.",
+  "Could not disable biometric unlock.": "Impossible de désactiver le déverrouillage biométrique.",
+  "Biometric setup failed or was cancelled. You can continue using your vault password.": "La configuration biométrique a échoué ou a été annulée. Vous pouvez continuer à utiliser le mot de passe du coffre."
 }
