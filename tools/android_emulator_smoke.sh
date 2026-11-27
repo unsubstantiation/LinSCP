@@ -235,7 +235,12 @@ restart_and_run portable-reopen
 # Exercise a real persisted tree grant, obtained only through the OS picker.
 node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-start
 python3 tools/android_select_saf_folder.py
+# A provider-backed file one byte above the per-document cap, isolated so
+# other synchronization fixtures cannot accidentally traverse it.
+adb shell mkdir -p /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture
+adb shell "dd if=/dev/zero of=/sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin bs=1048576 count=64 && printf x >> /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin"
 node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-finish
+adb shell rm /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin
 if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-edited ]]; then
   echo "SAF provider did not persist edited bytes" >&2; exit 1
 fi

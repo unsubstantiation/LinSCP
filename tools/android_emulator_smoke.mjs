@@ -309,6 +309,31 @@ const expression = `
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafDocumentCap(tree, root, tab);
+  }
+  async function verifyAndroidGrantedSafDocumentCap(tree, root, tab) {
+    const dir = tree + '/document/cap-fixture';
+    const local = (await invoke('POST', '/api/tabs/local', {local_dir: dir, remote_dir: root})).tab.id;
+    const entries = (await invoke('GET', '/api/local/list?tab=' + local + '&path=' + encodeURIComponent(dir))).entries;
+    if (!entries?.some(entry => entry.name === 'oversize.bin' && entry.size === 67108865)) throw new Error('Provider cap fixture missing or wrong size: ' + JSON.stringify(entries));
+    async function expectCap(path, body) {
+      let refused = false;
+      try { await invoke('POST', path, body); }
+      catch (error) { refused = error.status === 400 && /oversize[.]bin/.test(error.message || '') && /64 MiB/.test(error.message || ''); }
+      if (!refused) throw new Error('Expected named provider document-cap refusal from ' + path);
+    }
+    await expectCap('/api/transfer/upload', {tab, local_dir: dir, remote_dir: '/', names: ['oversize.bin']});
+    await expectCap('/api/transfer/upload', {tab: local, local_dir: dir, remote_dir: root, names: ['oversize.bin']});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'cap-fixture'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/cap-fixture/oversize.bin', content: 'small remote fixture'});
+    await expectCap('/api/sync/preview', {tab, local_dir: dir, remote_dir: '/cap-fixture', mode: 'remote', criteria: 'checksum'});
+    const remote = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/cap-fixture/oversize.bin'));
+    if (remote.content !== 'small remote fixture') throw new Error('Cap refusal changed remote file');
+    const after = (await invoke('GET', '/api/local/list?tab=' + local + '&path=' + encodeURIComponent(dir))).entries;
+    if (!after?.some(entry => entry.name === 'oversize.bin' && entry.size === 67108865)) throw new Error('Cap refusal changed provider file');
+    const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: dir})).tab.id;
+    const privateFiles = (await invoke('GET', '/api/local/list?tab=' + rootTab + '&path=' + encodeURIComponent(root))).entries;
+    if (privateFiles?.some(entry => entry.name === 'oversize.bin')) throw new Error('Cap refusal left a local destination');
   }
   async function verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask) {
     await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-tree-up'});
