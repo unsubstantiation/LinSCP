@@ -11668,12 +11668,12 @@ fn offlineotp_entries_from_sessions(
     if include_vault_keys {
         let dir = config_root.join("keys");
         let ids = list_vault_key_ids(&dir, ".key.vault", 2000)?;
-        let all_public_ids = list_vault_key_ids(&dir, ".pub", 2000)?;
-        let private_ids: std::collections::HashSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let all_public_ids = list_vault_key_ids(&dir, ".pub", 4000)?;
+        let private_ids: HashMap<String, &str> = ids.iter().map(|id| (id.to_ascii_lowercase(), id.as_str())).collect();
         let mut public_ids = Vec::new();
         for id in all_public_ids {
-            if private_ids.contains(&id.to_ascii_lowercase()) {
-                if !ids.contains(&id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+            if let Some(private_id) = private_ids.get(&id.to_ascii_lowercase()) {
+                if *private_id != id.as_str() { return Err("Vault public key ID differs in case from its private key.".into()); }
             } else {
                 public_ids.push(id);
             }

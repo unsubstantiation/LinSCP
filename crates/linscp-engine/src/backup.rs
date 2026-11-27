@@ -96,12 +96,15 @@ fn validate_key_references(ini: &str, keys: &[BackupVaultKey]) -> Result<(), Str
 
 fn collect_public_only_keys(config_dir: &Path, private_keys: &[BackupVaultKey]) -> Result<Vec<BackupVaultPublicKey>, String> {
     let dir = config_dir.join("keys");
-    let ids = list_ids(&dir, ".pub", KEY_COUNT_LIMIT)?;
-    let private: BTreeSet<String> = private_keys.iter().map(|k| k.id.to_ascii_lowercase()).collect();
+    // A private key may have a public sidecar in addition to the independent
+    // public-only key limit; do not count those sidecars against that limit.
+    let ids = list_ids(&dir, ".pub", KEY_COUNT_LIMIT * 2)?;
+    let private: std::collections::BTreeMap<String, &str> = private_keys.iter()
+        .map(|key| (key.id.to_ascii_lowercase(), key.id.as_str())).collect();
     let mut result = Vec::new();
     for id in &ids {
-        if private.contains(&id.to_ascii_lowercase()) {
-            if !private_keys.iter().any(|key| key.id == *id) { return Err("Vault public key ID differs in case from its private key.".into()); }
+        if let Some(private_id) = private.get(&id.to_ascii_lowercase()) {
+            if *private_id != id.as_str() { return Err("Vault public key ID differs in case from its private key.".into()); }
             continue;
         }
         if result.len() >= KEY_COUNT_LIMIT { return Err("Too many vault public keys.".into()); }
@@ -984,6 +987,28 @@ fn detect_distribution_id() -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn public_sidecars_do_not_count_toward_public_only_limit() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let private_id = format!("{:032x}", 0);
+        std::fs::write(dir.join(format!("{private_id}.pub")), b"paired").unwrap();
+        let private = vec![super::BackupVaultKey {
+            id: private_id,
+            encrypted_b64: String::new(),
+            label_b64: None,
+            public_b64: None,
+        }];
+        for index in 1..=super::KEY_COUNT_LIMIT {
+            std::fs::write(dir.join(format!("{index:032x}.pub")), b"public").unwrap();
+        }
+        let result = super::collect_public_only_keys(temp.path(), &private).unwrap();
+        assert_eq!(result.len(), super::KEY_COUNT_LIMIT);
+        std::fs::write(dir.join(format!("{:032x}.pub", super::KEY_COUNT_LIMIT + 1)), b"extra").unwrap();
+        assert!(super::collect_public_only_keys(temp.path(), &private).is_err());
+    }
+
     use super::*;
     use linscp_crypto::SessionMasterKey;
     use linscp_platform::password_vault::PasswordSecretVault;
