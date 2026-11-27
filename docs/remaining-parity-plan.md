@@ -322,7 +322,7 @@ The GUI can parse a manually pasted session URL through /api/session/url, includ
 
 **Area:** Desktop integration · **Status:** partial
 
-The native GUI embeds its frontend and engine in one executable; there is no separate core or GUI launcher to locate. Linux Make and CMake builds have been launched from staged custom prefixes under Xvfb, with the prefix bin directory in PATH.
+The native GUI embeds its frontend and engine in one executable; there is no separate core to locate. Make and CMake now generate a desktop entry targeting the runtime prefix instead of PATH; a GIO test launches a stub with a URL from a special-character prefix. Native desktop menu and default-handler selection remain untested.
 
 **Next:** The historical separate-core launcher no longer exists; desktop menu resolution and scheme selection at a custom prefix have not been tested. The old Python tests require the retired CLI.
 
@@ -364,9 +364,9 @@ English, Spanish, German and French catalogs cover the browser interface (menus,
 
 **Area:** Packaging/platforms · **Status:** partial
 
-source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. A Linux CI run built via Make, staged under a custom prefix and opened the resulting GUI under Xvfb; the Debian workflow repeats this smoke. There is no CLI in this distribution.
+source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop entry and icons under PREFIX (default /usr), optionally staged under DESTDIR. The Debian CI distribution suite runs the install recipe with an isolated stub binary and checks custom paths, default paths and permissions. A Linux CI run built via Make, staged under a custom prefix and opened the resulting GUI under Xvfb; the Debian workflow repeats this smoke. There is no CLI in this distribution. The desktop entry now names the runtime prefix, not DESTDIR or the session PATH; GIO launches a stub from a prefix with spaces and special characters.
 
-**Next:** The supported Linux GUI build and staged launch are exercised, but actual desktop menu discovery and scheme-handler selection under a custom prefix are unverified; launcher lookup depends on the session PATH. The former console client is not shipped.
+**Next:** The supported Linux GUI build and staged launch are exercised, but desktop menu discovery and scheme-handler selection under a custom prefix are unverified. The former console client is not shipped.
 
 **Acceptance criteria:**
 
@@ -377,7 +377,7 @@ source/linux/Makefile wraps the native Tauri build and installs the GUI, desktop
 
 **Area:** Packaging/platforms · **Status:** partial
 
-CMake wraps the native Tauri build, registers Rust and UI CTest entries, and installs the GUI, desktop entry and icons using CMAKE_INSTALL_PREFIX and DESTDIR. A Linux CI run built with CMake and opened the staged GUI under Xvfb; the Debian workflow repeats this smoke. A distribution test also exercises a custom prefix containing spaces with a stub executable. The retired CLI and man page are not installed, and CMake does not explicitly reject non-Linux hosts.
+CMake wraps the native Tauri build, registers Rust and UI CTest entries, and installs the GUI, desktop entry and icons using CMAKE_INSTALL_PREFIX and DESTDIR. A Linux CI run built with CMake and opened the staged GUI under Xvfb; the Debian workflow repeats this smoke. A distribution test also exercises a custom prefix containing spaces with a stub executable. The retired CLI and man page are not installed, and CMake does not explicitly reject non-Linux hosts. The desktop entry is generated at install time using the effective runtime prefix, including cmake --install --prefix, independent of DESTDIR or the session PATH.
 
 **Next:** The native Linux build and staged GUI launch are covered, but desktop menu discovery and scheme-handler selection from a custom prefix are unverified. CMake registers CTest entries, but this smoke does not execute them. The upstream console client is not shipped.
 
@@ -403,7 +403,7 @@ debian/rules and debian/control build a native GUI-only package with its desktop
 
 **Area:** Packaging/platforms · **Status:** partial
 
-The GUI embeds its engine and does not look up a separate PREFIX/bin/linscp core. The Make and CMake wrappers stage the GUI under custom prefixes, and the Linux desktop entry resolves linscp-gui through PATH.
+The GUI embeds its engine and does not look up a separate PREFIX/bin/linscp core. The Make and CMake installers generate desktop entries pointing to the effective runtime prefix; DESTDIR is excluded. A GIO test launches a stub with a URL without the prefix on PATH.
 
 **Next:** The separate-core prefix lookup described by the retired Python harness is not part of the GUI-only product. Desktop menu and scheme-handler discovery under a custom prefix remain unverified.
 

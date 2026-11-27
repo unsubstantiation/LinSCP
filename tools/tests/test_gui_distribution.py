@@ -82,6 +82,8 @@ class GuiDistributionTests(unittest.TestCase):
             (root / 'target/release').mkdir(parents=True)
             (root / 'debian').mkdir()
             shutil.copy(ROOT / 'source/linux/Makefile', root / 'source/linux/Makefile')
+            (root / 'tools').mkdir()
+            shutil.copy(ROOT / 'tools/install_desktop_entry.py', root / 'tools/install_desktop_entry.py')
             (root / 'target/release/linscp-gui').write_text('stub executable')
             for asset in ['linscp.desktop', 'linscp.png', 'linscp.svg']:
                 shutil.copy(ROOT / 'debian' / asset, root / 'debian' / asset)
@@ -95,6 +97,10 @@ class GuiDistributionTests(unittest.TestCase):
             for path in ['share/applications/linscp.desktop', 'share/pixmaps/linscp.png',
                          'share/icons/hicolor/scalable/apps/linscp.svg']:
                 self.assertTrue((prefix / path).is_file(), path)
+            desktop = (prefix / 'share/applications/linscp.desktop').read_text()
+            self.assertIn('\nExec="/opt/linscp custom/bin/linscp-gui" %u\n', desktop)
+            self.assertIn('\nTryExec=/opt/linscp custom/bin/linscp-gui\n', desktop)
+            self.assertNotIn(str(stage), desktop)
             self.assertFalse((stage / 'usr').exists())
             default_stage = pathlib.Path(tmp) / 'default stage'
             subprocess.run(['make', '-C', str(root / 'source/linux'), '-o', 'all', 'install',
@@ -109,6 +115,8 @@ class GuiDistributionTests(unittest.TestCase):
             (root / 'target/release').mkdir(parents=True)
             (root / 'debian').mkdir()
             shutil.copy(ROOT / 'CMakeLists.txt', root / 'CMakeLists.txt')
+            (root / 'tools').mkdir()
+            shutil.copy(ROOT / 'tools/install_desktop_entry.py', root / 'tools/install_desktop_entry.py')
             (root / 'target/release/linscp-gui').write_text('stub executable')
             for asset in ['linscp.desktop', 'linscp.png', 'linscp.svg']:
                 shutil.copy(ROOT / 'debian' / asset, root / 'debian' / asset)
@@ -127,7 +135,61 @@ class GuiDistributionTests(unittest.TestCase):
             for path in ['share/applications/linscp.desktop', 'share/pixmaps/linscp.png',
                          'share/icons/hicolor/scalable/apps/linscp.svg']:
                 self.assertTrue((prefix / path).is_file(), path)
+            desktop = (prefix / 'share/applications/linscp.desktop').read_text()
+            self.assertIn('\nExec="/opt/linscp custom/bin/linscp-gui" %u\n', desktop)
+            self.assertIn('\nTryExec=/opt/linscp custom/bin/linscp-gui\n', desktop)
+            self.assertNotIn(str(stage), desktop)
             self.assertFalse((stage / 'usr').exists())
+            override = '/opt/override prefix'
+            subprocess.run(['cmake', '--install', str(build), '--prefix', override],
+                           env={**os.environ, 'DESTDIR': str(stage)}, check=True, capture_output=True, text=True)
+            desktop = (stage / 'opt/override prefix/share/applications/linscp.desktop').read_text()
+            self.assertIn('\nExec="/opt/override prefix/bin/linscp-gui" %u\n', desktop)
+            self.assertNotIn(str(stage), desktop)
+
+    @unittest.skipUnless(__import__('ctypes.util', fromlist=['find_library']).find_library('gio-2.0'), 'GIO required')
+    def test_custom_prefix_desktop_entry_launches_uri_without_path_lookup(self):
+        import os
+        import sys
+        import time
+        with tempfile.TemporaryDirectory() as tmp:
+            prefix = pathlib.Path(tmp) / 'prefix % space "quote" $dollar \\backslash'
+            binary = prefix / 'bin/linscp-gui'
+            binary.parent.mkdir(parents=True)
+            binary.write_text('#!/bin/sh\nprintf "%s" "$1" > "$LINSCP_TEST_CAPTURE"\n')
+            binary.chmod(0o755)
+            subprocess.run([sys.executable, str(ROOT / 'tools/install_desktop_entry.py'),
+                            '--prefix', str(prefix), '--template', str(ROOT / 'debian/linscp.desktop')], check=True)
+            desktop = prefix / 'share/applications/linscp.desktop'
+            capture = pathlib.Path(tmp) / 'argument'
+            uri = 'sftp://example.invalid/path%20with%20spaces'
+            # GIO parses and launches the actual desktop entry, not a shell
+            # approximation of Exec. The prefix bin is deliberately off PATH.
+            code = '''
+import ctypes, ctypes.util, sys
+gio = ctypes.CDLL(ctypes.util.find_library("gio-2.0"))
+glib = ctypes.CDLL(ctypes.util.find_library("glib-2.0"))
+gio.g_desktop_app_info_new_from_filename.argtypes = [ctypes.c_char_p]
+gio.g_desktop_app_info_new_from_filename.restype = ctypes.c_void_p
+gio.g_app_info_launch_uris.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.POINTER(ctypes.c_void_p)]
+gio.g_app_info_launch_uris.restype = ctypes.c_int
+glib.g_list_append.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+glib.g_list_append.restype = ctypes.c_void_p
+app = gio.g_desktop_app_info_new_from_filename(sys.argv[1].encode())
+if not app: raise RuntimeError("GIO rejected desktop entry or TryExec")
+uri = ctypes.create_string_buffer(sys.argv[2].encode())
+uris = glib.g_list_append(None, ctypes.cast(uri, ctypes.c_void_p))
+error = ctypes.c_void_p()
+if not gio.g_app_info_launch_uris(app, uris, None, ctypes.byref(error)):
+    raise RuntimeError("GIO desktop launch failed")
+'''
+            subprocess.run([sys.executable, '-c', code, str(desktop), uri], check=True,
+                           env={**os.environ, 'PATH': '/usr/bin:/bin', 'LINSCP_TEST_CAPTURE': str(capture)}, timeout=15)
+            deadline = time.monotonic() + 10
+            while not capture.exists() and time.monotonic() < deadline:
+                time.sleep(0.05)
+            self.assertTrue(capture.exists(), 'desktop entry did not launch the installed executable')
+            self.assertEqual(capture.read_text(), uri)
 
     def test_the_shared_page_reaches_the_native_bridge_only(self):
         # The page used to fall back to `fetch()` with a bearer token when no

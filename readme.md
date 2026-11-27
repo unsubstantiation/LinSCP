@@ -142,10 +142,11 @@ Rust and frontend tests. CMake and `source/linux/Makefile` are convenience
 wrappers around the same build and install the one application.
 The Makefile installs under `/usr` by default; for a staged custom prefix use
 `make -C source/linux install PREFIX=/opt/linscp DESTDIR=/tmp/package-root`.
-CMake uses its standard `CMAKE_INSTALL_PREFIX`. Desktop launchers resolve
-`linscp-gui` through the session's `PATH`, so add a custom prefix's `bin` there
-before relying on the desktop entry. `DESTDIR` is only a staging root, not a
-runtime prefix.
+CMake uses its standard `CMAKE_INSTALL_PREFIX` (or `cmake --install --prefix`).
+The Make and CMake desktop entries point to the installed binary under that
+prefix rather than depending on the desktop session's `PATH`. `DESTDIR` is only
+a staging root, not a runtime prefix. Desktop discovery may still require the
+prefix's `share` directory in `XDG_DATA_DIRS`.
 
 The version shown in the app is the date of the build, not a release
 counter; see [docs/versioning.md](docs/versioning.md).

@@ -15,7 +15,7 @@ check:
 install: all
 	install -d "$(DESTDIR)$(PREFIX)/bin" "$(DESTDIR)$(PREFIX)/share/applications" "$(DESTDIR)$(PREFIX)/share/pixmaps" "$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps"
 	install -m 0755 "$(TOP)/target/release/linscp-gui" "$(DESTDIR)$(PREFIX)/bin/linscp-gui"
-	install -m 0644 "$(TOP)/debian/linscp.desktop" "$(DESTDIR)$(PREFIX)/share/applications/linscp.desktop"
+	$(PYTHON) "$(TOP)/tools/install_desktop_entry.py" --prefix "$(PREFIX)" --destdir "$(DESTDIR)" --template "$(TOP)/debian/linscp.desktop"
 	install -m 0644 "$(TOP)/debian/linscp.png" "$(DESTDIR)$(PREFIX)/share/pixmaps/linscp.png"
 	install -m 0644 "$(TOP)/debian/linscp.svg" "$(DESTDIR)$(PREFIX)/share/icons/hicolor/scalable/apps/linscp.svg"
 clean:
