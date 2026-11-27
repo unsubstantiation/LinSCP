@@ -2721,7 +2721,7 @@ function options(id) {
   await window.openPreferences();
   check('the preferences dialog opens with the stored values',
     doc.getElementById('preferencesModal').classList.contains('open') &&
-      value('prefTransfer') === 'binary' && value('prefFilemask') === '*.txt',
+      value('prefTransfer') === '' && value('prefFilemask') === '*.txt',
     value('prefTransfer') + ' / ' + value('prefFilemask'));
   doc.getElementById('prefConfirmOverwrite').checked = false;
   doc.getElementById('prefSpeed').value = '128';
@@ -7135,6 +7135,15 @@ function options(id) {
       check('an explicitly toggled default-valued override is persisted',
         window.transferOptions().preserve_time === true &&
         JSON.parse(calls.filter(c => c.path === '/api/preferences').pop().options.body).preferences.preset_overrides.includes('preserve_time'));
+      window.eval('transferSettings = ' + JSON.stringify(explicit));
+      window.openTransferSettings();
+      const mode = doc.getElementById('transferMode');
+      mode.value = '';
+      mode.dispatchEvent(new window.Event('change', {bubbles: true}));
+      await window.saveTransferSettings();
+      check('choosing default mode clears the explicit transfer override', !('transfer' in window.transferOptions()));
+      check('preferences support automatic-by-mask transfer mode',
+        Array.from(doc.getElementById('prefTransfer').options).some(option => option.value === 'automatic'));
     }
 
     // Completed features: string matched preset & rule persistence, CLI lcd local sync & canonical completion,

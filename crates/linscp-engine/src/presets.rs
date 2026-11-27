@@ -78,6 +78,9 @@ impl TransferPreset {
         if let Some(no) = self.newer_only {
             parts.push(format!("neweronly={}", if no { "on" } else { "off" }));
         }
+        if let Some(eol) = self.eol {
+            parts.push(format!("eol={}", eol.name()));
+        }
         if let Some(sp) = self.speed_kbytes_per_sec {
             parts.push(format!("speed={sp}"));
         }
@@ -576,6 +579,8 @@ mod tests {
         };
         p.parse_setting("transfer", "ascii").unwrap();
         p.parse_setting("preservetime", "all").unwrap();
+        p.parse_setting("eol", "crlf").unwrap();
+        assert!(p.describe().contains("eol=crlf"));
         p.parse_setting("resumesupport", "64").unwrap();
         p.parse_setting("host", ".example.com").unwrap();
         p.parse_setting("mask", "*.log").unwrap();

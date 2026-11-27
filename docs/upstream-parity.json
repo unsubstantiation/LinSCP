@@ -2589,7 +2589,7 @@
       "id": "transfer.presets",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out, persists the selection, and keeps a missing saved preset visibly selected instead of silently switching it to automatic. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings can override preset fields.",
+      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out, persists the selection, and keeps a missing saved preset visibly selected instead of silently switching it to automatic. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings override preset fields; untouched GUI defaults inherit them. Automatic matching evaluates each selected top-level item, combines filename and session rules, and prioritizes filename rules over session-only rules. Saved override markers retain explicit default-valued settings; old preferences infer non-default overrides. See docs/transfer-presets.md for precedence and migration.",
       "source": [
         "crates/linscp-engine/src/presets.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2611,6 +2611,7 @@
         "service": [
           "transfer_presets_fail_closed_on_corrupt_store_and_missing_site_preset",
           "selected_transfer_preset_filters_queued_files",
+          "automatic_transfer_presets_match_each_file_and_session",
           "preferences_keep_the_permission_mode_and_the_directory_timestamps"
         ],
         "gui": [
@@ -2618,6 +2619,10 @@
           "manual preset opt-out survives reloading presets",
           "manual preset opt-out persists through preferences",
           "automatic preset selection leaves matching enabled",
+          "automatic preset inherits untouched GUI defaults",
+          "explicit default-valued overrides are sent and survive preferences",
+          "an explicitly toggled default-valued override is persisted",
+          "choosing default mode clears the explicit transfer override",
           "unavailable saved preset is not silently changed to automatic"
         ],
         "android-emulator": [
@@ -2643,7 +2648,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator verifies a named mask against the WebDAV fixture, but per-site selection and every transfer setting are not exercised on Android or third-party servers. The historical live-dav suite needs the retired CLI. GUI manual transfer settings can override preset settings, and physical devices remain unverified.",
+      "gap": "The emulator previously verified a named mask against the WebDAV fixture; the added mixed automatic-matching case still needs an emulator run. Per-site selection and every transfer setting are not exercised on physical Android devices or third-party servers. The historical live-dav suite needs the retired CLI. GUI manual transfer settings can override preset settings, and physical devices remain unverified.",
       "acceptance": [
         "Exercise per-site presets and transfer-mode and permission settings on Android and against relevant live servers.",
         "Clarify and test precedence between manual settings and automatic preset values."

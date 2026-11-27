@@ -763,6 +763,7 @@
                   <option value="">Automatic (decide per file)</option>
                   <option value="binary">Binary</option>
                   <option value="ascii">ASCII (convert line ends)</option>
+                  <option value="automatic">Automatic by mask</option>
                 </select>
               </div>
               <div class="field-stack"><label for="prefSpeed">Speed limit (KiB/s):</label>
@@ -10620,6 +10621,7 @@
 
   let transferSettings = Object.assign({}, TRANSFER_DEFAULTS);
   let pendingPresetOverrides = new Set();
+  let pendingPresetInherits = new Set();
   const PRESET_OVERRIDE_FIELDS = {
     transferMode: 'transfer', prefTransfer: 'transfer',
     transferSpeed: 'speed', prefSpeed: 'speed',
@@ -10629,7 +10631,14 @@
   };
   document.addEventListener('change', event => {
     const field = PRESET_OVERRIDE_FIELDS[event.target && event.target.id];
-    if (field) pendingPresetOverrides.add(field);
+    if (!field) return;
+    if (field === 'transfer' && !event.target.value) {
+      pendingPresetOverrides.delete(field);
+      pendingPresetInherits.add(field);
+    } else {
+      pendingPresetInherits.delete(field);
+      pendingPresetOverrides.add(field);
+    }
   });
   function presetOverrides(prefs) {
     if (Array.isArray(prefs.preset_overrides)) return prefs.preset_overrides.slice();
@@ -10644,7 +10653,8 @@
     return result;
   }
   function mergedPresetOverrides(existing) {
-    return Array.from(new Set([...(existing || []), ...pendingPresetOverrides]));
+    return Array.from(new Set([...(existing || []), ...pendingPresetOverrides]))
+      .filter(field => !pendingPresetInherits.has(field));
   }
   // The stored preferences, as the backend holds them. Every transfer and
   // confirmation reads its defaults from here, so a second browser on the
@@ -10675,7 +10685,7 @@
     return Object.assign({}, preferences || {}, {
       preset: settings.preset || '',
       preset_overrides: settings.presetOverrides || [],
-      transfer: settings.transfer || '',
+      transfer: settings.transfer || 'binary',
       filemask: settings.filemask || '',
       speed: settings.speed || 0,
       resumesupport: settings.resumesupport || '',
@@ -10997,6 +11007,7 @@
 
   function openTransferSettings() {
     pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     clearTransferPresetRuleFields();
     if (transferSettings.permissions && $('transferPresetPermissions')) {
       const p = String(transferSettings.permissions).trim();
@@ -11018,7 +11029,8 @@
     });
     selectStoredTransferPreset($('transferPresetSelect'), transferSettings.preset);
     if ($('transferPresetName')) $('transferPresetName').value = transferSettings.preset === 'off' ? '' : (transferSettings.preset || '');
-    $('transferMode').value = transferSettings.transfer || '';
+    $('transferMode').value = (transferSettings.presetOverrides || []).includes('transfer')
+      ? (transferSettings.transfer || 'binary') : '';
     $('transferMask').value = transferSettings.filemask || '';
     $('transferSpeed').value = transferSettings.speed || 0;
     // The threshold is stored as a number of KiB, but the select has no
@@ -11099,6 +11111,7 @@
 
   async function resetTransferSettings() {
     pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     transferSettings = Object.assign({}, TRANSFER_DEFAULTS, {presetOverrides: []});
     if (!await persistTransferSettings()) return;
     openTransferSettings();
@@ -11140,7 +11153,7 @@
   }
 
   function fillPreferencesForm(prefs) {
-    $('prefTransfer').value = prefs.transfer || '';
+    $('prefTransfer').value = presetOverrides(prefs).includes('transfer') ? (prefs.transfer || 'binary') : '';
     $('prefFilemask').value = prefs.filemask || '';
     $('prefSpeed').value = prefs.speed || 0;
     if ($('prefResumeSupport') && $('prefResumeSize')) {
@@ -11173,7 +11186,7 @@
     }
     return Object.assign({}, preferences || {}, {
       preset_overrides: mergedPresetOverrides(presetOverrides(preferences || {})),
-      transfer: $('prefTransfer').value,
+      transfer: $('prefTransfer').value || 'binary',
       filemask: $('prefFilemask').value.trim(),
       speed: parseInt($('prefSpeed').value, 10) || 0,
       resumesupport: resumesupport,
@@ -11355,6 +11368,7 @@
 
   async function openPreferences() {
     pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     if (!preferences) await loadTransferSettings();
     fillPreferencesForm(preferences || {});
     $('preferencesStatus').textContent = '';
@@ -11379,6 +11393,7 @@
 
   async function resetPreferences() {
     pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     const result = await apiPost('/api/preferences', { action: 'reset' });
     if (!result.success) {
       $('preferencesStatus').textContent = errorMessage(result.error,

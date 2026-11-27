@@ -12,7 +12,7 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 | [`transfer.ascii-automatic`](remaining-parity-plan.md#transferascii-automatic) | Evidence | Test Android and relevant live servers; conversion and guarded uploads exist. |
 | [`transfer.filepart-resume`](remaining-parity-plan.md#transferfilepart-resume) | Development + evidence | Assess guarded-upload resume and provider limitations; retain default FTP/SFTP refusal without atomic source and explicit best-effort consent. |
 | [`transfer.resume-modes`](remaining-parity-plan.md#transferresume-modes) | Evidence | Validate GUI resume safety on physical devices and third-party servers. |
-| [`transfer.presets`](remaining-parity-plan.md#transferpresets) | Development + evidence | Clarify and test manual, site and rule precedence; extend Android/live server cases. |
+| [`transfer.presets`](remaining-parity-plan.md#transferpresets) | Evidence | Host tests cover manual, site and per-item rule precedence; see [preset precedence](transfer-presets.md). The new Android smoke case, physical devices and live servers still require runs. |
 | [`transfer.curl-progress`](remaining-parity-plan.md#transfercurl-progress) | Scope + evidence | GUI progress exists; terminal progress is historical CLI parity, not a shipped CLI requirement. |
 | [`sync.one-way`](remaining-parity-plan.md#syncone-way) | Evidence | Exercise supported synchronization workflows using runnable GUI/service fixtures. |
 | [`sync.keepuptodate-inotify`](remaining-parity-plan.md#synckeepuptodate-inotify) | Evidence | Exercise watcher and polling behavior on supported platforms and protocols. |

@@ -24,3 +24,7 @@ jobs:
         run: cargo test -p linscp-service --lib preferences_keep_the_permission_mode
       - name: Types and preference checks
         run: cargo test -p linscp-types --lib
+      - name: Engine script and transfer regression checks
+        run: cargo test -p linscp-engine --test script_engine_cases --test ordinary_conditional_resume
+      - name: Service library regression checks
+        run: cargo test -p linscp-service --lib -- --test-threads=1 --skip live_

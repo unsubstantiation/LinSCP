@@ -892,6 +892,30 @@ const expression = `
     try { await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['excluded.preset-bin'], preset: 'android-text-only'}); }
     catch (error) { refused = error.status === 400; }
     if (!refused) throw new Error('Deleted explicit preset silently fell back to defaults');
+
+    // Each member of a mixed selection must choose its own matching preset.
+    // A matching filename alone must not bypass an incompatible host rule.
+    await invoke('POST', '/api/presets/save', {name: 'android-wrong-host', host: 'wrong.invalid', mask: '*.auto-txt', transfer: 'ascii'});
+    await invoke('POST', '/api/presets/save', {name: 'android-auto-text', host: '127.0.0.1', mask: '*.auto-txt', transfer: 'binary'});
+    await invoke('POST', '/api/presets/save', {name: 'android-auto-binary', host: '127.0.0.1', mask: '*.auto-bin', transfer: 'binary'});
+    await invoke('POST', '/api/local/save', {path: root + '/one.auto-txt', content: 'text auto'});
+    await invoke('POST', '/api/local/save', {path: root + '/two.auto-bin', content: 'binary auto'});
+    const matched = await invoke('GET', '/api/presets?tab=' + tab + '&filename=' + encodeURIComponent('one.auto-txt'));
+    if (matched.matched !== 'android-auto-text') throw new Error('Automatic preset ignored session rule: ' + JSON.stringify(matched));
+    const oldTasks = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['one.auto-txt', 'two.auto-bin']});
+    let mixedDone = false;
+    for (let i = 0; i < 120; i++) {
+      const tasks = (await invoke('GET', '/api/transfers')).transfers.filter(item => !oldTasks.has(item.id));
+      if (tasks.some(item => item.status === 'Failed' || item.status === 'Cancelled')) throw new Error('Automatic preset transfer failed: ' + JSON.stringify(tasks));
+      if (tasks.length === 2 && tasks.every(item => item.status === 'Completed')) { mixedDone = true; break; }
+      await sleep(250);
+    }
+    if (!mixedDone) throw new Error('Mixed automatic presets did not queue and finish both files');
+    for (const [name, content] of [['one.auto-txt', 'text auto'], ['two.auto-bin', 'binary auto']]) {
+      if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/' + name))).content !== content) throw new Error('Automatic preset transfer differs: ' + name);
+    }
+    for (const name of ['android-wrong-host', 'android-auto-text', 'android-auto-binary']) await invoke('POST', '/api/presets/delete', {name});
   }
   await verifyAndroidTransferPreset();
   const vault = await invoke('GET', '/api/vault/status');
