@@ -3037,7 +3037,7 @@
       "id": "sessions.vault-password-only",
       "area": "Sessions/configuration",
       "status": "verified",
-      "notes": "The password-based vault refuses the retired hardware-key prefixes and round-trips setup, unlock and lock. Android additionally offers opt-in biometric unlock: a per-use authenticated Keystore key wraps the vault password, and the existing password unlock remains recovery. A disposable Android emulator exercises real fingerprint enrollment, wrong-fingerprint refusal, restart, successful unlock and saved-site reconnection, disabling biometrics and password fallback; direct WebView access to the password-bearing plugin is refused. Physical devices and biometric enrollment-change invalidation have not been tested.",
+      "notes": "The password-based vault refuses the retired hardware-key prefixes and round-trips setup, unlock and lock. Android additionally offers opt-in biometric unlock: a per-use authenticated Keystore key wraps the vault password, and the existing password unlock remains recovery. A disposable Android emulator exercises real fingerprint enrollment, wrong-fingerprint refusal, restart, successful unlock and saved-site reconnection, disabling biometrics and password fallback; direct WebView access to the password-bearing plugin is refused. The emulator also adds a second device fingerprint and verifies that the prior biometric credential is rejected and password recovery reconnects the saved site. Physical devices and vendor-specific Keystore behavior have not been tested.",
       "source": [
         "crates/linscp-platform/src/password_vault.rs"
       ],
