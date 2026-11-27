@@ -317,12 +317,22 @@ const expression = `
     await invoke('POST', '/api/local/mkdir', {tab: upTab, name: 'nested'});
     const child = (await invoke('POST', '/api/tabs/local', {local_dir: up + '/document/nested', remote_dir: root})).tab.id;
     await invoke('POST', '/api/local/save', {tab: child, path: 'up.txt', content: 'provider tree upload'});
-    await runTask('/api/transfer/upload', {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-up']});
+    const upload = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-up']};
+    let refused = false;
+    try { await invoke('POST', '/api/transfer/upload', upload); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_copy_risk; }
+    if (!refused) throw new Error('WebDAV tree upload did not require risk confirmation');
+    await runTask('/api/transfer/upload', {...upload, accept_directory_copy_risk: true});
     if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-tree-up/nested/up.txt'))).content !== 'provider tree upload') throw new Error('SAF tree upload differs');
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-tree-down'});
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/transfer-tree-down', name: 'nested'});
     await invoke('POST', '/api/remote/save', {tab, path: '/transfer-tree-down/nested/down.txt', content: 'provider tree download'});
-    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down']});
+    const download = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down']};
+    refused = false;
+    try { await invoke('POST', '/api/transfer/download', download); }
+    catch (error) { refused = error.status === 409 && error.payload?.directory_copy_risk; }
+    if (!refused) throw new Error('WebDAV tree download did not require risk confirmation');
+    await runTask('/api/transfer/download', {...download, accept_directory_copy_risk: true});
     const down = (await invoke('POST', '/api/tabs/local', {local_dir: tree + '/document/transfer-tree-down/document/nested', remote_dir: root})).tab.id;
     if ((await invoke('GET', '/api/local/edit?tab=' + down + '&path=down.txt')).content !== 'provider tree download') throw new Error('SAF tree download differs');
   }
