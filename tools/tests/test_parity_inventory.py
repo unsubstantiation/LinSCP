@@ -18,6 +18,38 @@ from check_upstream_parity import (check_capabilities, check_verification,
 
 
 class InventoryTests(unittest.TestCase):
+    def test_development_triage_covers_each_gap_once_without_promoting_it(self):
+        inventory = json.loads((ROOT / 'docs/upstream-parity.json').read_text(encoding='utf-8'))
+        gap_ids = {row['id'] for row in inventory['capabilities'] if row['status'] != 'verified'}
+        triage = (ROOT / 'docs/feature-development-triage.md').read_text(encoding='utf-8')
+        import re
+        documented = re.findall(r'^\| \[`([^`]+)`\]', triage, re.MULTILINE)
+        self.assertEqual(set(documented), gap_ids)
+        self.assertEqual(len(documented), len(gap_ids))
+        self.assertEqual(sum(row['status'] == 'missing' for row in inventory['capabilities']), 4)
+        for row in inventory['capabilities']:
+            if row['status'] == 'missing':
+                self.assertIn(f'`{row["id"]}`', triage)
+                self.assertIn('Out of scope', next(line for line in triage.splitlines() if f'`{row["id"]}`' in line))
+
+    def test_audited_plan_distinguishes_existing_code_and_missing_evidence(self):
+        inventory = json.loads((ROOT / 'docs/upstream-parity.json').read_text(encoding='utf-8'))
+        rows = {row['id']: row for row in inventory['capabilities']}
+        gss = rows['security.gssapi-and-tunnels']
+        self.assertEqual(gss['status'], 'partial')
+        self.assertIn('SSPI', gss['notes'])
+        self.assertIn('retired', gss['notes'])
+        self.assertIn('existing Windows SSPI provider', ' '.join(gss['acceptance']))
+        self.assertNotIn('GSSAPI-enabled libssh', ' '.join(gss['acceptance']))
+        desktop = rows['desktop.remote']
+        self.assertEqual(desktop['status'], 'partial')
+        self.assertIn('existing experimental X2Go', ' '.join(desktop['acceptance']))
+        self.assertIn('no implementation was found', desktop['gap'])
+        drop = rows['gui.native-path-drop']
+        self.assertIn('tools/prepare_android_project.py', drop['source'])
+        self.assertIn('existing generated Android', ' '.join(drop['acceptance']))
+        self.assertTrue((ROOT / 'tools/prepare_android_project.py').read_text(encoding='utf-8').find('android.intent.action.SEND_MULTIPLE') >= 0)
+
     def test_literal_and_constant_registrations(self):
         script = 'FCommands->Register(L"get", x); FCommands->Register(EXIT_COMMAND, x);'
         header = '#define EXIT_COMMAND L"exit"'

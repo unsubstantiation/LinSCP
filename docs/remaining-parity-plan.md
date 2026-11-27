@@ -1,10 +1,10 @@
 # Remaining parity implementation plan
 
-> **Historical:** This plan predates the native GUI-only conversion; removed CLI interfaces are not planned for restoration.
+> **Scope:** Historical upstream and CLI references are retained for comparison; removed CLI interfaces are not planned for restoration.
 
-Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. Full upstream parity is the target, **not a completed claim**.
+Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. It is a comparison with upstream, **not a completed parity claim**; the current product is GUI-only.
 
-45 tracked capability gaps. Each requires implementation and acceptance evidence; recording a plan does not satisfy its tests.
+45 tracked capability gaps. Some require development, others require evidence or a scope decision; recording a plan does not satisfy its tests. See [feature development triage](feature-development-triage.md).
 
 Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
@@ -194,15 +194,15 @@ The native GUI calls the service in-process through Tauri IPC rather than a sepa
 
 **Area:** Security/authentication · **Status:** partial
 
-Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.
+SSH jump-host support is tracked separately under security.ssh-jump-hosts. The current Rust SSH transport uses russh's gssapi-with-mic bridge and a system Kerberos context provider: Linux dynamically loads libgssapi_krb5 and Windows loads SSPI from System32. Android has no system provider here. GSSAPI authentication can be attempted when a provider is available; delegation is opt-in. GSSAPI key exchange is not implemented and explicit requests fail closed. The historical isolated MIT KDC and cross-realm cases in LiveSftpTest.py require the retired linscp CLI and are not runnable against the shipped GUI-only distribution. Windows SSPI loader/context construction has a platform unit test, but that does not establish successful Kerberos authentication. GUI and service-tabs tests cover settings and capability/refusal policy, not a live KDC exchange.
 
-**Next:** The live half is still unevidenced: live-tunnel and live-sftp need a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which keeps the jump-host and Kerberos settings a site stores and refuses a jump host that is not named.
+**Next:** Live authentication, principal selection, mutual authentication, missing/expired credentials, and delegation behavior need runnable evidence against the current russh transport on Linux and Windows. Android has no provider, GSSAPI key exchange is unsupported, and independent delegation security review and production KDC validation remain open.
 
 **Acceptance criteria:**
 
-- [ ] Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.
-- [ ] Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.
-- [ ] Provide a Windows SSPI (or sspi-crate) context provider behind the GssapiTokenProvider trait, with tests against an AD or Samba KDC, before claiming Kerberos on Windows.
+- [ ] Port isolated-realm and cross-realm GSSAPI tests to a supported service or Rust harness; exercise Linux principal selection, missing/expired credentials, mutual authentication and default-off versus opt-in delegation with no silent skips.
+- [ ] Exercise the existing Windows SSPI provider end to end against an AD or Samba KDC, including failures and delegation policy; address any implementation gaps before claiming Windows Kerberos interoperability.
+- [ ] Obtain an independent security review of delegated TGT handling and validate production KDC behavior; decide separately whether unsupported GSSAPI key exchange is in product scope.
 
 ## security.gui-account
 
@@ -220,14 +220,14 @@ The shipped native service is single-user and does not implement account login, 
 
 **Area:** GUI · **Status:** partial
 
-An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. Dropped files and folders are streamed in 64 KiB chunks into private per-drop staging with cumulative file-count (`MAX_DROP_STAGING_FILES`), byte-size (`MAX_DROP_STAGING_BYTES`), and directory-depth (`MAX_DROP_STAGING_DEPTH`) bounds, cleaning up partial staging trees on refusal. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.
+An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. Dropped files and folders are streamed in 64 KiB chunks into private per-drop staging with cumulative file-count (`MAX_DROP_STAGING_FILES`), byte-size (`MAX_DROP_STAGING_BYTES`), and directory-depth (`MAX_DROP_STAGING_DEPTH`) bounds, cleaning up partial staging trees on refusal. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the Android SEND/SEND_MULTIPLE filters are inserted into the generated manifest by tools/prepare_android_project.py.
 
 **Next:** The path a native window drops is streamed into bounded private staging and queued, but no automated test drives a real WebKit drop event or the Android share filter.
 
 **Acceptance criteria:**
 
 - [ ] Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).
-- [ ] Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.
+- [ ] Exercise the existing generated Android SEND/SEND_MULTIPLE filters end to end with a shared file, including the conflict question and queue entry.
 - [ ] Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop.
 
 ## editing.encoding-policy
@@ -487,7 +487,7 @@ Local copies and moves with a granted end run on LocalFs in the queue worker: by
 
 **Acceptance criteria:**
 
-- [ ] Copy and move files between a granted folder and app storage and between two granted trees on an Android device or emulator, covering the document-cap refusal and a move onto an existing name.
+- [ ] Exercise copy and move between two separately granted trees, including name conflicts, document-cap refusals and concurrent-creator races; repeat representative cases with other providers and physical devices.
 
 ## platform.android-saf-session-transfers
 
@@ -499,7 +499,7 @@ Session transfers with a granted local side stage through private temporary file
 
 **Acceptance criteria:**
 
-- [ ] Validate tree transfers and document-cap refusal between a granted folder and a server on an Android device or emulator, including other providers and physical devices.
+- [ ] Extend the existing emulator transfer and cap-refusal coverage to other document providers, large-document memory pressure, concurrent writers and physical devices; keep granted-folder resume refused until safely supported.
 
 ## editing.non-utf8-encodings
 
@@ -573,14 +573,14 @@ Encrypted portable full application backup (`LSCPBAK1`, independent password, Ar
 
 RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}). Android viewer launch is restricted in both the frontend and native bridge to allowed schemes and no userinfo; RDP/VNC/SPICE viewer URIs additionally refuse paths, queries and fragments. The debug APK emulator smoke invokes the native bridge directly to test unsafe URI refusals.
 
-**Next:** The Android emulator tests specific native URI refusals, not external viewer interoperability or every possible malformed URI. Live desktop server validation (xrdp, TigerVNC, SPICE, and live X2Go KDrive server) and gateway security review remain open.
+**Next:** The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help mentions an ironrdp WASM fallback; no implementation was found in the audited crates or shared frontend.
 
 **Acceptance criteria:**
 
-- [ ] Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).
-- [ ] Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).
-- [ ] Implement and test a built-in X2Go KDrive viewer on Linux, Windows and macOS, including graphics, input, SSH forwarding, and safe session lifecycle. Separately test X11/Waypipe launches and jump-host policy (live-desktop).
-- [ ] Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended.
+- [ ] Test RDP launches against a disposable server, including viewer resolution, TLS/NLA options, jump-host relay and credential handling.
+- [ ] Test VNC and SPICE viewer launches against disposable servers, including TLS options and generated viewer tickets where supported.
+- [ ] Validate and complete the existing experimental X2Go KDrive viewer against real servers on intended platforms, including rendering, input, SSH forwarding and lifecycle; test X11/Waypipe and jump-host policy separately.
+- [ ] Confirm whether the advertised ironrdp fallback is a product requirement; implement and review it if retained or correct the help text. Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit.
 
 ## platform.android-saf-synchronization
 
@@ -592,7 +592,7 @@ Synchronization with a granted local side plans and applies through LocalFs: the
 
 **Acceptance criteria:**
 
-- [ ] Validate nested-tree synchronization, document-cap refusal, timed repeated polling and cancellation with real providers and physical devices.
+- [ ] Extend the existing nested-sync, polling, cancellation and checksum cap tests to other providers, physical devices, other over-cap paths, timestamp fidelity and concurrent provider changes.
 
 ## Cross-cutting release gate
 

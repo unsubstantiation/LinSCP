@@ -591,11 +591,11 @@ def matrix_report(inventory):
 def plan_report(inventory):
     rows = [r for r in inventory['capabilities'] if r['status'] != 'verified']
     lines = ['# Remaining parity implementation plan', '',
-             '> **Historical:** This plan predates the native GUI-only conversion; removed CLI interfaces are not planned for restoration.', '',
+             '> **Scope:** Historical upstream and CLI references are retained for comparison; removed CLI interfaces are not planned for restoration.', '',
              'Generated from [upstream-parity.json](upstream-parity.json); do not edit separately. '
-             'Full upstream parity is the target, **not a completed claim**.', '',
-             f'{len(rows)} tracked capability gaps. Each requires implementation and acceptance evidence; '
-             'recording a plan does not satisfy its tests.', '',
+             'It is a comparison with upstream, **not a completed parity claim**; the current product is GUI-only.', '',
+             f'{len(rows)} tracked capability gaps. Some require development, others require evidence or a scope decision; '
+             'recording a plan does not satisfy its tests. See [feature development triage](feature-development-triage.md).', '',
              'Regenerate with `python3 tools/check_upstream_parity.py --write-report`.', '']
     for row in rows:
         lines += ['## ' + row['id'], '', '**Area:** ' + row['area'] + ' · **Status:** ' + row['status'], '',

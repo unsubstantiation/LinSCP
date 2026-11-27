@@ -3328,8 +3328,8 @@ function options(id) {
   if (agentStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Kerberos limits --------------------------------------------------
-  // The Kerberos section names its Linux-only limit, and key exchange — the
-  // one setting no build honors — is noted where the Linux-only note is not.
+  // The Kerberos section explains its runtime requirement, and key exchange —
+  // which no build honors — is noted where a runtime is available.
   let gssapiStubInstalled = false;
   if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
     window.LinSCPCore = window.LinSCPCore || {};
@@ -3337,8 +3337,8 @@ function options(id) {
     gssapiStubInstalled = true;
   }
   const kerberosReason = window.gssapiGap({ gssapi: false });
-  check('the Kerberos gap names Linux-only builds',
-    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux')) &&
+  check('the Kerberos gap names Linux and Windows runtime options',
+    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux') && kerberosReason.includes('Windows')) &&
       window.gssapiGap({ gssapi: true }) === null,
     String(kerberosReason));
   const kexReason = window.gssapiKexGap({ gssapi: true });
@@ -3349,9 +3349,8 @@ function options(id) {
   window.updateGssapiHint();
   const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
   // Which note this host shows depends on the host: where Kerberos is
-  // unavailable the note is the Linux-only limit, and where it is available
-  // the note is the unwired key exchange. Asserting one sentence made this
-  // pass on Linux and fail on Windows, where the other is correct.
+  // unavailable the note names supported runtimes, and where it is available
+  // the note is the unwired key exchange.
   const gssapiHostMissing = !gssapiStubInstalled &&
     window.LinSCPCore.hostCapabilities({ host: window }).gssapi === false;
   check('the Kerberos hint shows the gap reason',
