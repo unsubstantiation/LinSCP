@@ -96,6 +96,12 @@ exercise_biometrics() {
     adb logcat -d -s LinSCPBiometric:W || true
     exit 1
   fi
+  # Re-enroll the application credential, then add another device fingerprint.
+  restart_and_run bio-enroll-start
+  python3 tools/android_confirm_emulator_biometric.py 1
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
+  python3 tools/android_enroll_emulator_fingerprint.py --additional
+  restart_and_run bio-invalidated
 }
 # A focused disposable-emulator run avoids unrelated provider/UI fixtures.
 if [[ ${LINSCP_BIOMETRIC_ONLY:-0} == 1 ]]; then

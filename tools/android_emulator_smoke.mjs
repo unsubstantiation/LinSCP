@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -67,6 +67,18 @@ const expression = `
       ]);
       if (direct !== 'refused') throw new Error('WebView could invoke password-bearing biometric plugin: ' + direct);
       return {root, biometricEnrolled: true, directPluginRefused: true};
+    }
+    if (phase === 'bio-invalidated') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Invalidation test expected locked vault');
+      let refused = false;
+      try { await native.invoke('linscp_biometric_unlock'); } catch (_) { refused = true; }
+      if (!refused || (await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Enrollment change did not invalidate biometric unlock');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
+      if (!opened.tab?.connected) throw new Error('Password recovery after biometric invalidation failed');
+      await invoke('POST', '/api/tabs/close', {tab: opened.tab.id});
+      await native.invoke('linscp_biometric_disable');
+      return {root, enrollmentChangeInvalidated: true, passwordRecovery: true};
     }
     if (phase === 'bio-unlock-start') {
       if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric unlock expected a locked vault');

@@ -3,16 +3,21 @@
 
 This changes the device lock screen; use only on an ephemeral CI emulator.
 """
+import argparse
 import subprocess
 import time
 import xml.etree.ElementTree as ET
 from android_select_saf_folder import adb, click, dump
 
 
-def main():
+def main(argv=None):
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--additional', action='store_true', help='Enroll a second fingerprint on the already configured emulator')
+    args = parser.parse_args(argv)
     adb('shell', 'settings', 'put', 'system', 'screen_off_timeout', '1800000')
     adb('shell', 'svc', 'power', 'stayon', 'true')
-    adb('shell', 'locksettings', 'set-pin', '1234')
+    if not args.additional:
+        adb('shell', 'locksettings', 'set-pin', '1234')
     time.sleep(3)
     adb('shell', 'input', 'keyevent', '224')
     adb('shell', 'input', 'swipe', '160', '550', '160', '100', '300')
@@ -42,12 +47,12 @@ def main():
             click(done)
             print('Enrolled emulator fingerprint')
             return
-        button = find('MORE', 'I AGREE', 'AGREE', 'CONTINUE', 'NEXT', 'GOT IT')
+        button = find('MORE', 'I AGREE', 'AGREE', 'CONTINUE', 'NEXT', 'GOT IT', 'ADD FINGERPRINT', 'ADD ANOTHER')
         if button is not None:
             click(button)
             continue
         if any('finger' in label.lower() or 'sensor' in label.lower() for label in labels):
-            adb('emu', 'finger', 'touch', '1')
+            adb('emu', 'finger', 'touch', '2' if args.additional else '1')
             continue
     raise RuntimeError('Could not enroll emulator fingerprint; recent screens: ' + repr(history[-12:]))
 

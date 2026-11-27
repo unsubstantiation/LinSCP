@@ -25,9 +25,19 @@ class BiometricTests(unittest.TestCase):
              patch.object(enroll.time, 'sleep'), \
              patch.object(enroll, 'adb', side_effect=lambda *args: calls.append(args)), \
              patch.object(enroll, 'click', side_effect=lambda node: clicks.append(node.get('text'))):
-            enroll.main()
+            enroll.main([])
         self.assertEqual(clicks, ['MORE', 'DONE'])
         self.assertIn(('emu', 'finger', 'touch', '1'), calls)
+
+    def test_additional_enrollment_keeps_existing_pin_and_uses_new_fingerprint(self):
+        calls = []
+        with patch.object(enroll, 'dump', side_effect=[screen('Enter PIN'), screen('Touch the sensor'), screen('DONE')]), \
+             patch.object(enroll.time, 'sleep'), \
+             patch.object(enroll, 'adb', side_effect=lambda *args: calls.append(args)), \
+             patch.object(enroll, 'click'):
+            enroll.main(['--additional'])
+        self.assertIn(('emu', 'finger', 'touch', '2'), calls)
+        self.assertNotIn(('shell', 'locksettings', 'set-pin', '1234'), calls)
 
     def test_android_biometrics_use_per_operation_keystore_crypto_and_no_backup(self):
         kotlin = (ROOT / 'crates/linscp-tauri/android/LinSCPAndroidPlugin.kt').read_text()
