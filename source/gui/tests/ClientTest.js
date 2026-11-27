@@ -2586,12 +2586,14 @@ function options(id) {
   const exportCalls = () => calls.filter(call => call.path === '/api/vault/export');
   const exportBaseline = exportCalls().length;
   doc.querySelector('#keyExportList input[type="checkbox"]').checked = false;
+  doc.getElementById('keyExportIncludeVaultKeys').checked = false;
   await window.exportKeySession();
   check('an empty selection exports nothing',
     exportCalls().length === exportBaseline &&
       text('keyExportStatus').includes('Select at least one session to export.'),
     text('keyExportStatus'));
   doc.querySelector('#keyExportList input[type="checkbox"]').checked = true;
+  doc.getElementById('keyExportIncludeVaultKeys').checked = true;
   doc.getElementById('keyExportPassword').value = 'backup-password';
   doc.getElementById('keyExportPasswordConfirm').value = 'different-password';
   const mismatchBaseline = exportCalls().length;
@@ -2605,7 +2607,7 @@ function options(id) {
   const exportCall = exportCalls().pop();
   const exportPayload = exportCall ? JSON.parse(exportCall.options.body) : {};
   check('a matching export posts the ticked sessions',
-    exportPayload.plain_text === false &&
+    exportPayload.plain_text === false && exportPayload.include_vault_keys === true &&
       exportPayload.password === 'backup-password' &&
       JSON.stringify(exportPayload.sessions) === JSON.stringify(['GUI/test']),
     JSON.stringify(exportPayload));
