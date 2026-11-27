@@ -307,6 +307,7 @@ const expression = `
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
   }
   async function verifyAndroidGrantedSafLocalCopyMove(tree, safTab, root, runTask) {
     const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: tree})).tab.id;
@@ -329,6 +330,51 @@ const expression = `
     await runTask('/api/transfer/upload', {tab: safTab, local_dir: tree, remote_dir: plain, names: ['editor-boundary']});
     const nested = (await invoke('POST', '/api/tabs/local', {local_dir: plain + '/editor-boundary', remote_dir: tree})).tab.id;
     if ((await invoke('GET', '/api/local/edit?tab=' + nested + '&path=inside.txt')).content !== 'inside') throw new Error('Nested SAF copy differs');
+  }
+  async function verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask) {
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'nested-sync'});
+    const localDir = tree + '/document/nested-sync';
+    const local = (await invoke('POST', '/api/tabs/local', {local_dir: localDir, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: local, name: 'from-provider'});
+    const localChild = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-provider', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: localChild, name: 'nested'});
+    const localGrandchild = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-provider/document/nested', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: localGrandchild, path: 'up.txt', content: 'nested provider upload'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'nested-sync'});
+    const remoteDir = '/nested-sync';
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: remoteDir, name: 'from-server'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: remoteDir + '/from-server', name: 'nested'});
+    await invoke('POST', '/api/remote/save', {tab, path: remoteDir + '/from-server/nested/down.txt', content: 'nested server download'});
+    const sync = {tab, local_dir: localDir, remote_dir: remoteDir};
+    await runTask('/api/sync/run', {...sync, mode: 'local'});
+    const downloadTab = (await invoke('POST', '/api/tabs/local', {local_dir: localDir + '/document/from-server/document/nested', remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + downloadTab + '&path=down.txt')).content !== 'nested server download') throw new Error('Nested provider sync download differs');
+    await runTask('/api/sync/run', {...sync, mode: 'remote'});
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/from-provider/nested/up.txt'))).content !== 'nested provider upload') throw new Error('Nested provider sync upload differs');
+    // A second pass must observe a file created after the first pass began;
+    // the external-storage provider has no native watcher and uses polling.
+    await invoke('POST', '/api/local/save', {tab: local, path: 'poll-first.txt', content: 'first poll'});
+    const result = await invoke('POST', '/api/transfer/keepuptodate', {...sync, count: 2, interval: 10});
+    if (!result.success || !result.task_id) throw new Error('Cannot start provider polling');
+    let firstSeen = false;
+    for (let i = 0; i < 120; i++) {
+      const list = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent(remoteDir));
+      if (list.entries?.some(entry => entry.name === 'poll-first.txt')) { firstSeen = true; break; }
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === result.task_id);
+      if (task?.status === 'Failed' || task?.status === 'Completed' || task?.status === 'Cancelled') throw new Error('Provider polling ended before first file: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!firstSeen) throw new Error('Initial provider polling pass timed out');
+    await invoke('POST', '/api/local/save', {tab: local, path: 'poll-later.txt', content: 'second poll'});
+    let completed = false;
+    for (let i = 0; i < 180; i++) {
+      const task = (await invoke('GET', '/api/transfers')).transfers.find(item => item.id === result.task_id);
+      if (task?.status === 'Completed') { completed = true; break; }
+      if (task?.status === 'Failed' || task?.status === 'Cancelled') throw new Error('Provider polling failed: ' + JSON.stringify(task));
+      await sleep(250);
+    }
+    if (!completed) throw new Error('Second provider polling pass timed out');
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/poll-later.txt'))).content !== 'second poll') throw new Error('Second provider polling pass missed new file');
   }
   async function verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask) {
     // Isolate the fixture so the delete test cannot touch the grant marker.
