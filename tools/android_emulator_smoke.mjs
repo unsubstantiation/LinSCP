@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -42,6 +42,12 @@ const expression = `
     const phase = ${JSON.stringify(phase)};
     const native = window.__TAURI_INTERNALS__;
     const root = (await invoke('GET', '/api/status')).local_dir;
+    if (phase === 'bio-setup') {
+      if ((await invoke('GET', '/api/vault/status')).vault !== 'setup_required') throw new Error('Biometric fixture expected a fresh vault');
+      await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});
+      await invoke('POST', '/api/sessions/save', {name: 'android-smoke-vault-site', session: {protocol: 'dav', host: '127.0.0.1', port: ${port}, username: 'testuser', password: 'testpass', local_dir: root, initial_dir: '/'}});
+      return {root, biometricFixture: true};
+    }
     if (phase === 'bio-enroll-start') {
       if ((await invoke('GET', '/api/vault/status')).vault !== 'locked') throw new Error('Biometric enrollment expected a locked vault');
       await invoke('POST', '/api/vault/unlock', {password: 'different destination vault password'});

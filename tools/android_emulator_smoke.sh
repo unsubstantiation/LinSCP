@@ -63,6 +63,40 @@ done
 if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
 adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
 app_root_file=$(mktemp)
+# Restart actually destroys the app process and its in-memory vault key.
+restart_and_run() {
+  local phase=$1
+  adb shell am force-stop "$application"
+  adb shell am start -n "$application/.MainActivity"
+  for _ in $(seq 1 90); do
+    pid=$(adb shell pidof "$application" | tr -d '\r' || true)
+    if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
+    sleep 1
+  done
+  if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
+  adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
+  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase" "${portable_file:-}"; then
+    adb logcat -d --pid="$pid" -t 200 || true
+    exit 1
+  fi
+}
+exercise_biometrics() {
+  python3 tools/android_enroll_emulator_fingerprint.py
+  restart_and_run bio-enroll-start
+  python3 tools/android_confirm_emulator_biometric.py 1
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
+  restart_and_run bio-unlock-start
+  python3 tools/android_confirm_emulator_biometric.py 2
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-wrong-check
+  python3 tools/android_confirm_emulator_biometric.py 1
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish
+}
+# A focused disposable-emulator run avoids unrelated provider/UI fixtures.
+if [[ ${LINSCP_BIOMETRIC_ONLY:-0} == 1 ]]; then
+  node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-setup
+  exercise_biometrics
+  exit 0
+fi
 if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file"; then
   adb logcat -d --pid="$pid" -t 200 || true
   exit 1
@@ -116,22 +150,7 @@ for secret in (b'android-smoke-vault-site', b'testuser', b'testpass', b'127.0.0.
     assert secret not in sessions, 'saved site metadata appeared in plaintext'
 PYCODE
 # Force-stop actually destroys the app process and its in-memory vault key.
-restart_and_run() {
-  local phase=$1
-  adb shell am force-stop "$application"
-  adb shell am start -n "$application/.MainActivity"
-  for _ in $(seq 1 90); do
-    pid=$(adb shell pidof "$application" | tr -d '\r' || true)
-    if [[ -n "$pid" ]] && adb shell cat /proc/net/unix | grep -q "webview_devtools_remote_${pid}"; then break; fi
-    sleep 1
-  done
-  if [[ -z "${pid:-}" ]]; then adb logcat -d -t 500; exit 1; fi
-  adb forward tcp:9222 "localabstract:webview_devtools_remote_${pid}"
-  if ! node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" "$phase" "${portable_file:-}"; then
-    adb logcat -d --pid="$pid" -t 200 || true
-    exit 1
-  fi
-}
+
 restart_and_run reopen-vault
 
 # Snapshot after reconnect, which may update the site's last-used metadata.
@@ -247,13 +266,5 @@ fi
 restart_and_run saf-reopen
 # Enroll only on this disposable emulator, then exercise the real system
 # BiometricPrompt and Keystore CryptoObject across a process restart.
-python3 tools/android_enroll_emulator_fingerprint.py
-restart_and_run bio-enroll-start
-python3 tools/android_confirm_emulator_biometric.py 1
-node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-enroll-finish
-restart_and_run bio-unlock-start
-python3 tools/android_confirm_emulator_biometric.py 2
-node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-wrong-check
-python3 tools/android_confirm_emulator_biometric.py 1
-node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" bio-unlock-finish
+exercise_biometrics
 echo "Installed application ID and its install directory verified: $application ($sandbox)"

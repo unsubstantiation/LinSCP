@@ -128,7 +128,7 @@ jobs:
           target: google_apis
           disable-animations: true
           script: |
-            python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+            LINSCP_BIOMETRIC_ONLY=1 python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
 
   build:
     name: Signed Android release APK
@@ -272,5 +272,5 @@ jobs:
           target: google_apis
           disable-animations: true
           script: |
-            python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
+            LINSCP_BIOMETRIC_ONLY=1 python3 tools/run_cargo_ci.py bash tools/android_emulator_smoke.sh
             python3 tools/run_cargo_ci.py bash tools/android_release_launch_check.sh
