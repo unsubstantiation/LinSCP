@@ -8,7 +8,7 @@ import unittest
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[1]))
 from compile_translations import (generate, ROOT, OUTPUT, load_catalogs,
-                                  gui_page, GUI_PAGE, GUI_DIRECTORY,
+                                  gui_page, GUI_PAGE, GUI_DIRECTORY, GUI_SCRIPTS,
                                   check_gui_coverage, check_cli_coverage)
 
 
@@ -22,7 +22,10 @@ class TranslationTests(unittest.TestCase):
         catalogs = load_catalogs(GUI_DIRECTORY)
         page = GUI_PAGE.read_text(encoding='utf-8')
         self.assertEqual(page, gui_page(catalogs, page))
-        check_gui_coverage(catalogs, page)
+        scripts = [path.read_text(encoding='utf-8') for path in GUI_SCRIPTS]
+        check_gui_coverage(catalogs, page, scripts)
+        with self.assertRaises(ValueError):
+            check_gui_coverage(catalogs, page, scripts + ["t('Uncatalogued extracted message')"])
         check_cli_coverage(load_catalogs(ROOT / 'source/linux/locales'))
         with self.assertRaises(ValueError):
             check_gui_coverage(catalogs, page.replace('Site Manager', 'Uncatalogued UI label'))
