@@ -308,6 +308,23 @@ const expression = `
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
+    await verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask);
+  }
+  async function verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask) {
+    await invoke('POST', '/api/local/mkdir', {tab: localTab, name: 'transfer-tree-up'});
+    const up = tree + '/document/transfer-tree-up';
+    const upTab = (await invoke('POST', '/api/tabs/local', {local_dir: up, remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/mkdir', {tab: upTab, name: 'nested'});
+    const child = (await invoke('POST', '/api/tabs/local', {local_dir: up + '/document/nested', remote_dir: root})).tab.id;
+    await invoke('POST', '/api/local/save', {tab: child, path: 'up.txt', content: 'provider tree upload'});
+    await runTask('/api/transfer/upload', {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-up']});
+    if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/transfer-tree-up/nested/up.txt'))).content !== 'provider tree upload') throw new Error('SAF tree upload differs');
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-tree-down'});
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/transfer-tree-down', name: 'nested'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/transfer-tree-down/nested/down.txt', content: 'provider tree download'});
+    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down']});
+    const down = (await invoke('POST', '/api/tabs/local', {local_dir: tree + '/document/transfer-tree-down/document/nested', remote_dir: root})).tab.id;
+    if ((await invoke('GET', '/api/local/edit?tab=' + down + '&path=down.txt')).content !== 'provider tree download') throw new Error('SAF tree download differs');
   }
   async function verifyAndroidGrantedSafLocalCopyMove(tree, safTab, root, runTask) {
     const rootTab = (await invoke('POST', '/api/tabs/local', {local_dir: root, remote_dir: tree})).tab.id;
