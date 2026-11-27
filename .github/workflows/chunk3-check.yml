@@ -1,0 +1,24 @@
+name: Chunk 3 preset checks
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+permissions:
+  contents: read
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Engine preset checks
+        run: cargo test -p linscp-engine --lib presets::tests
+      - name: Service preset checks
+        run: cargo test -p linscp-service --lib transfer_preset
+      - name: Types and preference checks
+        run: cargo test -p linscp-types --lib

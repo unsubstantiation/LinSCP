@@ -4872,117 +4872,6 @@ impl CommanderService {
                 Err(error) => return api_error(500, format!("Cannot load transfer presets: {error}")),
             }
         };
-        let matched_preset: Option<linscp_engine::presets::TransferPreset> = if presets_disabled {
-            None
-        } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
-            match preset_store.find(requested_preset_raw).cloned() {
-                Some(p) => Some(p),
-                None => return api_error(400, format!("There is no transfer preset named '{requested_preset_raw}'.")),
-            }
-        } else {
-            let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
-            if site_preset_name.eq_ignore_ascii_case("off") || site_preset_name.eq_ignore_ascii_case("none") {
-                None
-            } else if !site_preset_name.is_empty() {
-                match preset_store.find(site_preset_name).cloned() {
-                    Some(preset) => Some(preset),
-                    None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
-                }
-            } else {
-                let first_name = names.first().and_then(Value::as_str).unwrap_or("");
-                let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
-                let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
-                let rdir = body.get("remote_dir").and_then(Value::as_str).unwrap_or(&tab.remote_dir);
-                let ldir = body.get("local_dir").and_then(Value::as_str).unwrap_or(&tab.local_dir);
-                preset_store
-                    .match_mask(first_name)
-                    .or_else(|| preset_store.match_session(host, user, rdir, ldir))
-                    .cloned()
-            }
-        };
-        let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
-        let newer_only = body
-            .get("newer_only")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                if move_item {
-                    None
-                } else {
-                    matched_preset.as_ref().and_then(|p| p.newer_only)
-                }
-            })
-            .unwrap_or(false);
-        let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
-        let has_explicit_no_permissions = body.get("no_permissions").is_some();
-        let explicit_permissions = match body
-            .get("permissions")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => None,
-            Some(raw) => {
-                let mut tmp = linscp_engine::presets::TransferPreset::default();
-                if let Err(error) = tmp.parse_setting("permissions", raw) {
-                    return api_error(400, error);
-                }
-                tmp.permissions
-            }
-        };
-        let speed_kb = match body.get("speed") {
-            None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
-            Some(v) => match v.as_u64() {
-                Some(n) if n <= 100_000_000 => n,
-                _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
-            },
-        };
-        let transfer_raw = body.get("transfer").and_then(Value::as_str).unwrap_or("").trim();
-        let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
-            "" => matched_preset.as_ref().and_then(|p| p.transfer_mode).unwrap_or(linscp_types::TransferMode::Binary),
-            "binary" => linscp_types::TransferMode::Binary,
-            "ascii" => linscp_types::TransferMode::Ascii,
-            "automatic" | "auto" => linscp_types::TransferMode::Automatic,
-            _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
-        };
-        let mask_raw = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim();
-        if !mask_raw.is_empty() && move_item {
-            return api_error(400, "File masks are not supported for moves.");
-        }
-        let parsed_mask = if mask_raw.is_empty() {
-            if !move_item {
-                match matched_preset.as_ref().filter(|p| !p.mask.is_empty()) {
-                    Some(preset) => match linscp_engine::filemask::FileMask::parse(&preset.mask) {
-                        Ok(mask) => mask,
-                        Err(error) => return api_error(400, format!("Invalid transfer preset mask: {error}")),
-                    },
-                    None => linscp_engine::filemask::FileMask::default(),
-                }
-            } else {
-                linscp_engine::filemask::FileMask::default()
-            }
-        } else {
-            match linscp_engine::filemask::FileMask::parse(mask_raw) {
-                Ok(mask) => mask,
-                Err(error) => return api_error(400, error),
-            }
-        };
-        let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
-        let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
-            "" => match matched_preset.as_ref().and_then(|p| p.resume_support) {
-                Some(rs) => (rs, false),
-                None => (linscp_engine::presets::ResumeSupportMode::On, false),
-            },
-            "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
-            "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
-            "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
-            other => match other.parse::<u64>() {
-                Ok(kb) => (linscp_engine::presets::ResumeSupportMode::Smart(kb.saturating_mul(1024)), true),
-                Err(_) => return api_error(400, "Invalid resumesupport value (expected on, off, default, or size in KiB)."),
-            },
-        };
-        if move_item && (append || newer_only) {
-            return api_error(400, "Moves cannot be combined with append or newer-only filtering.");
-        }
         let local_dir = match body.get("local_dir").and_then(Value::as_str) {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
@@ -4991,45 +4880,6 @@ impl CommanderService {
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
         if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
-        if !tab.is_local {
-            let scheme = session.as_ref().unwrap().scheme();
-            if matches!(scheme, linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
-                && explicit_resume_support
-                && !matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off)
-            {
-                return api_error(400, "The SCP protocol cannot resume transfers.");
-            }
-        }
-        let is_ftp_upload = upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
-        let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
-        if is_ftp_upload && !append && !ftp_risk_accepted {
-            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
-        }
-        let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
-        if resume && append {
-            return api_error(400, "Cannot combine resume and append.");
-        }
-        if resume && transfer_mode != linscp_types::TransferMode::Binary {
-            return api_error(400, "Verified resume requires binary transfer mode.");
-        }
-        if resume && matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off) && explicit_resume_support {
-            return api_error(400, "Cannot request resume when resume support is disabled.");
-        }
-        if append {
-            if tab.is_local {
-                return api_error(400, "Append is supported only on remote transfers.");
-            }
-            if upload && !session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) {
-                return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
-            }
-        }
-        if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
-            return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
-        }
-        let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
-        if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
-            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
-        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
@@ -5045,6 +4895,152 @@ impl CommanderService {
         for value in names {
             let name = match value.as_str() { Some(name) => name, None => return api_error(400, "Invalid file name") };
             if !seen.insert(name) { return api_error(400, "Duplicate file name") };
+            let matched_preset: Option<linscp_engine::presets::TransferPreset> = if presets_disabled {
+                None
+            } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
+                match preset_store.find(requested_preset_raw).cloned() {
+                    Some(p) => Some(p),
+                    None => return api_error(400, format!("There is no transfer preset named '{requested_preset_raw}'.")),
+                }
+            } else {
+                let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
+                if site_preset_name.eq_ignore_ascii_case("off") || site_preset_name.eq_ignore_ascii_case("none") {
+                    None
+                } else if !site_preset_name.is_empty() {
+                    match preset_store.find(site_preset_name).cloned() {
+                        Some(preset) => Some(preset),
+                        None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
+                    }
+                } else {
+                    let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
+                    let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
+                    let rdir = body.get("remote_dir").and_then(Value::as_str).unwrap_or(&tab.remote_dir);
+                    let ldir = body.get("local_dir").and_then(Value::as_str).unwrap_or(&tab.local_dir);
+                    preset_store.match_transfer(host, user, rdir, ldir, name).cloned()
+                }
+            };
+            let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
+            let newer_only = body
+                .get("newer_only")
+                .and_then(Value::as_bool)
+                .or_else(|| {
+                    if move_item {
+                        None
+                    } else {
+                        matched_preset.as_ref().and_then(|p| p.newer_only)
+                    }
+                })
+                .unwrap_or(false);
+            let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
+            let has_explicit_no_permissions = body.get("no_permissions").is_some();
+            let explicit_permissions = match body
+                .get("permissions")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => None,
+                Some(raw) => {
+                    let mut tmp = linscp_engine::presets::TransferPreset::default();
+                    if let Err(error) = tmp.parse_setting("permissions", raw) {
+                        return api_error(400, error);
+                    }
+                    tmp.permissions
+                }
+            };
+            let speed_kb = match body.get("speed") {
+                None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
+                Some(v) => match v.as_u64() {
+                    Some(n) if n <= 100_000_000 => n,
+                    _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
+                },
+            };
+            let transfer_raw = body.get("transfer").and_then(Value::as_str).unwrap_or("").trim();
+            let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
+                "" => matched_preset.as_ref().and_then(|p| p.transfer_mode).unwrap_or(linscp_types::TransferMode::Binary),
+                "binary" => linscp_types::TransferMode::Binary,
+                "ascii" => linscp_types::TransferMode::Ascii,
+                "automatic" | "auto" => linscp_types::TransferMode::Automatic,
+                _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
+            };
+            let mask_raw = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim();
+            if !mask_raw.is_empty() && move_item {
+                return api_error(400, "File masks are not supported for moves.");
+            }
+            let parsed_mask = if mask_raw.is_empty() {
+                if !move_item {
+                    match matched_preset.as_ref().filter(|p| !p.mask.is_empty()) {
+                        Some(preset) => match linscp_engine::filemask::FileMask::parse(&preset.mask) {
+                            Ok(mask) => mask,
+                            Err(error) => return api_error(400, format!("Invalid transfer preset mask: {error}")),
+                        },
+                        None => linscp_engine::filemask::FileMask::default(),
+                    }
+                } else {
+                    linscp_engine::filemask::FileMask::default()
+                }
+            } else {
+                match linscp_engine::filemask::FileMask::parse(mask_raw) {
+                    Ok(mask) => mask,
+                    Err(error) => return api_error(400, error),
+                }
+            };
+            let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
+            let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
+                "" => match matched_preset.as_ref().and_then(|p| p.resume_support) {
+                    Some(rs) => (rs, false),
+                    None => (linscp_engine::presets::ResumeSupportMode::On, false),
+                },
+                "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
+                "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
+                "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
+                other => match other.parse::<u64>() {
+                    Ok(kb) => (linscp_engine::presets::ResumeSupportMode::Smart(kb.saturating_mul(1024)), true),
+                    Err(_) => return api_error(400, "Invalid resumesupport value (expected on, off, default, or size in KiB)."),
+                },
+            };
+            if move_item && (append || newer_only) {
+                return api_error(400, "Moves cannot be combined with append or newer-only filtering.");
+            }
+            if !tab.is_local {
+                let scheme = session.as_ref().unwrap().scheme();
+                if matches!(scheme, linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
+                    && explicit_resume_support
+                    && !matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off)
+                {
+                    return api_error(400, "The SCP protocol cannot resume transfers.");
+                }
+            }
+            let is_ftp_upload = upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
+            let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
+            if is_ftp_upload && !append && !ftp_risk_accepted {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
+            }
+            let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+            if resume && append {
+                return api_error(400, "Cannot combine resume and append.");
+            }
+            if resume && transfer_mode != linscp_types::TransferMode::Binary {
+                return api_error(400, "Verified resume requires binary transfer mode.");
+            }
+            if resume && matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off) && explicit_resume_support {
+                return api_error(400, "Cannot request resume when resume support is disabled.");
+            }
+            if append {
+                if tab.is_local {
+                    return api_error(400, "Append is supported only on remote transfers.");
+                }
+                if upload && !session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) {
+                    return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
+                }
+            }
+            if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
+                return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
+            }
+            let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
+            if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
+            }
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
@@ -7771,9 +7767,7 @@ impl CommanderService {
                     let filename = query.get("filename").map(String::as_str).unwrap_or("");
                     let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
                     let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
-                    matched = store
-                        .match_mask(filename)
-                        .or_else(|| store.match_session(host, user, &tab.remote_dir, &tab.local_dir))
+                    matched = store.match_transfer(host, user, &tab.remote_dir, &tab.local_dir, filename)
                         .map(|p| p.name.clone());
                 }
             }
@@ -14733,6 +14727,52 @@ mod tests {
         assert!(done, "site opt-out transfers did not complete");
         assert_eq!(std::fs::read(other.join("allowed.txt")).unwrap(), b"allowed");
         assert_eq!(std::fs::read(other.join("excluded.bin")).unwrap(), b"excluded");
+    }
+
+    #[tokio::test]
+    async fn automatic_transfer_presets_match_each_file_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a.txt"), b"text").unwrap();
+        std::fs::write(src.join("b.bin"), b"binary").unwrap();
+        let svc = CommanderService::new(temp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        for preset in [
+            json!({"name":"wrong-host", "host":"other.example", "mask":"*.txt", "permissions":"0700"}),
+            json!({"name":"text", "host":"prod.example", "mask":"*.txt", "permissions":"0600"}),
+            json!({"name":"binary", "host":"prod.example", "mask":"*.bin", "permissions":"0640"}),
+        ] {
+            let saved = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/presets/save".into(), body: preset });
+            assert_eq!(saved.status, 200, "{}", saved.payload);
+        }
+        let id = svc.create_local_tab(src.to_string_lossy().into_owned(), dst.to_string_lossy().into_owned()).payload["tab"]["id"].as_u64().unwrap();
+        {
+            let mut state = svc.state.lock().unwrap();
+            let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+            spec.session.host = "prod.example".into();
+            state.tabs.get_mut(&id).unwrap().spec = Some(spec);
+        }
+        let preview = svc.dispatch(ApiEnvelope { method: "GET".into(), path: format!("/api/presets?tab={id}&filename=a.txt"), body: json!({}) });
+        assert_eq!(preview.payload["matched"], "text");
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab":id,"local_dir":src,"remote_dir":dst,"names":["a.txt","b.bin"]}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            assert!(!tasks.iter().any(|task| task["status"] == "Failed"), "{tasks:?}");
+            if tasks.len() == 2 && tasks.iter().all(|task| task["status"] == "Completed") { done = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"text");
+        assert_eq!(std::fs::read(dst.join("b.bin")).unwrap(), b"binary");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dst.join("a.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(dst.join("b.bin")).unwrap().permissions().mode() & 0o777, 0o640);
+        }
     }
 
     #[tokio::test]

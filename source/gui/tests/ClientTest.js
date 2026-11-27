@@ -7108,6 +7108,35 @@ function options(id) {
       window.prompt = savedPromptCli;
     }
 
+    // Untouched GUI defaults must not override automatically matched presets.
+    {
+      const defaults = window.preferencesToSettings({transfer: 'binary', speed: 0, preserve_time: true, newer_only: false, no_permissions: false});
+      window.eval('transferSettings = ' + JSON.stringify(defaults));
+      let opts = window.transferOptions();
+      check('automatic preset inherits untouched GUI defaults',
+        !('transfer' in opts) && !('speed' in opts) && !('preserve_time' in opts) &&
+        !('newer_only' in opts) && !('no_permissions' in opts));
+      const explicit = window.preferencesToSettings({transfer: 'binary', speed: 0, preserve_time: true, newer_only: false, no_permissions: false,
+        preset_overrides: ['transfer', 'speed', 'preserve_time', 'newer_only', 'no_permissions']});
+      window.eval('transferSettings = ' + JSON.stringify(explicit));
+      opts = window.transferOptions();
+      check('explicit default-valued overrides are sent and survive preferences',
+        opts.transfer === 'binary' && opts.speed === 0 && opts.preserve_time === true &&
+        opts.newer_only === false && opts.no_permissions === false &&
+        window.settingsToPreferences(explicit).preset_overrides.length === 5);
+      window.eval('transferSettings = ' + JSON.stringify(defaults));
+      window.openTransferSettings();
+      const preserve = doc.getElementById('transferPreserveTime');
+      preserve.checked = false;
+      preserve.dispatchEvent(new window.Event('change', {bubbles: true}));
+      preserve.checked = true;
+      preserve.dispatchEvent(new window.Event('change', {bubbles: true}));
+      await window.saveTransferSettings();
+      check('an explicitly toggled default-valued override is persisted',
+        window.transferOptions().preserve_time === true &&
+        JSON.parse(calls.filter(c => c.path === '/api/preferences').pop().options.body).preferences.preset_overrides.includes('preserve_time'));
+    }
+
     // Completed features: string matched preset & rule persistence, CLI lcd local sync & canonical completion,
     // Preferences resume default, and Editor Go-to-line + Search match line jump.
     {
@@ -7151,7 +7180,7 @@ function options(id) {
       check('saving a selected preset forwards octal permissions and preserve_time_dirs in transferOptions()',
         savedPresetOpts.preset === 'StringMatchedPreset' &&
         savedPresetOpts.permissions === '0644' &&
-        savedPresetOpts.preserve_time === true &&
+        savedPresetOpts.preserve_time !== false &&
         savedPresetOpts.preserve_time_dirs === true);
 
       // The transfer settings are kept in the preferences document, so the

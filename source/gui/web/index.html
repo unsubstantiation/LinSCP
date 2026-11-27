@@ -10619,6 +10619,33 @@
   };
 
   let transferSettings = Object.assign({}, TRANSFER_DEFAULTS);
+  let pendingPresetOverrides = new Set();
+  const PRESET_OVERRIDE_FIELDS = {
+    transferMode: 'transfer', prefTransfer: 'transfer',
+    transferSpeed: 'speed', prefSpeed: 'speed',
+    transferPreserveTime: 'preserve_time', prefPreserveTime: 'preserve_time',
+    transferNewerOnly: 'newer_only', prefNewerOnly: 'newer_only',
+    transferNoPermissions: 'no_permissions', prefNoPermissions: 'no_permissions'
+  };
+  document.addEventListener('change', event => {
+    const field = PRESET_OVERRIDE_FIELDS[event.target && event.target.id];
+    if (field) pendingPresetOverrides.add(field);
+  });
+  function presetOverrides(prefs) {
+    if (Array.isArray(prefs.preset_overrides)) return prefs.preset_overrides.slice();
+    // Old preferences did not record whether default-valued controls were touched.
+    // Preserve non-default choices; defaults inherit the selected preset.
+    const result = [];
+    if (prefs.transfer && prefs.transfer !== 'binary') result.push('transfer');
+    if (prefs.speed) result.push('speed');
+    if (prefs.preserve_time === false) result.push('preserve_time');
+    if (prefs.newer_only) result.push('newer_only');
+    if (prefs.no_permissions) result.push('no_permissions');
+    return result;
+  }
+  function mergedPresetOverrides(existing) {
+    return Array.from(new Set([...(existing || []), ...pendingPresetOverrides]));
+  }
   // The stored preferences, as the backend holds them. Every transfer and
   // confirmation reads its defaults from here, so a second browser on the
   // same account starts from the same values instead of its own storage.
@@ -10627,6 +10654,7 @@
   function preferencesToSettings(prefs) {
     return {
       preset: prefs.preset || '',
+      presetOverrides: presetOverrides(prefs),
       transfer: prefs.transfer || '',
       filemask: prefs.filemask || '',
       speed: prefs.speed || 0,
@@ -10646,6 +10674,7 @@
   function settingsToPreferences(settings) {
     return Object.assign({}, preferences || {}, {
       preset: settings.preset || '',
+      preset_overrides: settings.presetOverrides || [],
       transfer: settings.transfer || '',
       filemask: settings.filemask || '',
       speed: settings.speed || 0,
@@ -10967,6 +10996,7 @@
   }
 
   function openTransferSettings() {
+    pendingPresetOverrides = new Set();
     clearTransferPresetRuleFields();
     if (transferSettings.permissions && $('transferPresetPermissions')) {
       const p = String(transferSettings.permissions).trim();
@@ -11047,6 +11077,7 @@
     const preserveTime = $('transferPreserveTime').checked;
     transferSettings = {
       preset: selectedPreset,
+      presetOverrides: mergedPresetOverrides(transferSettings.presetOverrides),
       transfer: $('transferMode').value,
       filemask: $('transferMask').value.trim(),
       speed: speed,
@@ -11067,7 +11098,8 @@
   }
 
   async function resetTransferSettings() {
-    transferSettings = Object.assign({}, TRANSFER_DEFAULTS);
+    pendingPresetOverrides = new Set();
+    transferSettings = Object.assign({}, TRANSFER_DEFAULTS, {presetOverrides: []});
     if (!await persistTransferSettings()) return;
     openTransferSettings();
     toast(t('Transfer settings restored to their defaults.'));
@@ -11079,18 +11111,19 @@
     const opts = {
       resume: !!transferSettings.resume,
       recursive: true,
-      newer_only: !!transferSettings.newerOnly,
-      preserve_time: transferSettings.preserveTime !== false,
-      transfer: transferSettings.transfer || '',
       filemask: transferSettings.filemask || '',
-      speed: transferSettings.speed || 0,
       append: !!transferSettings.append,
-      no_permissions: !!transferSettings.noPermissions,
       resumesupport: transferSettings.resumesupport || '',
       priority: !!transferSettings.priority
     };
+    const overrides = transferSettings.presetOverrides || [];
+    if (overrides.includes('transfer')) opts.transfer = transferSettings.transfer || 'binary';
+    if (overrides.includes('speed')) opts.speed = transferSettings.speed || 0;
+    if (overrides.includes('preserve_time')) opts.preserve_time = transferSettings.preserveTime !== false;
+    if (overrides.includes('newer_only')) opts.newer_only = !!transferSettings.newerOnly;
+    if (overrides.includes('no_permissions')) opts.no_permissions = !!transferSettings.noPermissions;
     if (transferSettings.permissions) opts.permissions = transferSettings.permissions;
-    if (transferSettings.preserveTimeDirs && opts.preserve_time) opts.preserve_time_dirs = true;
+    if (transferSettings.preserveTimeDirs && transferSettings.preserveTime !== false) opts.preserve_time_dirs = true;
     if (transferSettings.preset) opts.preset = transferSettings.preset;
     return opts;
   }
@@ -11139,6 +11172,7 @@
       resumesupport = sup === 'size' ? String(sz) : sup;
     }
     return Object.assign({}, preferences || {}, {
+      preset_overrides: mergedPresetOverrides(presetOverrides(preferences || {})),
       transfer: $('prefTransfer').value,
       filemask: $('prefFilemask').value.trim(),
       speed: parseInt($('prefSpeed').value, 10) || 0,
@@ -11320,6 +11354,7 @@
   }
 
   async function openPreferences() {
+    pendingPresetOverrides = new Set();
     if (!preferences) await loadTransferSettings();
     fillPreferencesForm(preferences || {});
     $('preferencesStatus').textContent = '';
@@ -11343,6 +11378,7 @@
   }
 
   async function resetPreferences() {
+    pendingPresetOverrides = new Set();
     const result = await apiPost('/api/preferences', { action: 'reset' });
     if (!result.success) {
       $('preferencesStatus').textContent = errorMessage(result.error,
