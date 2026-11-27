@@ -112,6 +112,14 @@ jobs:
           LSCP_LIVE_S3: "1"
           RUST_MIN_STACK: "16777216"
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ -- --nocapture --test-threads=1
+
+      - name: Validate live WebDAV action log against the pinned schema
+        run: |
+          set -euo pipefail
+          export LSCP_LIVE_WEBDAV=1
+          export LINSCP_XML_LIVE_OUTPUT="$RUNNER_TEMP/linscp-live-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture --test-threads=1
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
   build:
     name: Debian package (.deb)
     runs-on: ubuntu-24.04

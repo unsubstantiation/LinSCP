@@ -17086,6 +17086,15 @@ mod tests {
         let port: u16 = line.trim().strip_prefix("READY ").expect("WebDAV server failed to start").parse().unwrap();
         let svc = CommanderService::new(tmp.join("config"), Arc::new(NativeLocalFs::new()));
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        // Export a real GUI action log for independent XSD validation when
+        // explicitly requested by CI. Never write it on ordinary test runs.
+        if std::env::var_os("LINSCP_XML_LIVE_OUTPUT").is_some() {
+            let mut prefs = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/preferences".into(), body: json!({}) }).payload["preferences"].clone();
+            prefs["xml_log_enabled"] = json!(true);
+            prefs["xml_log_path"] = json!("live-actions.xml");
+            let saved = svc.dispatch(request("/api/preferences", json!({"action": "save", "preferences": prefs})));
+            assert_eq!(saved.status, 200, "{}", saved.payload);
+        }
         let open = svc.dispatch_async(request("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
         assert_eq!(open.status, 200, "{}", open.payload);
         let id = open.payload["tab"]["id"].as_u64().unwrap();
@@ -17111,6 +17120,13 @@ mod tests {
         assert_eq!(list.status, 200, "{}", list.payload);
         assert!(list.payload["entries"].as_array().unwrap().iter().any(|e| e["name"] == "upload.txt"));
         assert_eq!(std::fs::read(downloaded.join("upload.txt")).unwrap(), b"WebDAV roundtrip");
+        if let Some(path) = std::env::var_os("LINSCP_XML_LIVE_OUTPUT") {
+            let log = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs/xml".into(), body: json!({}) });
+            assert_eq!(log.status, 200, "{}", log.payload);
+            let xml = log.payload["content"].as_str().expect("XML action log");
+            assert!(xml.contains("<upload>") && xml.contains("<download>"), "live log must include both operations: {xml}");
+            std::fs::write(path, xml).expect("write live XML schema sample");
+        }
         let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
         Box::pin(exercise_remote_delete(&svc, id)).await;
         Box::pin(exercise_webdav_local_trees(&svc, id, &local, &downloaded, session.as_ref())).await;
