@@ -93,6 +93,15 @@ jobs:
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
+      - name: Validate XML action log against the pinned schema
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/linscp-xmlschema
+          /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
+          export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
+
       - name: Exercise live protocol integration tests
         env:
           LSCP_LIVE_SFTP: "1"

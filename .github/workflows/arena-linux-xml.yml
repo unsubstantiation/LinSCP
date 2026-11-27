@@ -1,0 +1,114 @@
+name: Arena Linux XML validation
+
+on:
+  push:
+    branches: [arena/c4f5bb7a-linscp]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Linux checks & unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-tests
+
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
+            cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            python3-paramiko python3-pyftpdlib python3-openssl
+
+      - name: Check GUI distribution, workflow triggers, and X2Go
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+          python3 -m unittest discover -s tools/tests -p test_native_listeners.py
+          python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
+          python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
+          python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
+          python3 -m unittest discover -s tools/tests -p test_ppk_fixture_format.py
+          
+      - name: Install and test the shared frontend
+        run: |
+          set -euo pipefail
+          npm --prefix ui ci --no-audit --no-fund
+          npm --prefix ui test
+          if false; then
+            python3 tools/compile_translations.py
+            if ! git diff --quiet locales/; then
+              git config user.name "github-actions[bot]"
+              git config user.email "actions@localhost"
+              git add locales/de.json locales/en.json locales/es.json locales/fr.json
+              git commit -m "Regenerate unified locale files"
+              git push
+            fi
+          fi
+          python3 tools/compile_translations.py --check && python3 tools/check_shared_frontend.py
+
+      - name: Check the parity ledger and its repo-state suites
+        run: |
+          set -euo pipefail
+          python3 tools/check_upstream_parity.py
+          python3 -m unittest discover -s tools/tests -p test_build_version.py
+          python3 -m unittest discover -s tools/tests -p test_parity_inventory.py
+          python3 -m unittest discover -s tools/tests -p test_platform_conversion.py
+          python3 -m unittest discover -s tools/tests -p test_wayland_compatibility.py
+          python3 -m unittest discover -s tools/tests -p test_translations.py
+          python3 -m unittest discover -s tools/tests -p test_unified_locales.py
+          python3 -m unittest discover -s tools/tests -p test_shared_frontend.py
+          python3 tools/check_ci_test_execution.py
+          python3 -m unittest discover -s tools/tests -p test_rust_cross_lang_parity.py
+          python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
+          python3 -m unittest discover -s tools/tests -p test_ci_test_execution.py
+
+      - name: Exercise offline workspace unit tests
+        run: |
+          set -euo pipefail
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
+
+      - name: Validate XML action log against the pinned schema
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/linscp-xmlschema
+          /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
+          export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
+
+      - name: Exercise live protocol integration tests
+        env:
+          LSCP_LIVE_SFTP: "1"
+          LSCP_LIVE_WEBDAV: "1"
+          LSCP_LIVE_FTP: "1"
+          LSCP_LIVE_FTPES: "1"
+          LSCP_LIVE_FTPS_IMPLICIT: "1"
+          LSCP_LIVE_S3: "1"
+          RUST_MIN_STACK: "16777216"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ -- --nocapture --test-threads=1
