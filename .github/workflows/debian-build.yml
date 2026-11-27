@@ -48,6 +48,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+          python3 -m unittest discover -s tools/tests -p test_native_listeners.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
           python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
@@ -173,6 +174,8 @@ jobs:
       - name: Smoke test the native window
         run: |
           set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR"' EXIT
           if xvfb-run -a bash -euo pipefail -c '
             export WEBKIT_DISABLE_COMPOSITING_MODE=1
             export WEBKIT_DISABLE_DMABUF_RENDERER=1
@@ -190,6 +193,7 @@ jobs:
                 exit 1
               fi
               if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
+                python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
                 echo "LinSCP window opened"
                 exit 0
               fi
