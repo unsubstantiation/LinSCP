@@ -11,6 +11,13 @@ class SharedFrontendTests(unittest.TestCase):
     def test_real_page_is_fully_served(self):
         self.assertEqual(check.main(), 0)
 
+    def test_extracted_script_is_included_in_real_page_checks(self):
+        script = check.PAGE_SCRIPTS[0].read_text(encoding='utf-8')
+        service = check.SERVICE.read_text(encoding='utf-8')
+        self.assertIn('/api/vault/scan', check.page_endpoints(script))
+        self.assertEqual(check.unrouted(script, service), [])
+        self.assertEqual(check.unrouted_methods(script, service), [])
+
     def test_a_page_endpoint_without_a_route_is_reported(self):
         page = "const a = '/api/status'; const b = `/api/not/real`;"
         service = '("GET", "/api/status") => self.handle_status(),'

@@ -15,6 +15,7 @@ import sys
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 PAGE = ROOT / 'source/gui/web/index.html'
+PAGE_SCRIPTS = [ROOT / 'source/gui/web/key-session.js']
 SERVICE = ROOT / 'crates/linscp-service/src/lib.rs'
 
 PAGE_ENDPOINT = re.compile(r"""['"`](/api/[a-zA-Z0-9/_.-]+)""")
@@ -47,7 +48,7 @@ def unrouted_methods(page_text, service_text):
 
 
 def main():
-    page = PAGE.read_text(encoding='utf-8')
+    page = PAGE.read_text(encoding='utf-8') + '\n' + '\n'.join(path.read_text(encoding='utf-8') for path in PAGE_SCRIPTS)
     service = SERVICE.read_text(encoding='utf-8')
     problems = unrouted(page, service)
     method_problems = unrouted_methods(page, service)

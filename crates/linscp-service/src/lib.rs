@@ -15,6 +15,7 @@ use linscp_engine::{
     filemask::FileMask, offlineotp_vault::{self, CredentialEntry, LoginRecord, SshKeyRecord},
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
+use linscp_engine::vault_keys::{valid_id as valid_vault_key_id, list_ids as list_vault_key_ids, read_file as read_vault_key_file};
 use linscp_platform::{
     config_dir, gui_os, write_exclusive_private_file, write_private_file_atomic, LocalFs,
     NativeLocalFs, NativeSecretVault, SecretVault,
@@ -35,6 +36,8 @@ pub mod share_export;
 pub mod tabs;
 pub mod terminal_bridge;
 pub mod x2go_bridge;
+mod vault;
+mod backup;
 
 use tabs::{TabRuntime, parse_tab_id_str, session_is_local, collect_session_folders, stored_site_to_gui_json};
 use linscp_engine::url_and_raw::GuiConnectError;
@@ -5309,231 +5312,6 @@ impl CommanderService {
         self.default_local_dir()
     }
 
-    fn handle_vault_retry_lock(&self) -> ApiReply {
-        match self.retry_config_lock() {
-            Ok(()) => ApiReply { status: 200, payload: json!({ "success": true }) },
-            Err(error) => api_error(503, error),
-        }
-    }
-
-    fn handle_vault_status(&self) -> ApiReply {
-        let config_root = self.config_root();
-        match self.secret_vault.status(&config_root) {
-            Ok("setup_required") if matches!(linscp_engine::backup::restore_recovery_required(&config_root), Ok(true)) =>
-                api_error(503, "Cannot recover restore: the existing password-wrapped vault key is missing or unavailable."),
-            Ok(status) => ApiReply { status: 200, payload: json!({"success": true, "vault": status}) },
-            Err(error) => api_error(500, error.to_string()),
-        }
-    }
-
-    fn handle_vault_unlock(&self, mut body: Value) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let config_root = self.config_root();
-        let pending = match linscp_engine::backup::restore_recovery_required(&config_root) {
-            Ok(pending) => pending,
-            Err(error) => return api_error(503, error),
-        };
-        if pending && !matches!(self.secret_vault.status(&config_root), Ok("locked" | "unlocked")) {
-            if let Some(Value::String(password)) = body.get_mut("password") { zeroize::Zeroize::zeroize(password); }
-            return api_error(503, "Cannot recover restore: the existing password-wrapped vault key is missing or unavailable.");
-        }
-        let unlock_result = {
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            self.secret_vault.unlock_or_setup(&config_root, password, self.legacy_secret_vault.as_ref())
-        };
-        if let Some(Value::String(password)) = body.get_mut("password") {
-            zeroize::Zeroize::zeroize(password);
-        }
-        if let Err(error) = unlock_result {
-            return api_error(400, error.to_string());
-        }
-        if pending {
-            let lock_guard = self.config_lock.lock().expect("config lock mutex");
-            let lock = match lock_guard.as_ref() {
-                Ok(lock) => lock,
-                Err(error) => {
-                    let msg = error.clone();
-                    drop(lock_guard);
-                    let _ = self.secret_vault.lock();
-                    return api_error(503, msg);
-                }
-            };
-            match linscp_engine::backup::recover_interrupted_restore(&config_root, self.secret_vault.as_ref(), lock) {
-                Ok(true) => {}
-                Ok(false) => { let _ = self.secret_vault.lock(); return api_error(503, "Restore journal disappeared during recovery."); },
-                Err(error) => { let _ = self.secret_vault.lock(); return api_error(503, format!("Restore recovery failed: {error}")); },
-            }
-        }
-        if let Err(error) = SessionStore::protect_existing(&config_root, self.secret_vault.as_ref())
-            .and_then(|_| auto_reconnect::protect_existing(&config_root, self.secret_vault.as_ref()))
-            .and_then(|_| linscp_engine::protected_file::migrate(&config_root.join("sshhostkeys"), "ssh-host-keys", self.secret_vault.as_ref(), |bytes| {
-                let text = std::str::from_utf8(bytes).map_err(|e| e.to_string())?;
-                linscp_engine::hostkeys::HostKeyCache::validate(text)
-            }))
-            .and_then(|_| linscp_engine::protected_file::migrate(&config_root.join("workspaces.json"), "workspaces", self.secret_vault.as_ref(), |bytes| {
-                let value: Value = serde_json::from_slice(bytes).map_err(|e| format!("Invalid workspace file: {e}"))?;
-                // Older engine versions used an array; preserve it for compatibility.
-                if value.is_array() || value.get("workspaces").is_some_and(Value::is_object) { Ok(()) } else { Err("Invalid workspace structure".into()) }
-            })) {
-            let _ = self.secret_vault.lock();
-            return api_error(500, format!("Could not protect existing session data: {error}"));
-        }
-        if self.recovery_gate.load(std::sync::atomic::Ordering::Acquire) {
-            let preferences = PreferencesStore::load(&config_root).unwrap_or_default();
-            self.state.lock().expect("state mutex").preferences = preferences;
-            self.recovery_gate.store(false, std::sync::atomic::Ordering::Release);
-        }
-        let _ = linscp_platform::create_private_dir(&config_root.join("shell-manifests"));
-        let stale_temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
-        let _ = std::fs::remove_dir_all(stale_temp_dir);
-        ApiReply { status: 200, payload: json!({"success": true, "vault": "unlocked"}) }
-    }
-
-    fn handle_vault_lock(&self) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        // Locking explicitly disconnects every tab; do not restore them later.
-        {
-            let state = self.state.lock().expect("state mutex");
-            let result = auto_reconnect::load(&state.config_root, self.secret_vault.as_ref()).and_then(|mut intentions| {
-                let before = intentions.len();
-                intentions.clear();
-                if intentions.len() != before { auto_reconnect::save(&state.config_root, self.secret_vault.as_ref(), &intentions)?; }
-                Ok(())
-            });
-            if let Err(error) = result { return api_error(500, error); }
-        }
-        if let Err(error) = self.secret_vault.lock() {
-            return api_error(500, error.to_string());
-        }
-        let mut state = self.state.lock().expect("state mutex");
-        let tab_ids: Vec<u64> = state.tabs.keys().copied().collect();
-        for tab_id in tab_ids {
-            self.queue.cancel_for_tab(tab_id);
-            state.terminals.close_for_tab(tab_id);
-            state.monitors.forget(tab_id);
-        }
-        self.queue.clear_finished();
-        let drained_tunnels: Vec<_> = state.desktop_tunnels.drain().collect();
-        let drained_x2go: Vec<_> = state.x2go.drain().collect();
-        state.x2go_pending.clear();
-        let drained_edits: Vec<ExternalEditSession> =
-            state.external_edits.drain().map(|(_, e)| e).collect();
-        state.tabs.clear();
-        state.challenges.clear();
-        state.pending_connections.clear();
-        state.pending_sites.clear();
-        state.auto_pending.clear();
-        state.auto_retry_at.clear();
-        state.auto_suspended.clear();
-        state.active_tab_id = None;
-        wipe_logs(&mut state.logs);
-        drop(state);
-        drop(drained_tunnels);
-        drop(drained_x2go);
-        for edit in drained_edits {
-            edit.closed.store(true, std::sync::atomic::Ordering::Release);
-            if let Some(dir) = edit.staged_dir {
-                let _ = std::fs::remove_dir_all(dir);
-            }
-        }
-        ApiReply { status: 200, payload: json!({"success": true, "vault": "locked"}) }
-    }
-
-    fn handle_vault_ssh_keys(&self) -> ApiReply {
-        let config_root = self.config_root();
-        match self.secret_vault.status(&config_root) {
-            Ok("unlocked") => {}
-            Ok(_) => return api_error(423, "Unlock the local vault before choosing an SSH key."),
-            Err(error) => return api_error(500, error.to_string()),
-        }
-        let key_dir = config_root.join("keys");
-        let entries = match std::fs::read_dir(&key_dir) {
-            Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return ApiReply { status: 200, payload: json!({"success": true, "keys": []}) };
-            }
-            Err(error) => return api_error(500, format!("Cannot list vault keys: {error}")),
-        };
-        let mut keys = Vec::new();
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if !entry.file_type().map(|kind| kind.is_file()).unwrap_or(false) { continue; }
-            let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue; };
-            let Some(id) = file_name.strip_suffix(".key.vault") else { continue; };
-            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) { continue; }
-            let label = read_vault_key_label(&key_dir, id);
-            keys.push(json!({
-                "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{id}"),
-                "label": label,
-            }));
-        }
-        keys.sort_by(|left, right| left["label"].as_str().cmp(&right["label"].as_str()));
-        ApiReply { status: 200, payload: json!({"success": true, "keys": keys}) }
-    }
-
-    /// Remove only one explicitly confirmed vault key and its metadata. Saved
-    /// sites using the key must first be updated or removed.
-    fn handle_vault_ssh_key_delete(&self, body: Value) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let config_root = self.config_root();
-        match self.secret_vault.status(&config_root) {
-            Ok("unlocked") => {}
-            Ok(_) => return api_error(423, "Unlock the local vault before deleting an SSH key."),
-            Err(error) => return api_error(500, error.to_string()),
-        }
-        if body.get("confirm").and_then(Value::as_bool) != Some(true) {
-            return api_error(400, "Confirm SSH key deletion first.");
-        }
-        let Some(id) = body.get("reference").and_then(Value::as_str)
-            .and_then(|reference| reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX))
-            .filter(|id| id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit())) else {
-            return api_error(400, "Invalid encrypted SSH key reference.");
-        };
-        let reference = format!("{LOCAL_VAULT_KEY_PREFIX}{id}");
-        let store = match SessionStore::load_from_dir(&config_root, self.secret_vault.as_ref()) {
-            Ok(store) => store,
-            Err(error) => return api_error(500, format!("Cannot check stored sessions: {error}")),
-        };
-        let users: Vec<&str> = store.sites().iter().filter(|site|
-            site.private_key.as_deref() == Some(reference.as_str()) ||
-            site.tunnel.keyfile.as_deref() == Some(reference.as_str())
-        ).map(|site| site.name.as_str()).collect();
-        if !users.is_empty() {
-            return api_error(409, format!("Cannot delete this key: stored sessions use it: {}. Change or delete those sessions first.", users.join(", ")));
-        }
-        let key_dir = config_root.join("keys");
-        // Never traverse a symlink masquerading as the vault key directory.
-        match std::fs::symlink_metadata(&key_dir) {
-            Ok(metadata) if metadata.file_type().is_dir() => {}
-            Ok(_) => return api_error(400, "Invalid vault key directory."),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return api_error(404, "SSH key is no longer in the vault."),
-            Err(error) => return api_error(500, format!("Cannot inspect vault keys: {error}")),
-        }
-        let private_path = key_dir.join(format!("{id}.key.vault"));
-        match std::fs::symlink_metadata(&private_path) {
-            Ok(metadata) if metadata.file_type().is_file() => {}
-            Ok(_) => return api_error(400, "Invalid encrypted SSH key file."),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return api_error(404, "SSH key is no longer in the vault."),
-            Err(error) => return api_error(500, format!("Cannot inspect encrypted SSH key: {error}")),
-        }
-        if let Err(error) = std::fs::remove_file(&private_path) {
-            return api_error(500, format!("Could not delete the encrypted SSH key: {error}"));
-        }
-        // Metadata cleanup is best effort, but report partial failure honestly.
-        // remove_file removes a symlink itself, never the target.
-        let mut metadata_failed = false;
-        for extension in ["label", "pub"] {
-            if let Err(error) = std::fs::remove_file(key_dir.join(format!("{id}.{extension}"))) {
-                if error.kind() != std::io::ErrorKind::NotFound { metadata_failed = true; }
-            }
-        }
-        if metadata_failed {
-            return ApiReply { status: 500, payload: json!({"success": false, "deleted": true,
-                "error": "The encrypted SSH key was deleted, but some metadata could not be removed."}) };
-        }
-        ApiReply { status: 200, payload: json!({"success": true, "deleted": true}) }
-    }
-
     fn hostkey_entries_json(cache: &linscp_engine::hostkeys::HostKeyCache) -> Vec<Value> {
         cache
             .entries()
@@ -5751,107 +5529,6 @@ impl CommanderService {
                 "Unsupported host-key action; expected add, delete, clear or import_known_hosts.",
             ),
         }
-    }
-
-    fn handle_vault_ssh_key_import(&self, mut body: Value) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let config_root = self.config_root();
-        let name = body.get("name").and_then(Value::as_str).unwrap_or("")
-            .rsplit(['/', '\\']).next().unwrap_or("")
-            .chars().filter(|character| !character.is_control()).take(128).collect::<String>();
-        let private_key = body.get("private_key").and_then(Value::as_str).unwrap_or("");
-        if private_key.is_empty() || private_key.as_bytes().len() > 1024 * 1024 || private_key.contains('\0') {
-            if let Some(Value::String(private_key)) = body.get_mut("private_key") {
-                zeroize::Zeroize::zeroize(private_key);
-            }
-            return api_error(400, "Choose a non-empty SSH key file no larger than 1 MiB.");
-        }
-        if looks_like_public_ssh_key(private_key) {
-            if let Some(Value::String(private_key)) = body.get_mut("private_key") {
-                zeroize::Zeroize::zeroize(private_key);
-            }
-            return api_error(400, "Choose a private SSH key file, not a public key (.pub).");
-        }
-        let derived_public = derive_public_ssh_key_optional(private_key).unwrap_or_default();
-        let plaintext = zeroize::Zeroizing::new(private_key.as_bytes().to_vec());
-        let encryption_result = self.secret_vault.seal_local_blob(&plaintext);
-        if let Some(Value::String(private_key)) = body.get_mut("private_key") {
-            zeroize::Zeroize::zeroize(private_key);
-        }
-        let encrypted = match encryption_result {
-            Ok(encrypted) => encrypted,
-            Err(error) => return api_error(400, error.to_string()),
-        };
-        let key_dir = config_root.join("keys");
-        if let Err(error) = linscp_platform::create_private_dir(&key_dir) {
-            return api_error(500, error.to_string());
-        }
-        if let Some(existing_id) = find_existing_vault_key_id(&key_dir, &plaintext, self.secret_vault.as_ref()) {
-            backfill_vault_key_metadata(
-                &key_dir,
-                &existing_id,
-                (!name.is_empty()).then_some(name.as_str()),
-                &derived_public,
-                false,
-            );
-            let label = read_vault_key_label(&key_dir, &existing_id);
-            return ApiReply { status: 200, payload: json!({
-                "success": true,
-                "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{existing_id}"),
-                "label": label,
-                "deduplicated": true,
-            }) };
-        }
-        for _ in 0..8 {
-            let mut random = [0u8; 16];
-            rand::thread_rng().fill_bytes(&mut random);
-            let id = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
-            let encrypted_path = key_dir.join(format!("{id}.key.vault"));
-            match write_exclusive_private_file(&encrypted_path, &encrypted) {
-                Ok(()) => {}
-                Err(linscp_platform::PlatformError::AlreadyExists(_)) => continue,
-                Err(error) => {
-                    let _ = std::fs::remove_file(&encrypted_path);
-                    return api_error(500, error.to_string());
-                }
-            }
-            let label = derive_vault_key_label(&name, &derived_public, &id);
-            let label_path = key_dir.join(format!("{id}.label"));
-            match write_exclusive_private_file(&label_path, label.as_bytes()) {
-                Ok(()) => {}
-                Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
-                    let _ = std::fs::remove_file(&encrypted_path);
-                    continue;
-                }
-                Err(error) => {
-                    let _ = std::fs::remove_file(&encrypted_path);
-                    return api_error(500, error.to_string());
-                }
-            }
-            if !derived_public.is_empty() {
-                let public_path = key_dir.join(format!("{id}.pub"));
-                match write_exclusive_private_file(&public_path, derived_public.as_bytes()) {
-                    Ok(()) => {}
-                    Err(linscp_platform::PlatformError::AlreadyExists(_)) => {
-                        let _ = std::fs::remove_file(&label_path);
-                        let _ = std::fs::remove_file(&encrypted_path);
-                        continue;
-                    }
-                    Err(error) => {
-                        let _ = std::fs::remove_file(&public_path);
-                        let _ = std::fs::remove_file(&label_path);
-                        let _ = std::fs::remove_file(&encrypted_path);
-                        return api_error(500, error.to_string());
-                    }
-                }
-            }
-            return ApiReply { status: 200, payload: json!({
-                "success": true,
-                "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{id}"),
-                "label": label,
-            }) };
-        }
-        api_error(500, "Cannot allocate a unique encrypted SSH key file.")
     }
 
     /* A tab's `connected` said that its last answer had come back, and nothing
@@ -6152,463 +5829,6 @@ impl CommanderService {
         self.queue.set_xml_log_path(resolved_xml);
         { let mut g = self.state.lock().expect("m"); g.preferences = parsed.clone(); }
         ApiReply{ status: 200, payload: json!({"success": true, "preferences": parsed})}
-    }
-
-    // Full backup data crosses IPC only as an authenticated encrypted envelope.
-    // The GUI uses a smaller bound than the engine to limit WebView allocations.
-    /// The exclusive configuration-activity permit must be held when calling
-    /// this: it prevents IPC enqueue/retry and new connections between the
-    /// check and the subsequent restore. Background work itself is tracked by
-    /// the queue until its cleanup has finished.
-    fn ensure_full_restore_quiescent(&self) -> Result<(), String> {
-        if self.queue.has_unfinished_work() {
-            return Err("Finish or cancel all queued transfers and synchronization jobs before restoring.".into());
-        }
-        let state = self.state.lock().map_err(|_| "Configuration state is unavailable.".to_string())?;
-        if state.tabs.values().any(|tab| tab.connected && !tab.is_local)
-            || !state.pending_connections.is_empty()
-            || !state.challenges.is_empty()
-            || !state.auto_inflight.is_empty()
-            || !state.x2go_pending.is_empty()
-            || !state.x2go.is_empty()
-            || !state.terminals.summaries().is_empty()
-        {
-            return Err("Disconnect remote sessions, close terminals, and wait for connection attempts to finish before restoring.".into());
-        }
-        Ok(())
-    }
-
-    fn execute_full_backup_restore(
-        &self,
-        bundle: &linscp_engine::backup::BackupBundle,
-    ) -> Result<(), ApiReply> {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        if let Err(error) = self.config_lock.lock().expect("config lock mutex").as_ref() {
-            return Err(api_error(503, error));
-        }
-        let cfg = self.config_root();
-        match self.secret_vault.load_master_key(&cfg) {
-            Ok(Some(_)) => {}
-            Ok(None) => return Err(api_error(423, "Unlock the local vault before restoring a full backup.")),
-            Err(error) => return Err(api_error(500, error.to_string())),
-        }
-        if let Err(error) = self.ensure_full_restore_quiescent() {
-            return Err(api_error(409, error));
-        }
-        let restore_result = {
-            let lock_guard = self.config_lock.lock().expect("config lock mutex");
-            let lock = match lock_guard.as_ref() {
-                Ok(lock) => lock,
-                Err(error) => return Err(api_error(503, error)),
-            };
-            linscp_engine::backup::import_backup_transactional(&cfg, bundle, self.secret_vault.as_ref(), lock)
-        };
-        match restore_result {
-            Ok(()) => {
-                let preferences = PreferencesStore::load(&cfg).unwrap_or_default();
-                self.queue.clear_finished();
-                {
-                    let mut state = self.state.lock().expect("state mutex");
-                    state.preferences = preferences;
-                    let removed_tabs: Vec<u64> = state
-                        .tabs
-                        .iter()
-                        .filter_map(|(id, tab)| (!tab.is_local).then_some(*id))
-                        .collect();
-                    for tab_id in removed_tabs {
-                        state.terminals.close_for_tab(tab_id);
-                        state.tabs.remove(&tab_id);
-                    }
-                    if state.active_tab_id.is_some_and(|id| !state.tabs.contains_key(&id)) {
-                        state.active_tab_id = state.tabs.keys().min().copied();
-                    }
-                    state.challenges.clear();
-                    state.pending_sites.clear();
-                    state.auto_pending.clear();
-                    state.auto_retry_at.clear();
-                    state.auto_suspended.clear();
-                    let live: std::collections::BTreeSet<u64> = state.tabs.keys().copied().collect();
-                    state.monitors.retain(&live);
-                }
-                let stale_temp_dir = cfg.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
-                let _ = std::fs::remove_dir_all(stale_temp_dir);
-                Ok(())
-            }
-            Err(error) => {
-                if !matches!(linscp_engine::backup::restore_recovery_required(&cfg), Ok(false)) {
-                    self.recovery_gate.store(true, std::sync::atomic::Ordering::Release);
-                    let _ = self.secret_vault.lock();
-                    return Err(api_error(503, error));
-                }
-                Err(api_error(400, error))
-            }
-        }
-    }
-
-    fn handle_full_backup_import(&self, mut body: Value) -> ApiReply {
-        const MAX_BACKUP: usize = 16 * 1024 * 1024;
-        const MAX_ENCRYPTED: usize = MAX_BACKUP + 64;
-        let result = (|| -> Result<(), ApiReply> {
-            if body.get("confirm_replace").and_then(Value::as_bool) != Some(true) {
-                return Err(api_error(400, "Confirm replacing current configuration before restoring a full backup."));
-            }
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
-            if encoded.is_empty() {
-                return Err(api_error(400, "Choose a full backup file first."));
-            }
-            if encoded.len() > ((MAX_ENCRYPTED + 2) / 3) * 4 {
-                return Err(api_error(400, "Full backups are limited to 16 MiB in the GUI."));
-            }
-            let decoded = zeroize::Zeroizing::new(
-                BASE64_STD
-                    .decode(encoded.as_bytes())
-                    .map_err(|_| api_error(400, "Invalid backup file encoding."))?,
-            );
-            if decoded.len() > MAX_ENCRYPTED {
-                return Err(api_error(400, "Full backups are limited to 16 MiB in the GUI."));
-            }
-            let bundle = linscp_engine::backup::open_encrypted_backup(&decoded, password)
-                .map_err(|error| api_error(400, error))?;
-            self.execute_full_backup_restore(&bundle)
-        })();
-        if let Some(Value::String(password)) = body.get_mut("password") {
-            zeroize::Zeroize::zeroize(password);
-        }
-        if let Some(Value::String(encoded)) = body.get_mut("data_base64") {
-            zeroize::Zeroize::zeroize(encoded);
-        }
-        match result {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(reply) => reply,
-        }
-    }
-
-    fn exec_cli_backup_import(&self, line: &str) -> ApiReply {
-        use std::io::Read;
-        const MAX_CLI_BACKUP: usize = 64 * 1024 * 1024 + 64;
-        let reply_err = |msg: String| ApiReply {
-            status: 200,
-            payload: json!({"success": false, "stdout": "", "stderr": format!("{msg}\n"), "exit_code": 1}),
-        };
-        let tokens = match linscp_engine::script_params::tokenize_script_line(line.trim()) {
-            Ok(tokens) => tokens,
-            Err(error) => return reply_err(error),
-        };
-        if tokens.len() != 3 {
-            return reply_err("Syntax: backup export <file> | import <file>.".into());
-        }
-        let password = match std::env::var("LINSCP_BACKUP_PASSWORD") {
-            Ok(value) => zeroize::Zeroizing::new(value),
-            Err(_) => return reply_err("Set LINSCP_BACKUP_PASSWORD to an independent backup password (12 or more bytes).".into()),
-        };
-        let expanded = PathBuf::from(linscp_platform::terminal::expand_tilde(&tokens[2]));
-        let file = match std::fs::File::open(&expanded) {
-            Ok(file) => file,
-            Err(error) => return reply_err(format!("Cannot restore backup from '{}': {error}", tokens[2])),
-        };
-        let mut bytes = zeroize::Zeroizing::new(Vec::new());
-        if let Err(error) = file.take(MAX_CLI_BACKUP as u64 + 1).read_to_end(&mut bytes) {
-            return reply_err(format!("Cannot restore backup from '{}': {error}", tokens[2]));
-        }
-        if bytes.len() > MAX_CLI_BACKUP {
-            return reply_err(format!("Cannot restore backup from '{}': Backup exceeds size limit", tokens[2]));
-        }
-        let bundle = match linscp_engine::backup::open_encrypted_backup(&bytes, &password) {
-            Ok(bundle) => bundle,
-            Err(error) => return reply_err(format!("Cannot restore backup from '{}': {error}", tokens[2])),
-        };
-        match self.execute_full_backup_restore(&bundle) {
-            Ok(()) => ApiReply {
-                status: 200,
-                payload: json!({
-                    "success": true,
-                    "stdout": format!("Full backup restored from '{}'.\n", tokens[2]),
-                    "stderr": "",
-                    "exit_code": 0,
-                }),
-            },
-            Err(reply) => {
-                let message = reply
-                    .payload
-                    .get("error")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Restore failed.");
-                reply_err(format!("Cannot restore backup from '{}': {message}", tokens[2]))
-            }
-        }
-    }
-
-    fn write_backup_export_to_dir(&self, save_dir: &str, filename: &str, bytes: &[u8]) -> Result<String, String> {
-        let checked_dir = check_local_pane_directory(save_dir, "save_dir")?;
-        let dest = resolve_contained(&checked_dir, filename)?;
-        if is_saf_path(&dest) {
-            self.local_fs
-                .write_bytes_atomic(&dest, bytes)
-                .map_err(|e| e.to_string())?;
-        } else {
-            linscp_platform::write_owner_only_file_atomic(Path::new(&dest), bytes)
-                .map_err(|e| e.to_string())?;
-        }
-        Ok(dest)
-    }
-
-    fn handle_full_backup_export(&self, mut body: Value) -> ApiReply {
-        const MAX_BACKUP: usize = 16 * 1024 * 1024;
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let cfg = self.config_root();
-        let result = (|| -> Result<Value, String> {
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            if self.secret_vault.load_master_key(&cfg).map_err(|e| e.to_string())?.is_none() {
-                return Err("Unlock the local vault before using a full backup.".into());
-            }
-            let bundle = linscp_engine::backup::export_backup(&cfg, self.secret_vault.as_ref())?;
-            let bytes = linscp_engine::backup::seal_backup(&bundle, password)?;
-            if bytes.len() > MAX_BACKUP { return Err("Full backups are limited to 16 MiB in the GUI.".into()); }
-            let filename = format!("linscp-full-backup-{}.lscpbak", unix_now_seconds());
-            let saved_path = match body.get("save_dir").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-                Some(dir) => Some(self.write_backup_export_to_dir(dir, &filename, &bytes)?),
-                None => None,
-            };
-            let mut resp = json!({
-                "success": true,
-                "data_base64": BASE64_STD.encode(&bytes),
-                "filename": filename,
-            });
-            if let Some(saved) = saved_path {
-                resp["saved_path"] = json!(saved);
-            }
-            Ok(resp)
-        })();
-        if let Some(Value::String(password)) = body.get_mut("password") {
-            zeroize::Zeroize::zeroize(password);
-        }
-        match result {
-            Ok(payload) => ApiReply { status: 200, payload },
-            Err(error) => api_error(400, error),
-        }
-    }
-
-    fn handle_export_offlineotp_vault(&self, mut body: Value) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let result = (|| -> Result<ApiReply, ApiReply> {
-            let plain_text = body.get("plain_text").and_then(Value::as_bool).unwrap_or(false);
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            if plain_text {
-                return Err(api_error(400, "Plain-text backup exports are disabled."));
-            }
-            if password.is_empty() {
-                return Err(api_error(400, "Choose a non-empty backup password."));
-            }
-            // Optional selection: an explicit array of saved-session names. When
-            // present, only those sites (and the SSH keys they reference) are
-            // exported; an empty array exports nothing and says so.
-            let selection = parse_name_selection(body.get("sessions"))
-                .map_err(|error| api_error(400, &error))?;
-            let cfg = self.state.lock().expect("m").config_root.clone();
-            let store = SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref())
-                .map_err(|error| api_error(500, &error))?;
-            let include_vault_keys = body.get("include_vault_keys").and_then(Value::as_bool).unwrap_or(selection.is_none());
-            if let Some(set) = selection.as_ref() {
-                if set.is_empty() && !include_vault_keys {
-                    return Err(api_error(400, "Select at least one session to export."));
-                }
-                for name in body
-                    .get("sessions")
-                    .and_then(Value::as_array)
-                    .map(|items| items.iter().filter_map(Value::as_str).collect::<Vec<_>>())
-                    .unwrap_or_default()
-                {
-                    if store.find(name).is_none() {
-                        return Err(api_error(400, &format!("Saved session '{name}' was not found.")));
-                    }
-                }
-            }
-            let entries = offlineotp_entries_from_sessions(
-                &store,
-                &cfg,
-                self.secret_vault.as_ref(),
-                selection.as_ref(),
-                include_vault_keys,
-            )
-            .map_err(|error| api_error(400, &error))?;
-            let unix_seconds = unix_now_seconds();
-            let (data, filename) = offlineotp_vault::seal(&entries, password)
-                .map(|data| (data, offlineotp_vault::timestamped_filename(unix_seconds)))
-                .map_err(|error| api_error(400, &error))?;
-            let saved_path = match body.get("save_dir").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty()) {
-                Some(dir) => Some(self.write_backup_export_to_dir(dir, &filename, &data).map_err(|error| api_error(400, &error))?),
-                None => None,
-            };
-            let mut payload = json!({
-                "success": true,
-                "filename": filename,
-                "data_base64": BASE64_STD.encode(&data),
-                "entry_count": entries.len(),
-                "plain_text": plain_text,
-            });
-            if let Some(saved) = saved_path {
-                payload["saved_path"] = json!(saved);
-            }
-            Ok(ApiReply {
-                status: 200,
-                payload,
-            })
-        })();
-        zeroize_json_secret_fields(&mut body, &["password"]);
-        match result {
-            Ok(reply) => reply,
-            Err(reply) => reply,
-        }
-    }
-
-    /// Reads the backup the user picked and lists the sessions it contains,
-    /// so the page can show a tick-list without importing anything. Never
-    /// returns secret material.
-    fn handle_scan_key_session_backup(&self, mut body: Value) -> ApiReply {
-        let result = (|| -> Result<ApiReply, ApiReply> {
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
-            if encoded.len() > 22 * 1024 * 1024 {
-                return Err(api_error(413, "The key/session backup exceeds the 16 MiB limit."));
-            }
-            let bytes = zeroize::Zeroizing::new(
-                BASE64_STD
-                    .decode(encoded.as_bytes())
-                    .map_err(|_| api_error(400, "The selected file is not valid base64 data."))?,
-            );
-            let fingerprint = linscp_crypto::digests::sha256_hex(&bytes);
-            let encrypted = offlineotp_vault::is_encrypted_backup(&bytes);
-            if encrypted && password.is_empty() {
-                return Err(api_error(400, "Enter the password used to encrypt this backup."));
-            }
-            let imported = open_key_session_backup(&bytes, password, encrypted)
-                .map_err(|error| api_error(400, &error))?;
-            let ignored_entries = imported.ignored_entries;
-            let cfg = self.state.lock().expect("m").config_root.clone();
-            let existing_names: std::collections::HashSet<String> =
-                SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref())
-                    .map(|store| store.sites().iter().map(|site| site.name.clone()).collect())
-                    .unwrap_or_default();
-            let planned = plan_offlineotp_import(imported, None)
-                .map_err(|error| api_error(400, &error))?;
-            let entries: Vec<Value> = planned
-                .sites
-                .iter()
-                .map(|candidate| {
-                    json!({
-                        "name": candidate.site.name,
-                        "exists_in_store": existing_names.contains(&candidate.site.name),
-                        "protocol": candidate.site.protocol.as_str(),
-                        "host": candidate.site.host,
-                        "port": candidate.site.port,
-                        "username": candidate.site.username,
-                        "local_dir": candidate.site.local_directory,
-                        "other_local_dir": candidate.site.extra_fields.get("other_local_dir").cloned().unwrap_or_default(),
-                        "has_password": candidate.site.password.as_ref().is_some_and(|p| !p.is_empty())
-                            || candidate.site.proxy_password.as_ref().is_some_and(|p| !p.is_empty())
-                            || (candidate.site.tunnel.enabled
-                                && candidate.site.tunnel.password.as_ref().is_some_and(|p| !p.is_empty())),
-                        "has_key_passphrase": candidate.site.key_passphrase.as_ref().is_some_and(|p| !p.is_empty())
-                            || (candidate.site.tunnel.enabled
-                                && candidate.site.tunnel_passphrase.as_ref().is_some_and(|p| !p.is_empty())),
-                        "has_ssh_key": candidate.ssh_key.is_some() || candidate.tunnel_key.is_some(),
-                    })
-                })
-                .collect();
-            Ok(ApiReply {
-                status: 200,
-                payload: json!({
-                    "success": true,
-                    "encrypted": encrypted,
-                    "fingerprint": fingerprint,
-                    "entries": entries,
-                    "entry_count": entries.len(),
-                    "vault_key_count": planned.vault_keys.len(),
-                    "ignored_entries": ignored_entries,
-                }),
-            })
-        })();
-        zeroize_json_secret_fields(&mut body, &["password", "data_base64"]);
-        match result {
-            Ok(reply) => reply,
-            Err(reply) => reply,
-        }
-    }
-
-    fn handle_import_offlineotp_vault(&self, mut body: Value) -> ApiReply {
-        let _guard = self.session_key_lock.lock().expect("session key lock");
-        let result = (|| -> Result<ApiReply, ApiReply> {
-            let password = body.get("password").and_then(Value::as_str).unwrap_or("");
-            let encoded = body.get("data_base64").and_then(Value::as_str).unwrap_or("");
-            if encoded.len() > 22 * 1024 * 1024 {
-                return Err(api_error(413, "The key/session backup exceeds the 16 MiB limit."));
-            }
-            let bytes = zeroize::Zeroizing::new(
-                BASE64_STD
-                    .decode(encoded.as_bytes())
-                    .map_err(|_| api_error(400, "The selected file is not valid base64 data."))?,
-            );
-            let actual_fingerprint = linscp_crypto::digests::sha256_hex(&bytes);
-            if let Some(expected_fingerprint) = body
-                .get("fingerprint")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                if expected_fingerprint != actual_fingerprint {
-                    return Err(api_error(
-                        409,
-                        "The selected backup file changed since it was read. Read the backup again before importing.",
-                    ));
-                }
-            }
-            // Encrypted backups require their password; plain-text backups carry
-            // no envelope and need none. The two are told apart by the magic
-            // marker, never by the file extension.
-            let encrypted = offlineotp_vault::is_encrypted_backup(&bytes);
-            if encrypted && password.is_empty() {
-                return Err(api_error(400, "Enter the password used to encrypt this backup."));
-            }
-            let imported = open_key_session_backup(&bytes, password, encrypted)
-                .map_err(|error| api_error(400, &error))?;
-            let selection = parse_name_selection(body.get("sessions"))
-                .map_err(|error| api_error(400, &error))?;
-            if matches!(selection.as_ref(), Some(set) if set.is_empty())
-                && plan_offlineotp_import(imported.clone(), None).map_err(|error| api_error(400, error))?.vault_keys.is_empty() {
-                return Err(api_error(400, "Select at least one session to import."));
-            }
-            let replace = body.get("replace").and_then(Value::as_bool).unwrap_or(false);
-            let cfg = self.state.lock().expect("m").config_root.clone();
-            // `replace` never discards saved sessions: the store is always merged,
-            // and same-named sessions are overwritten only for names present in
-            // the backup and selected for import.
-            let existing = SessionStore::load_from_dir(&cfg, self.secret_vault.as_ref())
-                .map_err(|error| api_error(500, &error))?;
-            let (count, skipped, ignored) = import_offlineotp_entries(
-                &cfg,
-                existing,
-                imported,
-                self.secret_vault.as_ref(),
-                selection.as_ref(),
-                replace,
-            )
-            .map_err(|error| api_error(400, &error))?;
-            Ok(ApiReply {
-                status: 200,
-                payload: json!({
-                    "success": true,
-                    "imported": count,
-                    "skipped_existing": skipped,
-                    "ignored_entries": ignored,
-                }),
-            })
-        })();
-        zeroize_json_secret_fields(&mut body, &["password", "data_base64"]);
-        match result {
-            Ok(reply) => reply,
-            Err(reply) => reply,
-        }
     }
 
     fn handle_list_sessions(&self) -> ApiReply {
@@ -11864,7 +11084,7 @@ fn find_existing_vault_key_id(
         let path = entry.path();
         let Some(file_name) = path.file_name().and_then(|name| name.to_str()) else { continue };
         let Some(id) = file_name.strip_suffix(".key.vault") else { continue };
-        if id.len() == 32 && id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if valid_vault_key_id(id) {
             candidate_ids.push(id.to_string());
         }
     }
@@ -12070,7 +11290,7 @@ fn read_tls_blob_for_export(
     label: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(id) = path_or_ref.strip_prefix(LOCAL_VAULT_TLS_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err(format!("Saved {label} reference is invalid."));
         }
         let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -12447,49 +11667,22 @@ fn offlineotp_entries_from_sessions(
     }
     if include_vault_keys {
         let dir = config_root.join("keys");
-        let mut ids = Vec::new();
-        match std::fs::symlink_metadata(&dir) {
-            Ok(metadata) if metadata.file_type().is_dir() => {},
-            Ok(_) => return Err("Invalid vault key directory.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot inspect vault key directory: {error}")),
-        }
-        match std::fs::read_dir(&dir) {
-            Ok(items) => for item in items {
-                let item = item.map_err(|error| format!("Cannot list vault keys: {error}"))?;
-                let name = item.file_name();
-                let name = name.to_str().ok_or("Invalid vault key filename")?;
-                if let Some(id) = name.strip_suffix(".key.vault") {
-                    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())
-                        || !item.file_type().map_err(|e| e.to_string())?.is_file() {
-                        return Err("Invalid encrypted SSH key file in vault.".into());
-                    }
-                    ids.push(id.to_owned());
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot list vault keys: {error}")),
-        }
-        ids.sort();
-        let private_ids: std::collections::HashSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let ids = list_vault_key_ids(&dir, ".key.vault", 2000)?;
+        let all_public_ids = list_vault_key_ids(&dir, ".pub", 4000)?;
+        let private_ids: HashMap<String, &str> = ids.iter().map(|id| (id.to_ascii_lowercase(), id.as_str())).collect();
         let mut public_ids = Vec::new();
-        if let Ok(items) = std::fs::read_dir(&dir) {
-            for item in items {
-                let item = item.map_err(|e| format!("Cannot list vault keys: {e}"))?;
-                let name = item.file_name();
-                let name = name.to_str().ok_or("Invalid vault key filename")?;
-                let Some(id) = name.strip_suffix(".pub") else { continue };
-                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || !item.file_type().map_err(|e| e.to_string())?.is_file() {
-                    return Err("Invalid vault SSH public key file.".into());
-                }
-                if !private_ids.contains(&id.to_ascii_lowercase()) { public_ids.push(id.to_string()); }
+        for id in all_public_ids {
+            if let Some(private_id) = private_ids.get(&id.to_ascii_lowercase()) {
+                if *private_id != id.as_str() { return Err("Vault public key ID differs in case from its private key.".into()); }
+            } else {
+                public_ids.push(id);
             }
         }
-        public_ids.sort();
         for id in public_ids {
             let (public_key, _) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"), config_root, secret_vault)?;
+            let label = read_export_vault_key_label(&dir, &id, &public_key)?;
             entries.push(CredentialEntry::SshKey(SshKeyRecord {
-                label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{}", read_vault_key_label(&dir, &id)),
+                label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{label}"),
                 public_key, private_key: String::new(), host: String::new(), port: 0,
                 username: String::new(), password: String::new(),
             }));
@@ -12497,17 +11690,7 @@ fn offlineotp_entries_from_sessions(
         for id in ids {
             let (public_key, private_key) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_KEY_PREFIX}{id}"), config_root, secret_vault)?;
             if private_key.is_empty() { return Err("Saved vault SSH key is empty.".into()); }
-            let label_path = dir.join(format!("{id}.label"));
-            match std::fs::symlink_metadata(&label_path) {
-                Ok(meta) if meta.file_type().is_file() && meta.len() <= 512 => {
-                    let label = std::fs::read_to_string(&label_path).map_err(|e| format!("Cannot read vault key label: {e}"))?;
-                    if sanitize_vault_key_label(&label) != label { return Err("Vault SSH key label is invalid.".into()); }
-                },
-                Ok(_) => return Err("Invalid vault SSH key label file.".into()),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-                Err(error) => return Err(format!("Cannot read vault key label: {error}")),
-            }
-            let label = read_vault_key_label(&dir, &id);
+            let label = read_export_vault_key_label(&dir, &id, &public_key)?;
             entries.push(CredentialEntry::SshKey(SshKeyRecord {
                 label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{label}"),
                 public_key, private_key, host: String::new(), port: 0,
@@ -12525,6 +11708,19 @@ fn offlineotp_entries_from_sessions(
     Ok(entries)
 }
 
+// Exported labels must be read with the same bounded, no-follow policy as
+// key metadata; the picker can continue to use its best-effort display label.
+fn read_export_vault_key_label(dir: &Path, id: &str, public_key: &str) -> Result<String, String> {
+    match read_vault_key_file(&dir.join(format!("{id}.label")), 512)? {
+        Some(bytes) => {
+            let label = String::from_utf8(bytes).map_err(|_| "Vault SSH key label is not UTF-8.")?;
+            if sanitize_vault_key_label(&label) != label { return Err("Vault SSH key label is invalid.".into()); }
+            if label.is_empty() { Ok(derive_vault_key_label("", public_key, id)) } else { Ok(label) }
+        }
+        None => Ok(derive_vault_key_label("", public_key, id)),
+    }
+}
+
 fn read_offlineotp_keypair(
     path: &str,
     config_root: &Path,
@@ -12532,23 +11728,12 @@ fn read_offlineotp_keypair(
 ) -> Result<(String, String), String> {
     const LIMIT: u64 = 32 * 1024;
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
         }
         let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
-        let metadata = std::fs::symlink_metadata(&encrypted_path)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        if !metadata.file_type().is_file() { return Err("Invalid encrypted SSH key file.".into()); }
-        if metadata.len() > 1024 * 1024 + 64 {
-            return Err("Encrypted SSH key file is unexpectedly large.".to_string());
-        }
-        use std::io::Read as _;
-        let file = linscp_platform::open_private_file_no_follow(&encrypted_path)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        let mut encrypted = Vec::new();
-        file.take(1024 * 1024 + 65).read_to_end(&mut encrypted)
-            .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-        if encrypted.len() > 1024 * 1024 + 64 { return Err("Encrypted SSH key file is unexpectedly large.".into()); }
+        let encrypted = read_vault_key_file(&encrypted_path, 1024 * 1024 + 64)?
+            .ok_or("Saved encrypted SSH key is no longer in the vault.")?;
         let private = secret_vault.open_local_blob(&encrypted)
             .map_err(|error| error.to_string())?;
         if private.len() as u64 > LIMIT {
@@ -12557,21 +11742,20 @@ fn read_offlineotp_keypair(
         let private = String::from_utf8(private.to_vec())
             .map_err(|_| "SSH private key is not UTF-8 text.".to_string())?;
         let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        match std::fs::symlink_metadata(&public_path) {
-            Ok(meta) if meta.file_type().is_file() => {},
-            Ok(_) => return Err("Invalid vault SSH public key file.".into()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
-            Err(error) => return Err(format!("Cannot inspect vault SSH public key: {error}")),
-        }
-        let public = read_bounded_key_optional(&public_path, LIMIT)?;
+        let public = match read_vault_key_file(&public_path, LIMIT as usize)? {
+            Some(bytes) => String::from_utf8(bytes).map_err(|_| "Vault SSH public key is not UTF-8 text.")?,
+            None => String::new(),
+        };
         return Ok((public, private));
     }
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_PUBLIC_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved SSH public key reference is invalid.".to_string());
         }
         let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        let public = read_bounded_key(&public_path, LIMIT)?;
+        let public = String::from_utf8(read_vault_key_file(&public_path, LIMIT as usize)?
+            .ok_or("Saved SSH public key is no longer in the vault.")?)
+            .map_err(|_| "Vault SSH public key is not UTF-8 text.")?;
         if public.trim().is_empty() {
             return Err("Saved SSH public key contains no key text.".to_string());
         }
@@ -12783,7 +11967,7 @@ fn plan_offlineotp_import(
             CredentialEntry::SshKey(mut key) => {
                 if let Some(rest) = key.label.strip_prefix(OFFLINEOTP_VAULT_KEY_PREFIX) {
                     let (id, label) = rest.split_once(':').ok_or("Invalid standalone vault key label")?;
-                    if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())
+                    if !valid_vault_key_id(id)
                         || label.is_empty() || (key.private_key.is_empty() && key.public_key.is_empty())
                         || !key.host.is_empty() || !key.username.is_empty() || !key.password.is_empty() {
                         return Err("Invalid standalone vault key entry.".into());
@@ -12908,7 +12092,7 @@ fn import_offlineotp_entries(
                             let item = item.map_err(|e| e.to_string())?;
                             let name = item.file_name();
                             let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".pub")) else { continue };
-                            if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                            if valid_vault_key_id(id)
                                 && item.file_type().map_err(|e| e.to_string())?.is_file()
                                 && read_bounded_key(&item.path(), 32 * 1024)? == key.public_key {
                                 found = true;
@@ -13174,7 +12358,7 @@ fn protect_stored_ssh_keys(
     });
     for field in ["ca_certificate_file", "tls_certificate_file", "tls_certificate_key_file"] {
         if let Some(id) = site.extra_fields.get(field).and_then(|v| v.strip_prefix(LOCAL_VAULT_TLS_PREFIX)) {
-            if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            if !valid_vault_key_id(id) {
                 return Err(format!("Saved vault TLS reference in '{field}' is invalid."));
             }
             let blob = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -13199,7 +12383,7 @@ fn protect_one_ssh_key(
     created: &mut Vec<PathBuf>,
 ) -> Result<String, String> {
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
         }
         let key = config_root.join("keys").join(format!("{id}.key.vault"));
@@ -13315,7 +12499,7 @@ fn find_existing_vault_tls_id(
         let name = entry.file_name();
         let Some(name_str) = name.to_str() else { continue; };
         let Some(id) = name_str.strip_suffix(".tls.vault") else { continue; };
-        if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        if !valid_vault_key_id(id) {
             continue;
         }
         let Ok(meta) = entry.metadata() else { continue; };
@@ -13398,7 +12582,7 @@ fn materialize_one_vault_tls_blob(
 ) -> Result<(), String> {
     let Some(reference) = raw_fields.get(field).cloned() else { return Ok(()); };
     let Some(id) = reference.strip_prefix(LOCAL_VAULT_TLS_PREFIX) else { return Ok(()); };
-    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_vault_key_id(id) {
         return Err(format!("Saved vault TLS reference in '{field}' is invalid."));
     }
     let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
@@ -13441,7 +12625,7 @@ fn materialize_one_vault_key(
 ) -> Result<(), String> {
     let Some(reference) = keyfile.as_deref() else { return Ok(()); };
     let Some(id) = reference.strip_prefix(LOCAL_VAULT_KEY_PREFIX) else { return Ok(()); };
-    if id.len() != 32 || !id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+    if !valid_vault_key_id(id) {
         return Err("Saved encrypted SSH key reference is invalid.".to_string());
     }
     let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
@@ -19188,6 +18372,35 @@ mod tests {
         let blocked = service.dispatch(request("/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
         assert_eq!(blocked.status, 409, "{}", blocked.payload);
         assert!(blocked.payload["error"].as_str().unwrap().contains("copy"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn both_backup_formats_reject_symlinked_vault_key_metadata() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let service = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        unlock_for_test(&service);
+        let imported = service.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/vault/keys/import".into(), body: json!({"name": "fixture", "private_key": "fixture private key"}) });
+        assert_eq!(imported.status, 200);
+        let id = imported.payload["reference"].as_str().unwrap().strip_prefix(LOCAL_VAULT_KEY_PREFIX).unwrap();
+        let dir = tmp.path().join("keys");
+        let target = tmp.path().join("outside");
+        std::fs::write(&target, "outside value").unwrap();
+        let public = dir.join(format!("{id}.pub"));
+        let label = dir.join(format!("{id}.label"));
+        let export = |path: &str| service.dispatch(ApiEnvelope { method: "POST".into(), path: path.into(), body: json!({"password": "backup-password", "include_vault_keys": true}) });
+        assert_eq!(export("/api/vault/export").status, 200);
+        assert_eq!(export("/api/backup/export").status, 200);
+        symlink(&target, &public).unwrap();
+        assert_ne!(export("/api/vault/export").status, 200);
+        assert_ne!(export("/api/backup/export").status, 200);
+        std::fs::remove_file(&public).unwrap();
+        std::fs::remove_file(&label).unwrap();
+        symlink(&target, &label).unwrap();
+        assert_ne!(export("/api/vault/export").status, 200);
+        assert_ne!(export("/api/backup/export").status, 200);
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "outside value");
     }
 
     #[test]

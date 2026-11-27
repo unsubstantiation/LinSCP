@@ -90,6 +90,9 @@ async function run() {
       check('translated title', doc.querySelector('title').textContent.includes('Transferencia segura'));
       check('translated ARIA', doc.querySelector('#localPane').getAttribute('aria-label') === 'Panel local');
       check('translated toolbar', doc.querySelector('[onclick="openSiteManager()"] .tool-label').textContent === 'Nueva sesión');
+      await w.openKeySessionExport();
+      check('extracted key/session dialog is translated', doc.querySelector('#keyExportList').textContent.includes('No hay sesiones guardadas para exportar.'));
+      w.closeModal('keySessionExportModal');
       check('session names remain literal', doc.querySelector('#statusBadge').textContent === 'Conectado: Delete');
       check('filenames remain literal', doc.querySelector('#localFileList').textContent.includes('Delete'));
       check('filenames not translated', !doc.querySelector('#localFileList').textContent.includes('Eliminar'));

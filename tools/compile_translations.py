@@ -62,6 +62,7 @@ def generate(directory):
 
 
 GUI_PAGE = ROOT / 'source/gui/web/index.html'
+GUI_SCRIPTS = [ROOT / 'source/gui/web/key-session.js']
 GUI_DIRECTORY = ROOT / 'source/gui/locales'
 BEGIN_GUI = '  /* BEGIN GENERATED GUI CATALOGS */'
 END_GUI = '  /* END GENERATED GUI CATALOGS */'
@@ -101,13 +102,13 @@ class StaticMessages(HTMLParser):
             self.messages.add(text.strip())
 
 
-def check_gui_coverage(catalogs, source):
+def check_gui_coverage(catalogs, source, scripts=()):
     parser = StaticMessages()
     parser.feed(source)
     missing = parser.messages - catalogs['en'].keys()
     # Named t() calls are literal message keys; dynamic backend enum values
     # are intentionally separate from these source-owned UI messages.
-    stripped = source.split(BEGIN_GUI)[0] + source.split(END_GUI)[1]
+    stripped = source.split(BEGIN_GUI)[0] + source.split(END_GUI)[1] + '\n' + '\n'.join(scripts)
     for literal in re.findall(r"\bt\((\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*')", stripped):
         key = ast.literal_eval(literal)
         if key not in catalogs['en']:
@@ -280,20 +281,25 @@ def command_help_messages():
     return messages
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--check', action='store_true')
-    args = parser.parse_args()
+def render_outputs():
+    """Validate sources and render embedded tables without writing files."""
     catalogs = load_catalogs(GUI_DIRECTORY)
     page = GUI_PAGE.read_text(encoding='utf-8')
-    check_gui_coverage(catalogs, page)
+    check_gui_coverage(catalogs, page, [path.read_text(encoding='utf-8') for path in GUI_SCRIPTS])
     check_cli_coverage(load_catalogs(ROOT / 'source/linux/locales'))
     outputs = {}
     # Pure-Rust migration: Translations.inc is C++-only; skip if absent.
     if OUTPUT.exists() or (ROOT / 'source/linux/Script.cpp').exists():
         outputs[OUTPUT] = generate(ROOT / 'source/linux/locales')
     outputs[GUI_PAGE] = gui_page(catalogs, page)
-    for path, text in outputs.items():
+    return outputs
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true')
+    args = parser.parse_args()
+    for path, text in render_outputs().items():
         if args.check:
             if not path.exists() or path.read_text(encoding='utf-8') != text:
                 parser.exit(1, 'Translation output is stale; run tools/compile_translations.py\n')

@@ -78,6 +78,15 @@ fs.copyFileSync(
 );
 const rawHtml = fs.readFileSync(path.join(legacyWebDir, 'index.html'), 'utf8').replace(/\r\n/g, '\n');
 
+// Inline the dialog controller so the shipped page remains a single HTML
+// asset, while the source page can load the same controller as a script.
+const keySessionTag = '<script src="key-session.js"></script>';
+if (rawHtml.split(keySessionTag).length !== 2) {
+  throw new Error('Expected exactly one key-session.js script in the source page');
+}
+const keySessionCode = fs.readFileSync(path.join(legacyWebDir, 'key-session.js'), 'utf8');
+if (/<\/script/i.test(keySessionCode)) throw new Error('key-session.js cannot contain an HTML script terminator');
+
 const anchor = '  async function api(url, options) {\n    options = options || {};';
 if (!rawHtml.includes(anchor)) {
   throw new Error('Expected api(url, options) entrypoint in source/gui/web/index.html');
@@ -141,8 +150,11 @@ const nativeShim = `  window.LinSCPTransport = window.LinSCPCore
 // reads the absence and prints no version line.
 const buildVersionLine = `window.LinSCPBuildVersion = ${JSON.stringify(BUILD_STAMP)};`;
 
+const pageScriptAnchor = '  <script>\n  // Catalog data is generated';
+if (rawHtml.split(pageScriptAnchor).length !== 2) throw new Error('Expected exactly one page script anchor');
 const distHtml = rawHtml
-  .replace('<script>', () => `<script>\n${buildVersionLine}\n${iifeCode}\n${editorIifeCode}</script>\n<script>`)
+  .replace(keySessionTag, () => `<script>\n${keySessionCode}\n</script>`)
+  .replace(pageScriptAnchor, () => `  <script>\n${buildVersionLine}\n${iifeCode}\n${editorIifeCode}</script>\n<script>\n  // Catalog data is generated`)
   .replace(anchor, nativeShim);
 
 fs.writeFileSync(path.join(distDir, 'index.html'), distHtml, 'utf8');
