@@ -3,8 +3,8 @@
 ## Supported languages and coverage
 
 English (`en`), Spanish (`es`), German (`de`) and French (`fr`) catalogs ship
-with the application. There are 457 CLI catalog entries and 1020 browser entries,
-including whole help messages and plural variants. They are embedded at build time; there are no
+with the application, including whole help messages and plural variants. They
+are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
 A catalog walker reports interface strings still answered in English so a new
 message cannot slip through untranslated. The language selector is filled from
@@ -104,9 +104,14 @@ machine protocol, parsed sync plans, progress reports or error handling.
    enforce this, check that each catalog's `-help` lists every option and
    command in the English order, and check that both confirmation hints
    offer one consistent yes letter.
-4. Run `python3 tools/compile_translations.py`. Commit the catalogs together
-   with `source/linux/Translations.inc` and the generated inline catalog block
-   in `source/gui/web/index.html`. Do not hand-edit generated blocks.
+4. Run `python3 tools/update_translations.py` from the repository root. This
+   validates both source catalog sets and regenerates the inline GUI catalog
+   in `source/gui/web/index.html`, the unified `locales/*.json`, and the legacy
+   `source/linux/Translations.inc` only when that legacy output exists. Commit
+   the changed generated files with the source catalogs; do not edit generated
+   files by hand. Unexpected files in `locales/` are reported rather than deleted.
+   Validation happens before writes, but an I/O error during writing may still
+   leave partial output; fix the error and rerun the command.
 5. Run the tests below. CI also checks generated-output drift, untranslated
    static browser text, literal `t`/`tn` keys and literal CLI `Translate` keys.
 
@@ -149,16 +154,16 @@ Each catalog follows a few choices, so new messages stay consistent with it:
 ## Reproducible checks
 
 ```sh
-python3 tools/compile_translations.py --check   # fails if generated output is stale
+python3 tools/update_translations.py --check   # checks all outputs without writing
 python3 tools/tests/test_translations.py
 make -C source/linux check
 ```
 
-The browser tests in `source/gui/tests/` (`ClientTest.js`,
-`LocalizationTest.js`) need Node and `jsdom`, which is an optional test
-dependency. CMake registers them with CTest only when both are installed. The
-live SFTP suite needs `paramiko`. CI runs the drift check and the translation
-tests.
+Run `npm ci --prefix ui && npm test --prefix ui` to build and test the shared
+browser page, including the key/session dialog and localization workflows.
+CI runs the read-only drift check and translation tests. The lower-level
+`compile_translations.py` and `build_unified_locales.py` commands remain
+available, but each updates only part of the generated output.
 
 The Makefile, CMake, relocatable installs and Debian packages all embed the same
 translations, so none of them needs catalog files at runtime.

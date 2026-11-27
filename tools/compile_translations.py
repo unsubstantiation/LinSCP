@@ -281,10 +281,8 @@ def command_help_messages():
     return messages
 
 
-def main():
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--check', action='store_true')
-    args = parser.parse_args()
+def render_outputs():
+    """Validate sources and render embedded tables without writing files."""
     catalogs = load_catalogs(GUI_DIRECTORY)
     page = GUI_PAGE.read_text(encoding='utf-8')
     check_gui_coverage(catalogs, page, [path.read_text(encoding='utf-8') for path in GUI_SCRIPTS])
@@ -294,7 +292,14 @@ def main():
     if OUTPUT.exists() or (ROOT / 'source/linux/Script.cpp').exists():
         outputs[OUTPUT] = generate(ROOT / 'source/linux/locales')
     outputs[GUI_PAGE] = gui_page(catalogs, page)
-    for path, text in outputs.items():
+    return outputs
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--check', action='store_true')
+    args = parser.parse_args()
+    for path, text in render_outputs().items():
         if args.check:
             if not path.exists() or path.read_text(encoding='utf-8') != text:
                 parser.exit(1, 'Translation output is stale; run tools/compile_translations.py\n')
