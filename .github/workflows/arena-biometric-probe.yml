@@ -21,21 +21,7 @@ jobs:
           target: google_apis
           disable-animations: true
           script: |
-            adb shell locksettings set-pin 1234
-            sleep 3
-            adb shell input keyevent 224
-            adb shell input swipe 160 550 160 100 300
-            sleep 2
-            adb shell input text 1234
-            adb shell input keyevent 66
-            sleep 3
-            adb shell am start -a android.settings.FINGERPRINT_ENROLL
-            sleep 5
-            adb shell input text 1234
-            adb shell input keyevent 66
-            sleep 5
-            adb shell input tap 260 580
-            sleep 3
+            python3 tools/android_enroll_emulator_fingerprint.py > probe.log 2>&1 || { python3 -c "from pathlib import Path; print('::error::' + Path('probe.log').read_text()[-3500:].replace('%','%25').replace('\\n','%0A'))"; cat probe.log; exit 1; }
             adb shell uiautomator dump /sdcard/probe.xml
             adb exec-out cat /sdcard/probe.xml > probe.xml
             python3 -c "import xml.etree.ElementTree as E; r=E.parse('probe.xml'); print('::warning::' + str([(n.get('text'),n.get('content-desc'),n.get('bounds')) for n in r.iter('node') if n.get('text') or n.get('content-desc')]))"
