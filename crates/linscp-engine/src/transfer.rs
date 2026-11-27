@@ -528,7 +528,22 @@ async fn download_ordinary_resume(
     };
     let flushed = file.flush().await;
     drop(file);
-    let received = result.map_err(|e| e.to_string())?;
+    let received = match result {
+        Ok(received) => received,
+        Err(error) => {
+            let cancelled = flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst));
+            if partial.is_none() && !cancelled && flushed.is_ok()
+                && std::fs::metadata(&stage).is_ok_and(|m| m.len() > 0 && m.len() < info.size)
+            {
+                if let Some(ref path) = checkpoint {
+                    if linscp_platform::publish_no_replace(&stage, path).is_ok() {
+                        return Err(format!("{error}; a partial file was saved at '{}'.", path.display()));
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
+    };
     flushed.map_err(|e| format!("Cannot flush resume stage: {e}"))?;
     if offset.checked_add(received) != Some(info.size) {
         return Err("Resumed download length does not match the source metadata; the source was not deleted.".to_string());
