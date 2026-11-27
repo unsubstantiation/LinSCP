@@ -3367,12 +3367,15 @@
       "id": "security.gui-api-token",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView.",
+      "notes": "The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView. An idle packaged Linux GUI was checked via procfs in CI: it owned only its private loopback activation listener, whose record had private permissions; an HTTP request and a wrong activation token received no reply. This is a point-in-time process-level smoke, not proof about child processes, every runtime state, same-user access or Tauri IPC isolation.",
       "source": [
         "crates/linscp-tauri/src/lib.rs",
         "crates/linscp-service/src/lib.rs",
         "source/gui/web/index.html",
-        "tools/android_emulator_smoke.mjs"
+        "tools/android_emulator_smoke.mjs",
+        "tools/check_native_listeners.py",
+        "tools/tests/test_native_listeners.py",
+        ".github/workflows/debian-build.yml"
       ],
       "checks": {
         "gui": [
@@ -3384,7 +3387,7 @@
           "verifyAndroidWebViewRendering"
         ]
       },
-      "gap": "The Android WebView smoke covers file-pane rendering from a real IPC listing and injected tab/queue data; it does not establish IPC isolation. Desktop GUI cases use jsdom with a mock backend. No test proves the running binary opens no API listener or that Tauri IPC is inaccessible to other local processes; other rendering surfaces, untrusted web content and physical-device behavior need security validation.",
+      "gap": "The idle Linux package smoke sees no GUI-process HTTP listener, but does not audit child processes or active sessions. The Android WebView smoke covers file-pane rendering from a real IPC listing and injected tab/queue data; neither establishes IPC isolation. Desktop GUI rendering cases use jsdom with a mock backend. Tauri IPC accessibility to other local processes, other rendering surfaces, untrusted web content and physical-device behavior need security validation.",
       "acceptance": [
         "Exercise packaged desktop and Android IPC boundaries, including attempts from untrusted web content and local processes.",
         "Audit and test the remaining untrusted-data rendering surfaces, and validate the absence of any unintended API listener in the shipped application."
