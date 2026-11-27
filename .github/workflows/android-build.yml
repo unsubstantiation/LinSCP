@@ -83,6 +83,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
           python3 -m unittest discover -s tools/tests -p test_android_select_saf_folder.py
+          python3 -m unittest discover -s tools/tests -p test_android_biometrics.py
           python3 -m unittest discover -s tools/tests -p test_android_release_signing.py
           python3 -m unittest discover -s tools/tests -p test_android_saf_smoke.py
           echo "applicationId: $(python3 tools/android_application_id.py)"
@@ -204,6 +205,7 @@ jobs:
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py
           python3 -m unittest discover -s tools/tests -p test_android_select_saf_folder.py
+          python3 -m unittest discover -s tools/tests -p test_android_biometrics.py
           python3 -m unittest discover -s tools/tests -p test_android_release_signing.py
           python3 -m unittest discover -s tools/tests -p test_android_saf_smoke.py
           echo "applicationId: $(python3 tools/android_application_id.py)"
