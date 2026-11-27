@@ -1,7 +1,7 @@
 //! Ordinary resumes must pin and compare the local prefix before appending.
 use std::sync::{Arc, Mutex};
 use axum::{body::Body, extract::State, http::{HeaderMap, Method, StatusCode, Uri}, response::{IntoResponse, Response}, Router};
-use linscp_engine::{presets::ResumeSupportMode, transfer::{download_single_file, upload_single_file, TransferFlags}, xml_log::SessionLogger};
+use linscp_engine::{presets::ResumeSupportMode, transfer::{download_single_file, download_verified_resume, upload_single_file, TransferFlags}, xml_log::SessionLogger};
 use linscp_proto::{s3::{S3ConnectConfig, S3Session}, webdav::{WebDavConnectConfig, WebDavSession}, RemoteSession};
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 use zeroize::Zeroizing;
@@ -126,6 +126,15 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     }
     let err = download_single_file(session, path, Some(&entry), std::path::Path::new("-"), &direct, &mut logger, None).await.unwrap_err();
     assert!(err.contains("standard output"), "{err}");
+
+    std::fs::remove_file(&dest).unwrap();
+    std::fs::write(&stage, b"01234").unwrap();
+    state.lock().unwrap().swap_partial = Some(stage.clone());
+    let verified = TransferFlags { no_clobber: true, source_etag: Some("\"v1\"".into()), ..direct };
+    download_verified_resume(session, path, &entry, &dest, &verified, &mut logger, None).await.unwrap();
+    assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
+    assert_eq!(std::fs::read(&stage).unwrap(), b"xxxxx");
+    assert!(!std::fs::read_dir(tmp.path()).unwrap().any(|item| item.unwrap().file_name().to_string_lossy().starts_with(".linscp-resume-")));
 }
 
 #[tokio::test]

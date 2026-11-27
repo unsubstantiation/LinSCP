@@ -335,7 +335,10 @@ pub async fn download_verified_resume(
         Err(error) => return Err(format!("Cannot inspect resume partial: {error}")),
     };
     let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let temp = tempfile::Builder::new().prefix(".linscp-download-").rand_bytes(16).tempfile_in(parent)
+    let stage_dir = tempfile::Builder::new().prefix(".linscp-resume-").rand_bytes(16).tempdir_in(parent)
+        .map_err(|e| format!("Cannot create private resume directory: {e}"))?;
+    linscp_platform::create_private_dir(stage_dir.path()).map_err(|e| format!("Cannot secure resume directory: {e}"))?;
+    let temp = tempfile::Builder::new().prefix("download-").rand_bytes(16).tempfile_in(stage_dir.path())
         .map_err(|e| format!("Cannot create temporary download: {e}"))?;
     let (std_file, mut stage) = temp.into_parts();
     let mut file = tokio::fs::File::from_std(std_file);
@@ -346,6 +349,7 @@ pub async fn download_verified_resume(
         let reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let mut reader = reader.take(info.size.saturating_add(1));
         offset = tokio::io::copy(&mut reader, &mut file).await.map_err(|e| format!("Cannot copy resume partial: {e}"))?;
+        drop(reader);
         if offset > info.size { return Err("Resume partial is larger than the remote file.".to_string()); }
         file.flush().await.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
         if offset > 0 {
@@ -380,8 +384,8 @@ pub async fn download_verified_resume(
     flush.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
     if offset.checked_add(received) != Some(info.size) { return Err("Remote file length changed during verified resume.".to_string()); }
     if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled before publication.".to_string()); }
+    apply_downloaded_attrs(stage.as_ref(), info, flags);
     publish_owned_stage_no_replace(&mut stage, local_dest).map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
-    apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
     Ok(())
 }
@@ -532,9 +536,9 @@ async fn download_ordinary_resume(
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
         return Err("Transfer cancelled before publication.".to_string());
     }
+    apply_downloaded_attrs(&stage, info, flags);
     std::fs::rename(&stage, local_dest)
         .map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
-    apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
     if flags.delete_source {
         if let Some(token) = resume_identity.as_deref().filter(|_| is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
