@@ -12471,6 +12471,29 @@ fn offlineotp_entries_from_sessions(
             Err(error) => return Err(format!("Cannot list vault keys: {error}")),
         }
         ids.sort();
+        let private_ids: std::collections::HashSet<String> = ids.iter().map(|id| id.to_ascii_lowercase()).collect();
+        let mut public_ids = Vec::new();
+        if let Ok(items) = std::fs::read_dir(&dir) {
+            for item in items {
+                let item = item.map_err(|e| format!("Cannot list vault keys: {e}"))?;
+                let name = item.file_name();
+                let name = name.to_str().ok_or("Invalid vault key filename")?;
+                let Some(id) = name.strip_suffix(".pub") else { continue };
+                if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || !item.file_type().map_err(|e| e.to_string())?.is_file() {
+                    return Err("Invalid vault SSH public key file.".into());
+                }
+                if !private_ids.contains(&id.to_ascii_lowercase()) { public_ids.push(id.to_string()); }
+            }
+        }
+        public_ids.sort();
+        for id in public_ids {
+            let (public_key, _) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"), config_root, secret_vault)?;
+            entries.push(CredentialEntry::SshKey(SshKeyRecord {
+                label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{}", read_vault_key_label(&dir, &id)),
+                public_key, private_key: String::new(), host: String::new(), port: 0,
+                username: String::new(), password: String::new(),
+            }));
+        }
         for id in ids {
             let (public_key, private_key) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_KEY_PREFIX}{id}"), config_root, secret_vault)?;
             if private_key.is_empty() { return Err("Saved vault SSH key is empty.".into()); }
@@ -12761,7 +12784,7 @@ fn plan_offlineotp_import(
                 if let Some(rest) = key.label.strip_prefix(OFFLINEOTP_VAULT_KEY_PREFIX) {
                     let (id, label) = rest.split_once(':').ok_or("Invalid standalone vault key label")?;
                     if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit())
-                        || label.is_empty() || key.private_key.is_empty()
+                        || label.is_empty() || (key.private_key.is_empty() && key.public_key.is_empty())
                         || !key.host.is_empty() || !key.username.is_empty() || !key.password.is_empty() {
                         return Err("Invalid standalone vault key entry.".into());
                     }
@@ -12877,6 +12900,28 @@ fn import_offlineotp_entries(
         // the restored user label rather than inventing a session-derived one.
         for key in &vault_keys {
             let dir = config_root.join("keys");
+            if key.private_key.is_empty() {
+                let found = match std::fs::read_dir(&dir) {
+                    Ok(items) => {
+                        let mut found = false;
+                        for item in items {
+                            let item = item.map_err(|e| e.to_string())?;
+                            let name = item.file_name();
+                            let Some(id) = name.to_str().and_then(|n| n.strip_suffix(".pub")) else { continue };
+                            if id.len() == 32 && id.bytes().all(|b| b.is_ascii_hexdigit())
+                                && item.file_type().map_err(|e| e.to_string())?.is_file()
+                                && read_bounded_key(&item.path(), 32 * 1024)? == key.public_key {
+                                found = true;
+                                break;
+                            }
+                        }
+                        found
+                    },
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+                    Err(e) => return Err(format!("Cannot inspect vault public keys: {e}")),
+                };
+                if found { continue; }
+            }
             if let Some(id) = find_existing_vault_key_id(&dir, key.private_key.as_bytes(), secret_vault) {
                 let existing_label = read_vault_key_label(&dir, &id);
                 let existing_public = read_bounded_key_optional(&dir.join(format!("{id}.pub")), 32 * 1024)?;
@@ -14732,6 +14777,10 @@ mod tests {
             body: json!({"password": "full-backup-password", "data_base64": full_bak.payload["data_base64"], "confirm_replace": true}),
         });
         assert_eq!(full_restore.status, 200, "{}", full_restore.payload);
+        let full_store = SessionStore::load_from_dir(fourth_dir.path(), fourth_svc.secret_vault.as_ref()).unwrap();
+        let full_public = full_store.find("Agent Public Only").unwrap().extra_fields.get("linscp_public_key_file").unwrap();
+        let id = full_public.strip_prefix(LOCAL_VAULT_PUBLIC_KEY_PREFIX).unwrap();
+        assert_eq!(std::fs::read_to_string(fourth_dir.path().join("keys").join(format!("{id}.pub"))).unwrap(), "ssh-ed25519 AAAAPUBONLY agent@host\n");
 
         // Security checks: reject cross-host sshhostkeys poisoning and local-path pinned_public_key injection
         let poisoned_hk = BASE64_STD.encode("evil.example.test@22 ssh-ed25519 SHA256:EvilFp\n");
