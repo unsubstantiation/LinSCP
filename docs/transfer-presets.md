@@ -12,4 +12,4 @@ In the GUI, untouched default controls inherit the selected or automatically mat
 
 Automatic mode by mask decides text conversion for each file; ASCII converts line endings, while binary keeps bytes unchanged. Resume remains subject to [transfer resume safety](transfer-resume-safety.md), including the default refusal of FTP/SFTP resume without explicit best-effort approval. Presets do not bypass guarded-upload, no-overwrite, or Android granted-folder restrictions.
 
-Linux and Windows host tests cover rule conjunction, mixed-file selection, explicit/site precedence, and persisted overrides. The Android emulator smoke includes mixed automatic matching, but that new case and physical Android/third-party server behavior still require an actual run on those platforms.
+Linux and Windows host tests cover rule conjunction, mixed-file selection, explicit/site precedence, and persisted overrides. The packaged Android emulator smoke passed mixed automatic matching and session-rule checks against the WebDAV fixture ([run 46045911600](https://github.com/unsubstantiation/LinSCP/actions/runs/46045911600)); physical Android devices and third-party servers remain unverified.
