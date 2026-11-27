@@ -7,7 +7,7 @@ ssh_key_dir=$(mktemp -d)
 ssh_server=''
 cleanup() {
   kill "$server" ${ssh_server:+"$ssh_server"} 2>/dev/null || true
-  rm -f "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
+  rm -f "${oversize_download_fixture:-}" "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
   rm -rf -- "$ssh_root" "$ssh_key_dir"
 }
 LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
@@ -268,6 +268,13 @@ node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" sa
 python3 tools/android_select_saf_folder.py
 # A provider-backed file one byte above the per-document cap, isolated so
 # other synchronization fixtures cannot accidentally traverse it.
+# A separate remote fixture tests WebDAV-to-provider refusal. A sparse host
+# file avoids checking a large binary into the repository; the server is the
+# disposable loopback fixture with test-only credentials.
+oversize_download_fixture=$(mktemp)
+truncate -s 67108865 "$oversize_download_fixture"
+curl --fail --silent --show-error --user testuser:testpass \
+  --upload-file "$oversize_download_fixture" "http://127.0.0.1:$port/oversize-download.bin" >/dev/null
 adb shell mkdir -p /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture
 adb shell "dd if=/dev/zero of=/sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin bs=1048576 count=64 && printf x >> /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin"
 node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" saf-pick-finish

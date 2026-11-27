@@ -389,6 +389,23 @@ const expression = `
       catch (error) { refused = error.status === 400 && /oversize[.]bin/.test(error.message || '') && /64 MiB/.test(error.message || ''); }
       if (!refused) throw new Error('Expected named provider document-cap refusal from ' + path);
     }
+    // The remote fixture is independently served by WebDAV and is one byte
+    // over the provider limit. Refuse both copy and move before queuing, and
+    // ensure the source survives (especially the destructive move path).
+    const remoteName = 'oversize-download.bin';
+    const beforeQueue = (await invoke('GET', '/api/transfers')).transfers.length;
+    for (const [path, extra] of [['/api/transfer/download', {}], ['/api/transfer/move', {direction: 'download'}]]) {
+      let refused = false;
+      try { await invoke('POST', path, {tab, local_dir: tree, remote_dir: '/', names: [remoteName], ...extra}); }
+      catch (error) { refused = error.status === 400 && (error.message || '').includes(remoteName) && /64 MiB/.test(error.message || ''); }
+      if (!refused) throw new Error('Expected over-cap WebDAV to SAF refusal from ' + path);
+    }
+    if ((await invoke('GET', '/api/transfers')).transfers.length !== beforeQueue) throw new Error('Over-cap SAF download was queued');
+    const rootSafTab = (await invoke('POST', '/api/tabs/local', {local_dir: tree, remote_dir: root})).tab.id;
+    const target = (await invoke('GET', '/api/local/list?tab=' + rootSafTab + '&path=' + encodeURIComponent(tree))).entries;
+    if (target?.some(entry => entry.name === remoteName)) throw new Error('Over-cap download created a provider document');
+    const source = (await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'))).entries;
+    if (!source?.some(entry => entry.name === remoteName && entry.size === 67108865)) throw new Error('Over-cap move altered the WebDAV source');
     await expectCap('/api/transfer/upload', {tab, local_dir: dir, remote_dir: '/', names: ['oversize.bin']});
     await expectCap('/api/transfer/upload', {tab: local, local_dir: dir, remote_dir: root, names: ['oversize.bin']});
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'cap-fixture'});
