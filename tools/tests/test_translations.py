@@ -113,6 +113,33 @@ class TranslationTests(unittest.TestCase):
                     leftover.append("%s:%s" % (locale, key[:80]))
         self.assertEqual(leftover, [], leftover[:20])
 
+    def test_identical_single_word_labels_are_explicitly_reviewed(self):
+        # The general untranslated walker allows short and capitalized words
+        # because many protocol/product names are shared. That also used to
+        # let ordinary labels such as "Delete" silently ship untranslated.
+        # These are established same-spelling words in each language or names.
+        reviewed = {
+            'de': {'Desktop', 'Editor', 'English', 'Hotspot', 'Live', 'Name',
+                   'Offline', 'Orange', 'Pause', 'Proxy', 'Start', 'Status',
+                   'Tabs', 'Telnet', 'Terminal', 'Text'},
+            'es': {'Editor', 'English', 'Error', 'Local', 'Proxy', 'Telnet', 'Terminal'},
+            'fr': {'Action', 'Destination', 'English', 'Local', 'Mode', 'Options',
+                   'Orange', 'Pause', 'Permissions', 'Sessions', 'Source', 'Telnet',
+                   'Terminal', 'Type'},
+        }
+        catalogs = load_catalogs(GUI_DIRECTORY)
+        for locale, allowed in reviewed.items():
+            with self.subTest(locale=locale):
+                identical = {key for key, value in catalogs[locale].items()
+                             if value == key and re.fullmatch(r'[A-Z][a-z]+', key)}
+                self.assertEqual(identical - allowed, set(),
+                                 'Review or translate new same-as-English labels')
+        # These monitor terms have translations even though they used to be
+        # hidden by the broad capitalized-word exemption.
+        for locale in ('de', 'fr'):
+            for label in ('Sparkline', 'Swap'):
+                self.assertNotEqual(catalogs[locale][label], label)
+
     def test_every_sync_plan_reason_has_a_gui_catalog_key(self):
         """The page translates a plan's reason, so the key has to exist.
 
