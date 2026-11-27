@@ -16405,9 +16405,10 @@ mod tests {
         let mut ascii = linscp_engine::transfer::TransferFlags::default();
         ascii.ftp_risky_publish = true;
         ascii.transfer_mode = linscp_types::TransferMode::Ascii;
-        let rejected = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("up.txt"), "/ascii-unsafe.txt", &ascii, &mut logger, None).await;
-        assert!(rejected.is_err(), "FTP ASCII upload must not bypass staging");
-        assert!(!remote.join("ascii-unsafe.txt").exists());
+        let staged = linscp_engine::transfer::upload_single_file(session.as_ref(), &local.join("up.txt"), "/ascii-staged.txt", &ascii, &mut logger, None).await;
+        assert!(staged.is_ok(), "acknowledged FTP ASCII upload should use staged publication: {staged:?}");
+        assert_eq!(std::fs::read(remote.join("ascii-staged.txt")).unwrap(), b"FTP upload payload");
+        assert!(!std::fs::read_dir(remote).unwrap().any(|entry| entry.unwrap().file_name().to_string_lossy().starts_with(".linscp-upload-")), "FTP ASCII upload left a staging file");
         let no_consent = svc.dispatch_async(request(json!({"tab": id, "local_dir": local, "remote_dir": "/", "names": ["up.txt"]}))).await;
         assert_eq!(no_consent.status, 409);
         assert_eq!(no_consent.payload["ftp_rename_risk"], true);
