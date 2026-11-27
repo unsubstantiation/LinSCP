@@ -700,7 +700,6 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
         val cipher = Cipher.getInstance("AES/GCM/NoPadding")
         if (encrypting) cipher.init(Cipher.ENCRYPT_MODE, biometricKey(true))
         else cipher.init(Cipher.DECRYPT_MODE, biometricKey(false), GCMParameterSpec(128, wrapped!!, 0, 12))
-        cipher.updateAAD(biometricAad)
         val builder = BiometricPrompt.Builder(activity)
           .setTitle(if (encrypting) "Enable biometric vault unlock" else "Unlock LinSCP vault")
           .setSubtitle("Your vault password remains available as a fallback")
@@ -717,6 +716,10 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
               var stage = "cipher"
               try {
                 val authenticated = result.cryptoObject?.cipher ?: throw IllegalStateException("Missing authenticated cipher")
+                // A per-use Keystore key cannot process even AAD before the
+                // prompt supplies its authentication token.
+                stage = "aad"
+                authenticated.updateAAD(biometricAad)
                 if (encrypting) {
                   stage = "iv"
                   // Android Keystore may reset the cipher after doFinal, so
@@ -739,7 +742,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                   } finally { plaintext.fill(0) }
                 }
               } catch (error: Exception) {
-                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}; cause=${error.cause?.javaClass?.simpleName}: ${error.cause?.message}")
+                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}")
                 fail("Biometric credential unavailable; use your vault password")
               }
             }

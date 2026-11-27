@@ -35,6 +35,9 @@ class BiometricTests(unittest.TestCase):
                          'setInvalidatedByBiometricEnrollment(true)', 'BiometricPrompt.CryptoObject(cipher)',
                          'activity.noBackupFilesDir', 'AtomicFile(biometricFile)']:
             self.assertIn(fragment, kotlin)
+        biometric = kotlin[kotlin.index('private fun biometricPrompt'):kotlin.index('private val keystoreLock')]
+        self.assertGreater(biometric.index('authenticated.updateAAD(biometricAad)'),
+                           biometric.index('onAuthenticationSucceeded'))
         host = (ROOT / 'crates/linscp-tauri/src/lib.rs').read_text()
         unlock = host[host.index('pub async fn linscp_biometric_unlock'):host.index('pub async fn linscp_biometric_disable')]
         self.assertIn('"/api/vault/unlock"', unlock)
