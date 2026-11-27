@@ -22,6 +22,11 @@ jobs:
           disable-animations: true
           script: |
             adb shell locksettings set-pin 1234
+            adb shell input keyevent 224
+            adb shell input swipe 160 550 160 100 300
+            adb shell input text 1234
+            adb shell input keyevent 66
+            sleep 3
             adb shell am start -a android.settings.FINGERPRINT_ENROLL
             sleep 8
             adb shell uiautomator dump /sdcard/probe.xml
