@@ -3,11 +3,12 @@ set -euo pipefail
 log=$(mktemp)
 ssh_log=$(mktemp)
 ssh_root=$(mktemp -d)
+ssh_key_dir=$(mktemp -d)
 ssh_server=''
 cleanup() {
   kill "$server" ${ssh_server:+"$ssh_server"} 2>/dev/null || true
   rm -f "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
-  rm -rf -- "$ssh_root"
+  rm -rf -- "$ssh_root" "$ssh_key_dir"
 }
 LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
 server=$!
@@ -19,6 +20,14 @@ for _ in $(seq 1 60); do
 done
 port=$(sed -n 's/^READY //p' "$log" | head -n 1)
 test -n "$port"
+# A disposable key is authorized only by the throwaway fixture. The private
+# key remains outside its SFTP root and is supplied to the test process in
+# memory; no production key or account is used.
+ssh-keygen -q -t ed25519 -N '' -f "$ssh_key_dir/backup-fixture"
+mkdir -p "$ssh_root/.ssh"
+cp "$ssh_key_dir/backup-fixture.pub" "$ssh_root/.ssh/authorized_keys"
+LINSCP_ANDROID_SSH_KEY_B64=$(base64 -w0 "$ssh_key_dir/backup-fixture")
+export LINSCP_ANDROID_SSH_KEY_B64
 # A throwaway SSH fixture makes the Android agent refusal traverse the real
 # handshake, host-key challenge and authentication path inside the APK.
 LSCP_TEST_PORT=0 LSCP_TEST_ROOT="$ssh_root" python3 source/linux/tests/TestSftpServer.py >"$ssh_log" 2>&1 &

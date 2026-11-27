@@ -5,6 +5,8 @@ import { readFileSync, writeFileSync } from 'node:fs';
 const port = Number(process.argv[2]);
 const sshPort = Number(process.env.LINSCP_ANDROID_SSH_PORT);
 assert.ok(Number.isInteger(sshPort) && sshPort > 0 && sshPort < 65536, 'SSH fixture port is required');
+const fixtureKey = process.env.LINSCP_ANDROID_SSH_KEY_B64;
+assert.ok(fixtureKey && /^[A-Za-z0-9+/=]+$/.test(fixtureKey), 'disposable SSH fixture key is required');
 // The installed package, handed over by the harness that read it from the
 // configuration, so the storage this run finds is the storage of *this* app.
 const application = process.argv[3];
@@ -121,13 +123,13 @@ const expression = `
     await invoke('POST', '/api/vault/unlock', {password});
     const root = (await invoke('GET', '/api/status')).local_dir;
     if (phase === 'portable-setup') return {root, destinationVaultSetUp: true};
-    // A deliberately nonfunctional private-key fixture: this exercises vault
-    // encryption and backup rewrapping, not SSH parsing or authentication.
-    const keyFixture = 'android portable backup private key fixture';
+    // This disposable key is authorized only by the test SFTP server. The
+    // backup must restore usable private key bytes, not just its metadata.
+    const keyFixture = atob(${JSON.stringify(fixtureKey)});
     if (phase === 'portable-export') {
       const key = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
       if (!key.success || !(key.reference?.startsWith('vaultkey://') && /^[a-f0-9]{32}$/.test(key.reference.slice(11)))) throw new Error('Fixture key import failed');
-      await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: 'fixture.invalid', username: 'test', keyfile: key.reference}});
+      await invoke('POST', '/api/sessions/save', {name: 'portable-key-site', session: {protocol: 'sftp', host: '127.0.0.1', port: ${sshPort}, username: 'testuser', keyfile: key.reference, local_dir: root, initial_dir: '/'}});
       const exported = await invoke('POST', '/api/backup/export', {password: 'portable android backup password'});
       if (!exported.success || !atob(exported.data_base64).startsWith('LSCPBAK1')) throw new Error('Portable backup export failed');
       return {root, portableData: {backupBase64: exported.data_base64, keyReference: key.reference}};
@@ -148,6 +150,18 @@ const expression = `
     // destination vault without exposing private bytes through a read API.
     const duplicate = await invoke('POST', '/api/vault/keys/import', {name: 'portable-fixture-key', private_key: keyFixture});
     if (!duplicate.deduplicated || duplicate.reference !== portable.keyReference) throw new Error('Restored key cannot be decrypted to the original fixture');
+    let sshConnection;
+    try { sshConnection = await invoke('POST', '/api/tabs/open', {site_name: 'portable-key-site'}); }
+    catch (error) {
+      if (error.status !== 409 || !error.payload?.challenge) throw error;
+      const challenge = error.payload.challenge;
+      if (challenge.host !== '127.0.0.1' || challenge.port !== ${sshPort}) throw new Error('Unexpected SSH fixture host-key challenge');
+      sshConnection = await invoke('POST', '/api/tabs/verify', {tab: challenge.tab, role: challenge.role, fingerprint: challenge.fingerprint, remember: false});
+    }
+    if (!sshConnection.tab?.connected) throw new Error('Restored private key failed SFTP authentication');
+    const sshList = await invoke('GET', '/api/remote/list?tab=' + sshConnection.tab.id + '&path=' + encodeURIComponent('/'));
+    if (!Array.isArray(sshList.entries)) throw new Error('Restored SSH connection could not list the fixture');
+    await invoke('POST', '/api/tabs/close', {tab: sshConnection.tab.id});
     const opened = await invoke('POST', '/api/tabs/open', {site_name: 'android-smoke-vault-site'});
     if (!opened.tab?.connected) throw new Error('Portable restored credential failed to authenticate');
     return {root, portableBackupPhase: phase};
