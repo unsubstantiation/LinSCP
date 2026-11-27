@@ -5670,7 +5670,7 @@
       "id": "platform.android-saf-synchronization",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and one keep-up-to-date pass.",
+      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and nested synchronization in both directions. A two-pass keep-up-to-date run uploads a file created after the first pass started, exercising interval polling with the external-storage provider.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/keepuptodate.rs",
@@ -5695,7 +5695,8 @@
           "a granted folder is offered keep-up-to-date"
         ],
         "android-emulator": [
-          "verifyAndroidGrantedSafSync"
+          "verifyAndroidGrantedSafSync",
+          "verifyAndroidGrantedSafNestedSync"
         ]
       },
       "verified_on": {
@@ -5712,7 +5713,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator exercises single-file synchronization and one polling pass with the external-storage DocumentsProvider and a WebDAV fixture. Nested trees, over-cap files, timed second passes, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.",
+      "gap": "The emulator exercises nested synchronization and repeated polling with the external-storage DocumentsProvider and a WebDAV fixture. Over-cap files, polling cancellation with a real provider, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.",
       "acceptance": [
         "Validate nested-tree synchronization, document-cap refusal, timed repeated polling and cancellation with real providers and physical devices."
       ]
