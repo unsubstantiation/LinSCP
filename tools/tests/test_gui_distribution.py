@@ -163,8 +163,14 @@ class GuiDistributionTests(unittest.TestCase):
             desktop = prefix / 'share/applications/linscp.desktop'
             capture = pathlib.Path(tmp) / 'argument'
             uri = 'sftp://example.invalid/path%20with%20spaces'
+            config = pathlib.Path(tmp) / 'xdg-config'
+            data_home = pathlib.Path(tmp) / 'xdg-data'
+            config.mkdir()
+            data_home.mkdir()
+            (config / 'mimeapps.list').write_text('[Default Applications]\nx-scheme-handler/sftp=linscp.desktop;\n')
             # GIO parses and launches the actual desktop entry, not a shell
             # approximation of Exec. The prefix bin is deliberately off PATH.
+            # A second invocation discovers it through isolated XDG defaults.
             code = '''
 import ctypes, ctypes.util, sys
 gio = ctypes.CDLL(ctypes.util.find_library("gio-2.0"))
@@ -175,7 +181,16 @@ gio.g_app_info_launch_uris.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.
 gio.g_app_info_launch_uris.restype = ctypes.c_int
 glib.g_list_append.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
 glib.g_list_append.restype = ctypes.c_void_p
-app = gio.g_desktop_app_info_new_from_filename(sys.argv[1].encode())
+if sys.argv[3] == 'default':
+    gio.g_app_info_get_default_for_uri_scheme.argtypes = [ctypes.c_char_p]
+    gio.g_app_info_get_default_for_uri_scheme.restype = ctypes.c_void_p
+    gio.g_app_info_get_id.argtypes = [ctypes.c_void_p]
+    gio.g_app_info_get_id.restype = ctypes.c_char_p
+    app = gio.g_app_info_get_default_for_uri_scheme(b'sftp')
+    if not app or gio.g_app_info_get_id(app) != b'linscp.desktop':
+        raise RuntimeError('GIO did not discover the configured SFTP handler')
+else:
+    app = gio.g_desktop_app_info_new_from_filename(sys.argv[1].encode())
 if not app: raise RuntimeError("GIO rejected desktop entry or TryExec")
 uri = ctypes.create_string_buffer(sys.argv[2].encode())
 uris = glib.g_list_append(None, ctypes.cast(uri, ctypes.c_void_p))
@@ -183,13 +198,18 @@ error = ctypes.c_void_p()
 if not gio.g_app_info_launch_uris(app, uris, None, ctypes.byref(error)):
     raise RuntimeError("GIO desktop launch failed")
 '''
-            subprocess.run([sys.executable, '-c', code, str(desktop), uri], check=True,
-                           env={**os.environ, 'PATH': '/usr/bin:/bin', 'LINSCP_TEST_CAPTURE': str(capture)}, timeout=15)
-            deadline = time.monotonic() + 10
-            while not capture.exists() and time.monotonic() < deadline:
-                time.sleep(0.05)
-            self.assertTrue(capture.exists(), 'desktop entry did not launch the installed executable')
-            self.assertEqual(capture.read_text(), uri)
+            env = {**os.environ, 'PATH': '/usr/bin:/bin', 'LINSCP_TEST_CAPTURE': str(capture),
+                   'XDG_CONFIG_HOME': str(config), 'XDG_DATA_HOME': str(data_home),
+                   'XDG_CONFIG_DIRS': str(config), 'XDG_DATA_DIRS': str(prefix / 'share')}
+            for mode in ('explicit', 'default'):
+                subprocess.run([sys.executable, '-c', code, str(desktop), uri, mode], check=True,
+                               env=env, timeout=15)
+                deadline = time.monotonic() + 10
+                while not capture.exists() and time.monotonic() < deadline:
+                    time.sleep(0.05)
+                self.assertTrue(capture.exists(), f'{mode} desktop entry did not launch the installed executable')
+                self.assertEqual(capture.read_text(), uri)
+                capture.unlink()
 
     def test_the_shared_page_reaches_the_native_bridge_only(self):
         # The page used to fall back to `fetch()` with a bearer token when no
