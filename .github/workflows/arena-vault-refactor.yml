@@ -1,0 +1,23 @@
+name: Vault refactor validation
+on:
+  push:
+    branches: [arena/47659bfb-linscp]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      RUST_MIN_STACK: 16777216
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-tests
+      - name: Run service tests
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p linscp-service -- --test-threads=1 --skip live_ 2>&1 | tee /tmp/service-test.log || { tail -80 /tmp/service-test.log | while IFS= read -r line; do echo "::error::$line"; done; exit 1; }
