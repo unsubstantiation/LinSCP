@@ -775,7 +775,6 @@ pub async fn download_single_file(
     };
 
     let fresh_stage = stage_opt.is_some() && !flags.resume && !flags.append;
-    #[cfg(unix)]
     let used_verified_file = verified_file.is_some();
     let open_res = if let Some(file) = private_file.take() {
         Ok(file)
@@ -822,12 +821,11 @@ pub async fn download_single_file(
     let flush_res = tokio::io::AsyncWriteExt::flush(&mut file).await;
     // Detect path replacement before publishing (this is not an atomic
     // check-and-rename; a trusted destination directory is still required).
-    #[cfg(unix)]
     if used_verified_file {
-        use std::os::unix::fs::MetadataExt;
         let opened = file.metadata().await.map_err(|e| format!("Cannot inspect resume file: {e}"))?;
-        let named = std::fs::symlink_metadata(&write_path).map_err(|e| format!("Resume pathname changed: {e}"))?;
-        if !named.is_file() || opened.dev() != named.dev() || opened.ino() != named.ino() {
+        if !linscp_platform::resume_path_matches_open_file(&opened, &write_path)
+            .map_err(|e| format!("Resume pathname changed: {e}"))?
+        {
             return Err("Resume pathname changed; refusing publication.".to_string());
         }
     }

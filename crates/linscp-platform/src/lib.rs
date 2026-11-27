@@ -482,6 +482,29 @@ fn resolve_os_path(path: &str) -> PathBuf {
     }
 }
 
+/// Check whether a named regular file still identifies an opened resume file.
+/// This is not an atomic check-and-publication operation. On Unix compare the
+/// device and inode; on Windows callers must keep a no-delete-sharing handle
+/// open throughout the check. The caller must still trust the directory for
+/// the subsequent pathname publication.
+pub fn resume_path_matches_open_file(opened: &std::fs::Metadata, path: &Path) -> std::io::Result<bool> {
+    let named = std::fs::symlink_metadata(path)?;
+    if !named.is_file() || !opened.is_file() { return Ok(false); }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(opened.dev() == named.dev() && opened.ino() == named.ino())
+    }
+    #[cfg(windows)]
+    {
+        Ok(opened.len() == named.len())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        Ok(false)
+    }
+}
+
 fn entry_from_symlink_meta(
     name: String,
     full_path: &Path,
