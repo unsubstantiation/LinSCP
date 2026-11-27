@@ -10,6 +10,8 @@ from android_select_saf_folder import adb, click, dump
 
 
 def main():
+    adb('shell', 'settings', 'put', 'system', 'screen_off_timeout', '1800000')
+    adb('shell', 'svc', 'power', 'stayon', 'true')
     adb('shell', 'locksettings', 'set-pin', '1234')
     time.sleep(3)
     adb('shell', 'input', 'keyevent', '224')
@@ -31,7 +33,7 @@ def main():
         history.append(labels)
         def find(*words):
             return next((n for n in nodes if (n.get('text') or n.get('content-desc') or '').upper() in words and n.get('enabled') == 'true'), None)
-        if any('Re-enter your PIN' in label or 'Enter your PIN' in label for label in labels):
+        if any('Re-enter your PIN' in label or 'Enter your PIN' in label or label == 'Enter PIN' for label in labels):
             adb('shell', 'input', 'text', '1234')
             adb('shell', 'input', 'keyevent', '66')
             continue
