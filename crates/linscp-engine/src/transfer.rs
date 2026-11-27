@@ -755,8 +755,8 @@ pub async fn download_single_file(
                     return Err("Resume partial changed after verification; retry the transfer.".to_string());
                 }
                 // Adopt existing partial target into stage path or resume directly
-                std::fs::rename(local_dest, sp)
-                    .map_err(|e| format!("Cannot move resume partial into staging: {e}"))?;
+                linscp_platform::gui_os::rename_no_replace(local_dest, sp)
+                    .map_err(|e| format!("Cannot move resume partial into staging without replacement: {e}"))?;
                 (sp.clone(), local_stat.size)
             } else {
                 if flags.resume && sp_meta.exists {
