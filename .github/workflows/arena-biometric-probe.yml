@@ -30,7 +30,10 @@ jobs:
             adb shell input keyevent 66
             sleep 3
             adb shell am start -a android.settings.FINGERPRINT_ENROLL
-            sleep 8
+            sleep 5
+            adb shell input text 1234
+            adb shell input keyevent 66
+            sleep 5
             adb shell uiautomator dump /sdcard/probe.xml
             adb exec-out cat /sdcard/probe.xml > probe.xml
             python3 -c "import xml.etree.ElementTree as E; r=E.parse('probe.xml'); print('::warning::' + str([(n.get('text'),n.get('content-desc'),n.get('bounds')) for n in r.iter('node') if n.get('text') or n.get('content-desc')]))"
