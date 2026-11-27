@@ -4,7 +4,7 @@ import argparse
 import subprocess
 import time
 import xml.etree.ElementTree as ET
-from android_select_saf_folder import adb, dump
+from android_select_saf_folder import adb, click, dump
 
 
 def main():
@@ -20,6 +20,10 @@ def main():
             continue
         labels = [n.get('text') or n.get('content-desc') or '' for n in nodes]
         history.append([label for label in labels if label])
+        got_it = next((node for node in nodes if (node.get('text') or '').lower() == 'got it'), None)
+        if got_it is not None:
+            click(got_it)
+            continue
         if any(label.lower() == 'use password' for label in labels):
             adb('emu', 'finger', 'touch', args.fingerprint)
             print('Sent emulator fingerprint to the native prompt')
