@@ -6,7 +6,7 @@ use linscp_proto::{s3::{S3ConnectConfig, S3Session}, webdav::{WebDavConnectConfi
 use linscp_types::{FileEntry, ProtocolScheme, TransferMode};
 use zeroize::Zeroizing;
 
-struct Resource { data: Vec<u8>, etag: String, change_after_prefix: bool, wrong_version_at: Option<&'static str>, bad_etag_at: Option<(&'static str, bool)>, version_requests: Vec<String> }
+struct Resource { data: Vec<u8>, etag: String, change_after_prefix: bool, wrong_version_at: Option<&'static str>, bad_etag_at: Option<(&'static str, bool)>, version_requests: Vec<String>, swap_partial: Option<std::path::PathBuf> }
 async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri: Uri, headers: HeaderMap) -> Response {
     let mut r = state.lock().unwrap();
     if method.as_str() == "PROPFIND" {
@@ -38,6 +38,12 @@ async fn resource(State(state): State<Arc<Mutex<Resource>>>, method: Method, uri
         let etag = r.etag.clone();
         let data = r.data[start..=end].to_vec();
         if start == 0 && r.change_after_prefix { r.etag = "\"v2\"".into(); }
+        if start == 0 {
+            if let Some(path) = r.swap_partial.take() {
+                std::fs::remove_file(&path).unwrap();
+                std::fs::write(path, b"xxxxx").unwrap();
+            }
+        }
         let phase = if start == 0 { "prefix" } else { "tail" };
         let mut response = Response::builder().status(StatusCode::PARTIAL_CONTENT).header("content-range", content_range);
         if let Some((fault_phase, omit)) = r.bad_etag_at.filter(|(fault_phase, _)| *fault_phase == phase) {
@@ -75,6 +81,17 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
     assert_eq!(std::fs::read(&stage).unwrap(), b"01234");
     assert_eq!(std::fs::read(&dest).unwrap(), b"old");
     state.lock().unwrap().change_after_prefix = false;
+    // Replace the name after its prefix is read. On Unix the transfer must
+    // write through the verified handle and must not publish the substitute.
+    #[cfg(unix)]
+    {
+        state.lock().unwrap().swap_partial = Some(stage.clone());
+        let error = download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap_err();
+        assert!(error.contains("pathname changed"), "{error}");
+        assert_eq!(std::fs::read(&stage).unwrap(), b"xxxxx");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+        std::fs::write(&stage, b"01234").unwrap();
+    }
     download_single_file(session, path, Some(&entry), &dest, &flags, &mut logger, None).await.unwrap();
     assert_eq!(std::fs::read(&dest).unwrap(), b"0123456789");
     // With staging disabled, the destination itself is the partial.
@@ -103,7 +120,7 @@ async fn exercise(session: &dyn RemoteSession, path: &str, state: Arc<Mutex<Reso
 
 #[tokio::test]
 async fn webdav_and_s3_ordinary_resume_pin_and_compare() {
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -118,7 +135,7 @@ async fn webdav_and_s3_ordinary_resume_pin_and_compare() {
 #[tokio::test]
 async fn s3_versioned_resume_pins_version_and_preserves_partials_on_failure() {
     use linscp_engine::transfer::local_stage_path;
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -155,7 +172,7 @@ async fn s3_versioned_resume_pins_version_and_preserves_partials_on_failure() {
 #[tokio::test]
 async fn s3_version_verified_resume_uses_version_scoped_checkpoint() {
     use linscp_engine::transfer::{download_verified_resume, local_stage_path};
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
@@ -193,7 +210,7 @@ async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() 
     use linscp_proto::TransferRequest;
     use std::time::{Duration, Instant};
     let payload = vec![42u8; 16 * 1024];
-    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state);
@@ -218,7 +235,7 @@ async fn conditional_s3_download_obeys_speed_limit_for_first_chunk_and_resume() 
 async fn http_resume_prefix_verification_obeys_speed_limit() {
     use std::time::{Duration, Instant};
     let payload = vec![71u8; 16 * 1024];
-    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: payload.clone(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state);
@@ -239,7 +256,7 @@ async fn http_resume_prefix_verification_obeys_speed_limit() {
 async fn webdav_conditional_downloads_reject_unconfirmed_response_etags() {
     use linscp_engine::transfer::download_verified_resume;
     use linscp_proto::TransferRequest;
-    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new() }));
+    let state = Arc::new(Mutex::new(Resource { data: b"0123456789".to_vec(), etag: "\"v1\"".into(), change_after_prefix: false, wrong_version_at: None, bad_etag_at: None, version_requests: Vec::new(), swap_partial: None }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let port = listener.local_addr().unwrap().port();
     let app = Router::new().fallback(resource).with_state(state.clone());
