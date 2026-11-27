@@ -739,7 +739,7 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
                   } finally { plaintext.fill(0) }
                 }
               } catch (error: Exception) {
-                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}")
+                android.util.Log.w("LinSCPBiometric", "Authenticated biometric operation failed at $stage: ${error.javaClass.simpleName}; cause=${error.cause?.javaClass?.simpleName}: ${error.cause?.message}")
                 fail("Biometric credential unavailable; use your vault password")
               }
             }
