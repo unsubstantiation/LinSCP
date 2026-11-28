@@ -127,7 +127,8 @@ impl X2GoBridge {
 
     pub fn start_with_options(session: GuardedKDriveSession, allow_clipboard: bool) -> Self {
         let (reader, writer, agent) = session.into_parts();
-        Self::spawn_with_mode(reader, writer, allow_clipboard, move |mode| async move {
+        let on_failure = if agent.preserves_session_on_failure() { ExitMode::Suspend } else { ExitMode::Terminate };
+        Self::spawn_with_mode(reader, writer, allow_clipboard, on_failure, move |mode| async move {
             match mode {
                 ExitMode::Terminate => agent.close().await.map_err(|_| "X2Go agent cleanup failed."),
                 ExitMode::Suspend => agent.suspend().await.map_err(|_| "X2Go session suspend failed."),
@@ -137,17 +138,17 @@ impl X2GoBridge {
 
     fn spawn<F>(reader: KDriveReader, writer: KDriveWriter, cleanup: F) -> Self
     where F: Future<Output = Result<(), &'static str>> + Send + 'static {
-        Self::spawn_with_mode(reader, writer, false, move |_| cleanup)
+        Self::spawn_with_mode(reader, writer, false, ExitMode::Terminate, move |_| cleanup)
     }
 
-    fn spawn_with_mode<C, F>(reader: KDriveReader, writer: KDriveWriter, allow_clipboard: bool, cleanup: C) -> Self
+    fn spawn_with_mode<C, F>(reader: KDriveReader, writer: KDriveWriter, allow_clipboard: bool, on_failure: ExitMode, cleanup: C) -> Self
     where
         C: FnOnce(ExitMode) -> F + Send + 'static,
         F: Future<Output = Result<(), &'static str>> + Send + 'static,
     {
         let (commands, input) = mpsc::channel(INPUT_QUEUE);
         let (output, messages) = mpsc::channel(OUTPUT_QUEUE);
-        let task = tokio::spawn(run(reader, writer, input, output, allow_clipboard, cleanup, SERVER_SILENCE));
+        let task = tokio::spawn(run(reader, writer, input, output, allow_clipboard, on_failure, cleanup, SERVER_SILENCE));
         Self { commands, messages, task, allow_clipboard }
     }
 
@@ -225,14 +226,14 @@ pub(crate) fn test_bridge(client: tokio::io::DuplexStream, cleanup_signal: onesh
 
 async fn run<C, F>(mut reader: KDriveReader, mut writer: KDriveWriter,
                    mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>,
-                   allow_clipboard: bool, cleanup: C, server_silence: Duration) -> Result<ExitMode, &'static str>
+                   allow_clipboard: bool, on_failure: ExitMode, cleanup: C, server_silence: Duration) -> Result<ExitMode, &'static str>
 where
     C: FnOnce(ExitMode) -> F,
     F: Future<Output = Result<(), &'static str>>,
 {
     let mut pending = None;
     let mut remote_closed = false;
-    let mut exit_mode = ExitMode::Terminate;
+    let mut exit_mode = on_failure;
     let mut result = Ok(());
     let mut frame_tracker = WireFrameTracker::default();
     let mut lease = tokio::time::Instant::now() + VIEWER_LEASE;
@@ -257,7 +258,8 @@ where
                 }
                 Some(Command::Touch) => { lease = tokio::time::Instant::now() + VIEWER_LEASE; }
                 Some(Command::Suspend) => { exit_mode = ExitMode::Suspend; break; }
-                Some(Command::Close) | None => break,
+                Some(Command::Close) => { exit_mode = ExitMode::Terminate; break; }
+                None => break,
             },
             permit = output.reserve(), if pending.is_some() => {
                 match permit {
@@ -414,7 +416,7 @@ mod tests {
             let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
             let (reader, writer) = channel.into_halves();
             let (signal, observed) = oneshot::channel();
-            let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+            let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, ExitMode::Terminate, move |mode| async move {
                 let _ = signal.send(mode);
                 Ok(())
             });
@@ -434,7 +436,7 @@ mod tests {
         let (started, observed) = oneshot::channel();
         let (release, wait) = oneshot::channel();
         let (finished, done) = oneshot::channel();
-        let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+        let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, ExitMode::Terminate, move |mode| async move {
             let _ = started.send(mode);
             let _ = wait.await;
             let _ = finished.send(());
@@ -454,7 +456,7 @@ mod tests {
         let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
         let (reader, writer) = channel.into_halves();
         let (signal, observed) = oneshot::channel();
-        let mut bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+        let mut bridge = X2GoBridge::spawn_with_mode(reader, writer, false, ExitMode::Terminate, move |mode| async move {
             let _ = signal.send(mode);
             Ok(())
         });
@@ -462,6 +464,29 @@ mod tests {
         assert_eq!(bridge.next_message().await.unwrap()["type"], "disconnect");
         assert_eq!(observed.await.unwrap(), ExitMode::Terminate);
         assert!(bridge.suspend().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn resumed_bridge_suspends_on_disconnect_but_explicit_close_terminates() {
+        for explicit in [false, true] {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+            let (reader, writer) = channel.into_halves();
+            let (signal, observed) = oneshot::channel();
+            let mut bridge = X2GoBridge::spawn_with_mode(reader, writer, false, ExitMode::Suspend, move |mode| async move {
+                let _ = signal.send(mode);
+                Ok(())
+            });
+            if explicit {
+                assert!(bridge.close().await.is_ok());
+                assert_eq!(observed.await.unwrap(), ExitMode::Terminate);
+            } else {
+                server.write_all(&header(10)).await.unwrap();
+                assert_eq!(bridge.next_message().await.unwrap()["type"], "disconnect");
+                assert_eq!(observed.await.unwrap(), ExitMode::Suspend);
+                assert!(bridge.close().await.is_err());
+            }
+        }
     }
 
     #[tokio::test]
@@ -474,7 +499,7 @@ mod tests {
         let (signal, observed) = oneshot::channel();
         let cleanup = move |_| async move { let _ = signal.send(()); Ok(()) };
         let result = tokio::time::timeout(Duration::from_secs(1),
-            run(reader, writer, input, output, false, cleanup, Duration::from_millis(20))).await.unwrap();
+            run(reader, writer, input, output, false, ExitMode::Terminate, cleanup, Duration::from_millis(20))).await.unwrap();
         assert_eq!(result, Err("KDrive server is not responding."));
         assert!(observed.await.is_ok());
     }

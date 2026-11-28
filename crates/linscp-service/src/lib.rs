@@ -3514,7 +3514,7 @@ impl CommanderService {
         let bridge = x2go_bridge::X2GoBridge::start_with_options(channel, allow_clipboard);
         let generation = match self.register_x2go_bridge(id, &ssh, bridge) {
             Ok(generation) => generation,
-            Err(bridge) => return match bridge.close().await {
+            Err(bridge) => return match if is_resumed { bridge.suspend().await } else { bridge.close().await } {
                 Ok(()) => api_error(409, "The selected SSH session changed while X2Go was starting."),
                 Err(_) => api_error(409, "The SSH session changed while X2Go was starting; agent cleanup could not be confirmed."),
             },
