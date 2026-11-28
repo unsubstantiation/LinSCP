@@ -43,7 +43,7 @@ async fn x2go_kdrive_start_frames_suspend_resume_and_terminate() {
     });
     // An X client on the fixture display observes keyboard input sent through
     // the real KDrive channel, not through the control SSH connection.
-    let launch = format!("rm -f ~/x2go-input-result; DISPLAY=:{display} nohup xterm -title LinSCPInputFixture -e sh -c 'IFS= read -r line; printf %s \"$line\" > \"$HOME/x2go-input-result\"' </dev/null >~/x2go-xterm.log 2>&1 &");
+    let launch = format!("rm -f ~/x2go-input-result; DISPLAY=:{display} nohup xterm -title LinSCPInputFixture -e sh -c 'IFS= read -r line; printf %s \"$line\" > \"$HOME/x2go-input-result\"; sleep 120' </dev/null >~/x2go-xterm.log 2>&1 &");
     let launched = ssh.exec_command_bounded(&launch, Duration::from_secs(10), 8192).await.expect("launch input fixture");
     assert_eq!(launched.exit_code, Some(0));
     let focus = format!("export DISPLAY=:{display}; timeout 8s xdotool search --sync --onlyvisible --name '^LinSCPInputFixture$' windowfocus --sync || {{ cat ~/x2go-xterm.log >&2; xdotool search --name . >&2 || true; exit 1; }}");
