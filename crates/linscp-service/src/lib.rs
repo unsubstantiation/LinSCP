@@ -12263,6 +12263,14 @@ fn random_vault_material_id() -> String {
 }
 
 impl OfflineOtpMaterialStage {
+    fn existing_public(root: &Path, vault: &dyn SecretVault, id: &str, required: bool) -> Result<String, String> {
+        match vault.read_vault_material(root, linscp_platform::VaultMaterialKind::SshPublic, id).map_err(|e| e.to_string())? {
+            linscp_platform::VaultMaterialRead::Plaintext(bytes) if bytes.len() <= 32 * 1024 => String::from_utf8(bytes.to_vec()).map_err(|_| "Existing public key is not UTF-8".into()),
+            linscp_platform::VaultMaterialRead::Missing if !required => Ok(String::new()),
+            _ => Err("Cannot read existing vault public key".into()),
+        }
+    }
+
     fn load_existing(root: &Path, vault: &dyn SecretVault) -> Result<Self, String> {
         let mut stage = Self::default();
         let keys = vault.list_vault_ssh_keys(root).map_err(|e| e.to_string())?.ok_or("Transactional vault does not enumerate SSH keys")?;
@@ -12274,12 +12282,12 @@ impl OfflineOtpMaterialStage {
                 linscp_platform::VaultMaterialRead::Plaintext(bytes) if !bytes.is_empty() && bytes.len() <= 1024 * 1024 => bytes,
                 _ => return Err("Cannot read existing vault SSH key".into()),
             };
-            let public = read_export_public_key(root, vault, &key.id, 32 * 1024, false)?;
+            let public = Self::existing_public(root, vault, &key.id, false)?;
             stage.existing_ssh.push(StagedSessionKey { id: key.id, private, label: key.label, public });
         }
         for id in public_ids {
             if !valid_vault_key_id(&id) { return Err("Invalid existing public key ID".into()); }
-            let public = read_export_public_key(root, vault, &id, 32 * 1024, true)?;
+            let public = Self::existing_public(root, vault, &id, true)?;
             if public.is_empty() { return Err("Existing public key is empty".into()); }
             stage.existing_public.push((id, public));
         }
