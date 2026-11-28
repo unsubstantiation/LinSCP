@@ -733,6 +733,11 @@ impl SessionStore {
     /// Read the on-disk store as INI, decrypting a password-vault envelope.
     /// Never interpret a locked or corrupt encrypted store as an empty store.
     pub fn read_ini_text(config_dir: &Path, vault: &dyn SecretVault) -> Result<Option<Zeroizing<String>>, String> {
+        match vault.read_session_ini(config_dir).map_err(|e| e.to_string())? {
+            linscp_platform::SessionIniRead::Unhandled => {},
+            linscp_platform::SessionIniRead::Missing => return Ok(None),
+            linscp_platform::SessionIniRead::Plaintext(value) => return Ok(Some(value)),
+        }
         let path = config_dir.join("sessions.ini");
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => Zeroizing::new(text),
@@ -755,6 +760,7 @@ impl SessionStore {
     /// Atomically write INI inside the password vault, or use the legacy codec
     /// for hosts whose vault explicitly does not support encrypted metadata.
     pub fn write_ini_text(config_dir: &Path, vault: &dyn SecretVault, text: &str) -> Result<(), String> {
+        if vault.write_session_ini(config_dir, text).map_err(|e| e.to_string())? { return Ok(()); }
         let path = config_dir.join("sessions.ini");
         if vault.protects_session_store() {
             let mut payload = Zeroizing::new(String::from(VAULT_STORE_CONTEXT));
@@ -777,6 +783,17 @@ impl SessionStore {
     /// content. Validate before atomic replacement; leave corrupt input intact.
     pub fn protect_existing(config_dir: &Path, vault: &dyn SecretVault) -> Result<(), String> {
         if !vault.protects_session_store() { return Ok(()); }
+        match vault.read_session_ini(config_dir).map_err(|e| e.to_string())? {
+            linscp_platform::SessionIniRead::Unhandled => {},
+            linscp_platform::SessionIniRead::Missing => return Ok(()),
+            linscp_platform::SessionIniRead::Plaintext(ini) => {
+                let master = vault.load_master_key(config_dir).map_err(|e| e.to_string())?
+                    .ok_or_else(|| "Unlock the local vault before reading sessions.".to_string())?;
+                let key = SessionMasterKey::from_array(*master);
+                Self::parse_ini(&ini, Some(&key))?;
+                return Ok(());
+            }
+        }
         let path = config_dir.join("sessions.ini");
         let original = match std::fs::read_to_string(&path) {
             Ok(text) => Zeroizing::new(text),

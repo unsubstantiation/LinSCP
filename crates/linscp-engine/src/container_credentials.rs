@@ -67,9 +67,17 @@ impl Document {
         Ok(Zeroizing::new(serde_json::to_vec(self).map_err(|e| e.to_string())?))
     }
 
-    fn session_key(&self) -> Result<SessionMasterKey, String> {
+    fn master_bytes(&self) -> Result<Zeroizing<[u8; 32]>, String> {
         let raw = Zeroizing::new(BASE64.decode(&self.session_key_b64).map_err(|_| "Invalid session key encoding")?);
-        SessionMasterKey::from_bytes(&raw).map_err(|_| "Invalid session key length".into())
+        let mut key = Zeroizing::new([0u8; 32]);
+        if raw.len() != key.len() { return Err("Invalid session key length".into()); }
+        key.copy_from_slice(&raw);
+        Ok(key)
+    }
+
+    fn session_key(&self) -> Result<SessionMasterKey, String> {
+        let raw = self.master_bytes()?;
+        Ok(SessionMasterKey::from_array(*raw))
     }
 
     fn validate(&self) -> Result<(), String> {
@@ -292,11 +300,108 @@ impl UnlockedCredentialContainer {
     }
 }
 
+/// Experimental bridge for existing SessionStore callers. This only routes
+/// session INI; key management, other protected files, backup and the service
+/// lifecycle are not switched to it yet. Never mix it with the live service
+/// until all those paths use the same container transaction boundary.
+pub struct ContainerSessionVault {
+    root: std::path::PathBuf,
+    unlocked: std::sync::Mutex<Option<UnlockedCredentialContainer>>,
+}
+
+impl ContainerSessionVault {
+    pub fn new(root: &std::path::Path, unlocked: UnlockedCredentialContainer) -> Result<Self, String> {
+        let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+        Ok(Self { root, unlocked: std::sync::Mutex::new(Some(unlocked)) })
+    }
+
+    /// Drop the derived encryption key and release the file lock.
+    pub fn lock(&self) -> Result<(), String> {
+        let mut guard = self.unlocked.lock().map_err(|_| "Container session is unavailable")?;
+        *guard = None;
+        Ok(())
+    }
+
+    fn check_root(&self, root: &std::path::Path) -> Result<(), linscp_platform::PlatformError> {
+        let actual = std::fs::canonicalize(root)?;
+        if actual != self.root {
+            return Err(linscp_platform::PlatformError::SecretVault("Container session belongs to a different configuration root".into()));
+        }
+        Ok(())
+    }
+
+    fn error(message: impl ToString) -> linscp_platform::PlatformError {
+        linscp_platform::PlatformError::SecretVault(message.to_string())
+    }
+}
+
+impl linscp_platform::SecretVault for ContainerSessionVault {
+    fn protects_session_store(&self) -> bool { true }
+
+    fn load_master_key(&self, config_dir: &std::path::Path) -> Result<Option<Zeroizing<[u8; 32]>>, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        Ok(Some(document.master_bytes().map_err(Self::error)?))
+    }
+
+    fn load_or_create_master_key(&self, config_dir: &std::path::Path) -> Result<Zeroizing<[u8; 32]>, linscp_platform::PlatformError> {
+        self.load_master_key(config_dir)?.ok_or_else(|| Self::error("Vault is locked"))
+    }
+
+    fn read_session_ini(&self, config_dir: &std::path::Path) -> Result<linscp_platform::SessionIniRead, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        Ok(linscp_platform::SessionIniRead::Plaintext(Zeroizing::new(document.sessions_ini.clone())))
+    }
+
+    fn write_session_ini(&self, config_dir: &std::path::Path, text: &str) -> Result<bool, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
+        let mut document = session.read().map_err(Self::error)?;
+        document.sessions_ini.zeroize();
+        document.sessions_ini.push_str(text);
+        session.write(&document).map_err(Self::error)?;
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn existing_session_store_api_uses_container_without_legacy_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let unlocked = vault.unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        let mut sessions = SessionStore::load_from_dir(dir.path(), &bridge).unwrap();
+        let mut site = StoredSite::new("sample", ProtocolScheme::Sftp, "example.test");
+        site.password = Some("secret".into());
+        sessions.upsert(site);
+        sessions.save_to_dir(dir.path(), &bridge).unwrap();
+        SessionStore::protect_existing(dir.path(), &bridge).unwrap();
+        assert_eq!(SessionStore::load_from_dir(dir.path(), &bridge).unwrap().find("sample").unwrap().password.as_deref(), Some("secret"));
+        assert!(!dir.path().join("sessions.ini").exists());
+        assert!(!dir.path().join("sessions.key").exists());
+        let other = tempfile::tempdir().unwrap();
+        assert!(SessionStore::load_from_dir(other.path(), &bridge).is_err());
+        bridge.lock().unwrap();
+        assert!(SessionStore::load_from_dir(dir.path(), &bridge).is_err());
+        assert!(sessions.save_to_dir(dir.path(), &bridge).is_err());
+        assert!(!dir.path().join("sessions.ini").exists());
+        let reopened = CredentialContainer::acquire(&path).unwrap().unlock("test password").ok().unwrap();
+        assert_eq!(reopened.load_sessions().unwrap().find("sample").unwrap().password.as_deref(), Some("secret"));
+    }
 
     #[test]
     fn unlocked_session_keeps_lock_and_commits_without_password() {

@@ -272,12 +272,28 @@ pub trait LocalFs: Send + Sync {
     }
 }
 
+/// Optional storage override for the decoded session INI. `Unhandled` keeps
+/// the legacy filesystem implementation; handled backends must fail closed.
+pub enum SessionIniRead {
+    Unhandled,
+    Missing,
+    Plaintext(Zeroizing<String>),
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
 pub trait SecretVault: Send + Sync {
     fn load_master_key(&self, config_dir: &Path) -> Result<Option<Zeroizing<[u8; 32]>>, PlatformError>;
     fn load_or_create_master_key(&self, config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError>;
+    /// Backends may store session INI in an authenticated container instead of
+    /// `sessions.ini`. A handled write must be atomic and refuse locked access.
+    fn read_session_ini(&self, _config_dir: &Path) -> Result<SessionIniRead, PlatformError> {
+        Ok(SessionIniRead::Unhandled)
+    }
+    fn write_session_ini(&self, _config_dir: &Path, _text: &str) -> Result<bool, PlatformError> {
+        Ok(false)
+    }
     /// The local password vault protects the entire session store, not just secrets.
     fn protects_session_store(&self) -> bool { false }
     fn seal_session_store(&self, _plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
