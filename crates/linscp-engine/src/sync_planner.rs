@@ -450,15 +450,14 @@ fn collect_local_tree_fs(
     let mut children = fs.list_dir(root_uri).map_err(|e| format!("Cannot read local directory '{root_uri}': {e}"))?;
     children.sort_by(|a, b| a.name.cmp(&b.name));
     for child in children {
-        if child.name == "."
-            || child.name == ".."
-            || child.name.ends_with(".filepart")
-            || child.name.contains(".filepart.v")
-        {
+        if child.name == "." || child.name == ".." {
             continue;
         }
         if !valid_sync_entry_name(&child.name) {
             return Err("Invalid directory entry name.".to_string());
+        }
+        if child.name.ends_with(".filepart") || child.name.contains(".filepart.v") {
+            continue;
         }
         if child.is_symlink {
             mark_ancestor_retained(retained_dirs, rel_prefix);
@@ -575,15 +574,14 @@ async fn collect_remote_tree(
         .await
         .map_err(|e| format!("Cannot list remote directory '{root}': {e}"))?;
     for entry in entries {
-        if entry.name == "."
-            || entry.name == ".."
-            || entry.name.ends_with(".filepart")
-            || entry.name.contains(".filepart.v")
-        {
+        if entry.name == "." || entry.name == ".." {
             continue;
         }
         if !valid_sync_entry_name(&entry.name) {
             return Err("Invalid remote directory entry name.".to_string());
+        }
+        if entry.name.ends_with(".filepart") || entry.name.contains(".filepart.v") {
+            continue;
         }
         if entry.is_symlink {
             mark_ancestor_retained(retained_dirs, rel_prefix);

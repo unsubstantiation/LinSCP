@@ -1964,6 +1964,21 @@
     </div>
   </div>
 
+  <!-- Retry an undecodable file without discarding an already-open editor. -->
+  <div class="modal-overlay" id="editorEncodingRetryModal" role="dialog" aria-modal="true" aria-labelledby="editorEncodingRetryTitle">
+    <div class="modal-box" style="width:480px; max-width:96vw;">
+      <div class="modal-header"><span id="editorEncodingRetryTitle">Cannot open the file.</span>
+        <button type="button" class="modal-close" onclick="cancelEditorEncodingRetry()" aria-label="Close">&#10005;</button></div>
+      <div class="modal-body">
+        <p id="editorEncodingRetryError" role="alert"></p>
+        <label for="editorRetryEncoding">Text encoding:</label>
+        <select id="editorRetryEncoding" class="select-field"><option value="UTF-8">UTF-8</option></select>
+      </div>
+      <div class="modal-footer"><button class="btn btn-primary" onclick="retryEditorEncoding()">Open</button>
+        <button class="btn" onclick="cancelEditorEncodingRetry()">Cancel</button></div>
+    </div>
+  </div>
+
   <!-- Search -->
   <div class="modal-overlay" id="searchModal" role="dialog" aria-modal="true" aria-label="Find files">
     <div class="modal-box" style="width:720px; max-width:96vw;">
@@ -6942,11 +6957,21 @@
     'Windows-1250', 'Windows-1251', 'Shift_JIS', 'EUC-JP', 'GBK', 'Big5', 'EUC-KR'
   ];
 
+  function selectEncoding(id, desired) {
+    const select = $(id);
+    if (!select) return;
+    const options = [...select.options];
+    const wanted = String(desired || 'utf-8').toLowerCase();
+    const option = options.find(item => item.value.toLowerCase() === wanted)
+      || options.find(item => item.value.toLowerCase() === 'utf-8') || options[0];
+    if (option) select.value = option.value;
+  }
+
   function populateEncodingSelects() {
     const list = Array.isArray(state.supportedEncodings) && state.supportedEncodings.length
       ? state.supportedEncodings
       : DEFAULT_TEXT_ENCODINGS;
-    for (const id of ['editorEncoding', 'searchEncoding']) {
+    for (const id of ['editorEncoding', 'searchEncoding', 'editorRetryEncoding']) {
       const sel = $(id);
       if (!sel) continue;
       const current = sel.value || 'UTF-8';
@@ -6957,7 +6982,7 @@
         opt.textContent = enc;
         sel.appendChild(opt);
       }
-      sel.value = list.includes(current) ? current : 'UTF-8';
+      selectEncoding(id, current);
     }
   }
 
@@ -7118,7 +7143,7 @@
       original: '',
       baseMtime: null,
       baseMtimeNs: null,
-      initialEncoding: 'UTF-8',
+      initialEncoding: 'utf-8',
       initialEol: 'lf',
       initialBom: false,
       hasFormatMetadata: false,
@@ -7126,7 +7151,7 @@
       externalUploadCount: 0,
       dirty: true
     };
-    if ($('editorEncoding')) $('editorEncoding').value = 'UTF-8';
+    selectEncoding('editorEncoding', 'UTF-8');
     if ($('editorEol')) { $('editorEol').value = 'lf'; $('editorEol').disabled = false; }
     if ($('editorBom')) { $('editorBom').checked = false; $('editorBom').disabled = false; }
     updateExternalEditorControls();
@@ -7140,6 +7165,19 @@
     setTimeout(() => { if (editorInstance) editorInstance.focus(); }, 50);
   }
 
+  let pendingEditorEncodingRetry = null;
+  function cancelEditorEncodingRetry() {
+    pendingEditorEncodingRetry = null;
+    closeModal('editorEncodingRetryModal');
+    if (state.editor) selectEncoding('editorEncoding', state.editor.initialEncoding);
+  }
+  async function retryEditorEncoding() {
+    const retry = pendingEditorEncodingRetry;
+    if (!retry) return;
+    await openEditor(retry.path, retry.side, retry.readOnly,
+      $('editorRetryEncoding').value, retry.initialLine);
+  }
+
   async function openEditor(path, side, readOnly, requestedEncoding, initialLine) {
     side = side || 'remote';
     readOnly = !!readOnly;
@@ -7147,7 +7185,22 @@
     const endpoint = side === 'local' ? '/api/local/edit' : '/api/remote/edit';
     const encQuery = requestedEncoding ? '&encoding=' + encodeURIComponent(requestedEncoding) : '';
     const data = await apiGet(endpoint + '?tab=' + tabId() + '&path=' + encodePath(path) + encQuery);
-    if (!data || !data.success) { toast(errorMessage(data && data.error, t("Cannot open the file.")), true); return; }
+    if (!data || !data.success) {
+      const error = String((data && data.error) || '');
+      if (/invalid byte sequence|not valid utf-8|binary file containing nul/i.test(error)) {
+        pendingEditorEncodingRetry = {path, side, readOnly, initialLine};
+        $('editorEncodingRetryError').textContent = error;
+        selectEncoding('editorRetryEncoding', requestedEncoding || 'utf-8');
+        openModal('editorEncodingRetryModal');
+      } else {
+        toast(errorMessage(error, t("Cannot open the file.")), true);
+      }
+      return;
+    }
+    if (pendingEditorEncodingRetry) {
+      pendingEditorEncodingRetry = null;
+      closeModal('editorEncodingRetryModal');
+    }
     const detectedEncoding = (data.info && data.info.encoding) || requestedEncoding || 'UTF-8';
     const detectedEol = (data.info && data.info.eol) || 'lf';
     const detectedBom = !!(data.info && data.info.bom);
@@ -7171,7 +7224,7 @@
       externalUploadCount: preservedUploadCount,
       dirty: false
     };
-    if ($('editorEncoding')) $('editorEncoding').value = detectedEncoding;
+    selectEncoding('editorEncoding', detectedEncoding);
     if ($('editorEol')) { $('editorEol').value = detectedEol; $('editorEol').disabled = readOnly; }
     if ($('editorBom')) { $('editorBom').checked = detectedBom; $('editorBom').disabled = readOnly; }
     updateExternalEditorControls();
@@ -7264,7 +7317,7 @@
     const enc = ($('editorEncoding') && $('editorEncoding').value) || 'UTF-8';
     const eol = ($('editorEol') && $('editorEol').value) || 'lf';
     const bom = !!($('editorBom') && $('editorBom').checked);
-    return enc !== (state.editor.initialEncoding || 'UTF-8')
+    return enc.toLowerCase() !== (state.editor.initialEncoding || 'UTF-8').toLowerCase()
       || eol !== (state.editor.initialEol || 'lf')
       || bom !== !!state.editor.initialBom;
   }
@@ -7414,7 +7467,7 @@
     if ($('searchMaxSizeUnit')) $('searchMaxSizeUnit').value = '1024';
     if ($('searchModifiedAfter')) $('searchModifiedAfter').value = '';
     if ($('searchModifiedBefore')) $('searchModifiedBefore').value = '';
-    if ($('searchEncoding')) $('searchEncoding').value = 'UTF-8';
+    selectEncoding('searchEncoding', 'UTF-8');
     toggleSearchContents();
     openModal('searchModal');
   }
@@ -9223,6 +9276,7 @@
       event.target.isContentEditable === true ||
       (event.target.closest && !!event.target.closest('.cm-editor'));
     if (event.key === 'Escape') {
+      if ($('editorEncodingRetryModal').classList.contains('open')) { cancelEditorEncodingRetry(); return; }
       if ($('hostKeyModal').classList.contains('open')) { await cancelHostKey(); return; }
       if ($('terminalHelpModal') && $('terminalHelpModal').classList.contains('open')) { closeTerminalHelp(); return; }
       if ($('terminalModal').classList.contains('open')) { if (!embeddedTerminal) closeTerminal(); return; }

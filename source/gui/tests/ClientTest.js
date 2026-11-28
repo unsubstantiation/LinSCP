@@ -4754,8 +4754,34 @@ function options(id) {
     check('closing external editor session posts id to /api/editor/external/close',
       !!extCloseCall && JSON.parse(extCloseCall.options.body).id === 'ext-42');
     window.closeEditor();
+    responses['/api/status'] = Object.assign({}, prevStatus, {
+      supported_encodings: ['utf-8', 'utf-16le', 'windows-1252']
+    });
+    await window.refreshStatus();
+    responses['/api/remote/edit'] = { success: false, error: 'File is not valid UTF-8 binary/encoded text.' };
+    await window.openEditor('/tmp/slowremote/legacy.txt', 'remote', false);
+    check('undecodable file offers encoding retry without opening the editor',
+      doc.getElementById('editorEncodingRetryModal').classList.contains('open') &&
+      !doc.getElementById('editorModal').classList.contains('open') &&
+      doc.getElementById('editorRetryEncoding').value === 'utf-8');
+    doc.getElementById('editorRetryEncoding').value = 'windows-1252';
+    responses['/api/remote/edit'] = { success: true, content: 'café',
+      info: { encoding: 'windows-1252', eol: 'lf', bom: false, mtime: 123 } };
+    await window.retryEditorEncoding();
+    const retryCall = calls.filter(c => c.path === '/api/remote/edit').pop();
+    check('retry opens with selected lowercase backend encoding',
+      new URL(retryCall.url, 'http://localhost').searchParams.get('encoding') === 'windows-1252' &&
+      doc.getElementById('editorEncoding').value === 'windows-1252' &&
+      !doc.getElementById('editorEncodingRetryModal').classList.contains('open'));
+    window.markDirty();
+    check('unchanged lowercase encoding is not dirty', doc.getElementById('editorStatus').textContent === 'No changes');
+    window.closeEditor();
+    window.openSearch();
+    check('search defaults to backend lowercase utf-8', doc.getElementById('searchEncoding').value === 'utf-8');
+    window.closeModal('searchModal');
     responses['/api/remote/edit'] = prevRemoteEdit;
     responses['/api/status'] = prevStatus;
+    await window.refreshStatus();
     delete responses['/api/editor/external'];
     delete responses['/api/editor/external/close'];
 
@@ -4763,11 +4789,11 @@ function options(id) {
     doc.getElementById('searchContents').checked = true;
     window.toggleSearchContents();
     doc.getElementById('searchText').value = 'latin';
-    doc.getElementById('searchEncoding').value = 'Windows-1252';
+    doc.getElementById('searchEncoding').value = 'windows-1252';
     await window.runSearch();
     const encSearchCall = calls.filter(c => c.path === '/api/remote/search').pop();
     check('content search forwards selected text encoding',
-      !!encSearchCall && JSON.parse(encSearchCall.options.body).encoding === 'Windows-1252');
+      !!encSearchCall && JSON.parse(encSearchCall.options.body).encoding === 'windows-1252');
     window.closeModal('searchModal');
 
     // 4. Preferences XML log settings & XML log viewer/clear.
