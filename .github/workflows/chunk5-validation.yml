@@ -21,6 +21,8 @@ jobs:
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto proxy -- --nocapture
       - name: Tunnel and proxy integration
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto --test ssh_sftp_scp_tunnel -- --nocapture
+      - name: Proxy bypass policy
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine proxy_bypass_uses_real_loopback -- --nocapture
       - name: Service GSSAPI policy
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service gssapi -- --nocapture
   kerberos:
