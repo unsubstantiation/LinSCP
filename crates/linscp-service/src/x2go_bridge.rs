@@ -162,6 +162,10 @@ impl X2GoBridge {
         X2GoInput { commands: self.commands.clone(), allow_clipboard: self.allow_clipboard }
     }
 
+    /// A finished actor has completed its remote cleanup attempt. The service
+    /// can reap an abandoned registration before starting a replacement.
+    pub fn is_finished(&self) -> bool { self.task.is_finished() }
+
     /// Nonblocking poll; touch renews the lease even when no frame is ready.
     pub fn poll(&mut self) -> Result<Option<Value>, &'static str> {
         let received = self.messages.try_recv();

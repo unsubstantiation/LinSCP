@@ -62,7 +62,7 @@ an abandoned viewer lease expires after 60 seconds. Explicit suspend keeps the
 output receiver alive until the actor processes the suspend command, even when
 the output queue is full or the requesting API future is cancelled. It reports
 an error rather than claiming suspension when the bridge already terminated.
-A tab remains reserved while explicit shutdown runs, even if the API caller is cancelled, so a replacement viewer cannot race the old cleanup. Startup also retains its reservation after API cancellation; if its successful reply cannot be delivered, the service attempts cleanup. A reply lost after delivery is still governed by the viewer lease. These measures only protect local lifecycle ordering; a broken SSH connection or
+A tab remains reserved while explicit shutdown runs, even if the API caller is cancelled, so a replacement viewer cannot race the old cleanup. After an abandoned bridge has finished its cleanup attempt, the next open reaps its stale registration. Startup also retains its reservation after API cancellation; if its successful reply cannot be delivered, the service attempts cleanup. A reply lost after delivery is still governed by the viewer lease. These measures only protect local lifecycle ordering; a broken SSH connection or
 server-side failure can still leave the remote session's state unknown. The experimental X2Go
 open route registers that bridge and the page polls it, forwards input, and
 requests close. Poll, input and close carry a service-issued generation so

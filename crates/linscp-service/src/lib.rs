@@ -3514,6 +3514,12 @@ impl CommanderService {
         }
         let (session, ssh) = {
             let mut state = self.state.lock().expect("state mutex");
+            // An abandoned viewer may have expired and completed cleanup with
+            // nobody left to call close. Reap it only after the actor finishes;
+            // never race an in-flight suspend or terminate on the same tab.
+            if state.x2go.get(&id).is_some_and(|entry| entry.bridge.is_finished()) {
+                state.x2go.remove(&id);
+            }
             if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) || state.x2go_stopping.contains(&id) { return api_error(409, "An X2Go viewer is already open, starting, or stopping for this tab."); }
             let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else { return api_error(400, "Not connected"); };
             let Some(session) = tab.remote.as_ref().cloned() else { return api_error(400, "Not connected"); };
@@ -13510,6 +13516,28 @@ mod tests {
         assert_eq!(closed.status, 200);
         assert!(cleanup.await.is_ok());
         assert_eq!(svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=1", json!({}))).status, 400);
+    }
+
+    #[tokio::test]
+    async fn x2go_reopen_reaps_finished_abandoned_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, server) = tokio::io::duplex(1024);
+        let (signal, cleanup) = tokio::sync::oneshot::channel();
+        svc.state.lock().unwrap().x2go.insert(7, X2GoRegistered {
+            generation: "1".into(), bridge: x2go_bridge::test_bridge(client, signal),
+        });
+        drop(server);
+        cleanup.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if svc.state.lock().unwrap().x2go.get(&7).unwrap().bridge.is_finished() { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let open = ApiEnvelope { method: "POST".into(), path: "/api/x2go/open".into(), body: json!({"tab":7,"desktop":"XFCE","width":800,"height":600}) };
+        assert_eq!(svc.dispatch_async(open).await.status, 400); // no connected tab, but no stale-viewer conflict
+        assert!(!svc.state.lock().unwrap().x2go.contains_key(&7));
     }
 
     #[tokio::test]
