@@ -140,7 +140,7 @@ bounds parsed incoming messages, enables input only after a main image, and
 closes on overflow, decode errors or disconnect. A supplied transport must write
 packets, request a new main image on reinitialization, and arrange remote agent
 cleanup; the reader delivers messages and uses a heuristic to identify barrier replies.
-The page connects the opted-in text clipboard callbacks to native clipboard APIs, falling back to WebView clipboard access where available; malformed or interleaved selection chunks are discarded, and selection-demand replies preserve the requested selection (0 or 1). Clipboard permissions and actual protocol interoperability remain platform-dependent. Tests exercise this wiring with a simulated transport and WebView. The page
+The page connects the opted-in text clipboard callbacks to native clipboard APIs, falling back to WebView clipboard access where available; malformed or interleaved selection chunks are discarded, and selection-demand replies preserve the requested selection (0 or 1). Server start and resume commands request clipboard mode `both` only when this viewer opts in, otherwise `none`. Clipboard permissions, provider behavior and actual protocol interoperability remain platform-dependent. Tests exercise this wiring with a simulated transport and WebView. The page
 uses `/api/x2go/open`, poll, input and close; it has not been tested against an
 actual X2Go server. Generic desktop launch/ticket requests still reject X2Go.
 

@@ -65,13 +65,18 @@ impl X2GoLink {
 /// desktop value is used in the session ID; the actual desktop is started
 /// separately after the graphics connection is ready.
 pub fn start_command(width: u16, height: u16, desktop: X2GoDesktop, link: X2GoLink) -> Result<String, &'static str> {
+    start_command_with_clipboard(width, height, desktop, link, false)
+}
+
+/// Clipboard is enabled server-side only after an explicit per-viewer opt-in.
+pub fn start_command_with_clipboard(width: u16, height: u16, desktop: X2GoDesktop, link: X2GoLink, allow_clipboard: bool) -> Result<String, &'static str> {
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION ||
         u32::from(width) * u32::from(height) > MAX_PIXELS {
         return Err("Invalid X2Go desktop dimensions.");
     }
     Ok(format!(
-        "x2gostartagent {width}x{height} {} 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K {} none",
-        link.argument(), desktop.argument()
+        "x2gostartagent {width}x{height} {} 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K {} {}",
+        link.argument(), desktop.argument(), if allow_clipboard { "both" } else { "none" }
     ))
 }
 
@@ -142,12 +147,16 @@ pub fn validate_session_id(session_id: &str) -> Result<&str, &'static str> {
 
 /// Builds a validated `x2goresume-session` command without arbitrary shell input.
 pub fn resume_command(session_id: &str, width: u16, height: u16, link: X2GoLink) -> Result<String, &'static str> {
+    resume_command_with_clipboard(session_id, width, height, link, false)
+}
+
+pub fn resume_command_with_clipboard(session_id: &str, width: u16, height: u16, link: X2GoLink, allow_clipboard: bool) -> Result<String, &'static str> {
     let id = validate_session_id(session_id)?;
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION ||
         u32::from(width) * u32::from(height) > MAX_PIXELS {
         return Err("Invalid X2Go desktop dimensions.");
     }
-    Ok(format!("x2goresume-session {id} {width}x{height} {} 16m-jpeg-9 us pc105/us 0 none", link.argument()))
+    Ok(format!("x2goresume-session {id} {width}x{height} {} 16m-jpeg-9 us pc105/us 0 {}", link.argument(), if allow_clipboard { "both" } else { "none" }))
 }
 
 impl Drop for X2GoStartedSession {
@@ -249,7 +258,14 @@ pub async fn start_guarded_agent(
     ssh: Arc<SshConnection>, width: u16, height: u16, desktop: X2GoDesktop,
     link: X2GoLink, timeout: Duration,
 ) -> Result<X2GoAgentGuard, ProtoError> {
-    let command = start_command(width, height, desktop, link)
+    start_guarded_agent_with_clipboard(ssh, width, height, desktop, link, timeout, false).await
+}
+
+pub async fn start_guarded_agent_with_clipboard(
+    ssh: Arc<SshConnection>, width: u16, height: u16, desktop: X2GoDesktop,
+    link: X2GoLink, timeout: Duration, allow_clipboard: bool,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = start_command_with_clipboard(width, height, desktop, link, allow_clipboard)
         .map_err(|_| ProtoError::Transport("Invalid X2Go startup parameters.".into()))?;
     if timeout.is_zero() || timeout > Duration::from_secs(120) {
         return Err(ProtoError::Transport("Invalid X2Go startup timeout.".into()));
@@ -491,7 +507,14 @@ pub async fn resume_guarded_agent(
     link: X2GoLink,
     timeout: Duration,
 ) -> Result<X2GoAgentGuard, ProtoError> {
-    let command = resume_command(session_id, width, height, link)
+    resume_guarded_agent_with_clipboard(ssh, session_id, width, height, link, timeout, false).await
+}
+
+pub async fn resume_guarded_agent_with_clipboard(
+    ssh: Arc<SshConnection>, session_id: &str, width: u16, height: u16,
+    link: X2GoLink, timeout: Duration, allow_clipboard: bool,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = resume_command_with_clipboard(session_id, width, height, link, allow_clipboard)
         .map_err(|msg| ProtoError::Transport(msg.into()))?;
     let target_id = session_id.to_string();
     if timeout.is_zero() || timeout > Duration::from_secs(120) {
@@ -693,6 +716,9 @@ mod tests {
     fn startup_command_is_bounded_and_uses_only_known_arguments() {
         assert_eq!(start_command(1280, 720, X2GoDesktop::Mate, X2GoLink::Adsl).unwrap(),
             "x2gostartagent 1280x720 adsl 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K MATE none");
+        assert!(start_command_with_clipboard(800, 600, X2GoDesktop::Xfce, X2GoLink::Lan, true).unwrap().ends_with(" XFCE both"));
+        assert!(resume_command_with_clipboard("alice-50-test", 800, 600, X2GoLink::Lan, true).unwrap().ends_with(" 0 both"));
+        assert!(resume_command_with_clipboard("alice-50-test", 800, 600, X2GoLink::Lan, false).unwrap().ends_with(" 0 none"));
         assert!(start_command(0, 10, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());
         assert!(start_command(8193, 1, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());
         assert!(start_command(8192, 8192, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());

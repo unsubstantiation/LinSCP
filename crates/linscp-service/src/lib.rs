@@ -3490,7 +3490,7 @@ impl CommanderService {
 
     async fn x2go_open_inner(&self, body: Value) -> ApiReply {
         use linscp_proto::x2go_control::{
-            resume_command, resume_guarded_agent, start_command, start_guarded_agent, X2GoDesktop, X2GoLink,
+            resume_command, resume_guarded_agent_with_clipboard, start_command, start_guarded_agent_with_clipboard, X2GoDesktop, X2GoLink,
         };
         use linscp_proto::x2go_transport::GuardedKDriveSession;
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
@@ -3529,12 +3529,12 @@ impl CommanderService {
             _ => return api_error(400, "Could not check the X2Go server."),
         }
         let (agent, is_resumed) = if let Some(resume_id) = resume_session_id {
-            match resume_guarded_agent(ssh.clone(), resume_id, width, height, X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+            match resume_guarded_agent_with_clipboard(ssh.clone(), resume_id, width, height, X2GoLink::Lan, std::time::Duration::from_secs(75), allow_clipboard).await {
                 Ok(agent) => (agent, true),
                 Err(error) => return api_error(400, error.to_string()),
             }
         } else {
-            match start_guarded_agent(ssh.clone(), width, height, desktop.expect("desktop validated"), X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+            match start_guarded_agent_with_clipboard(ssh.clone(), width, height, desktop.expect("desktop validated"), X2GoLink::Lan, std::time::Duration::from_secs(75), allow_clipboard).await {
                 Ok(agent) => (agent, false),
                 Err(error) => return api_error(400, error.to_string()),
             }

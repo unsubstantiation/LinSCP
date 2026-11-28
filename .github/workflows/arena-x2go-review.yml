@@ -33,3 +33,14 @@ jobs:
             python -c 'import pathlib; s=pathlib.Path("x2go-test.log").read_text(errors="replace"); s=s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error::" + s[-16000:])'
           fi
           exit "$status"
+
+  package-probe:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check availability of KDrive packages
+        run: |
+          sudo apt-get update -qq
+          for package in x2goserver x2goserver-x2gokdrive xserver-x2gokdrive xfce4 openssh-server; do
+            candidate=$(apt-cache policy "$package" | sed -n 's/^  Candidate: //p')
+            echo "::notice::$package candidate ${candidate:-unavailable}"
+          done
