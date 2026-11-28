@@ -65,6 +65,31 @@ fn session_key_references(ini: &str) -> Result<BTreeSet<String>, String> {
     Ok(ids)
 }
 
+// A full backup does not embed arbitrary files referenced by legacy sessions.
+// Refuse rather than produce a seemingly portable backup with broken credentials.
+fn validate_portable_session_material(ini: &str) -> Result<(), String> {
+    let store = SessionStore::parse_ini(ini, None)?;
+    for site in store.sites() {
+        for (field, value, prefix) in [
+            ("private key", site.private_key.as_deref(), "vaultkey://"),
+            ("tunnel key", site.tunnel.keyfile.as_deref(), "vaultkey://"),
+            ("public key", site.extra_fields.get("linscp_public_key_file").map(String::as_str), "vaultpub://"),
+            ("tunnel public key", site.extra_fields.get("linscp_tunnel_public_key_file").map(String::as_str), "vaultpub://"),
+            ("CA certificate", site.extra_fields.get("ca_certificate_file").map(String::as_str), "vaulttls://"),
+            ("client certificate", site.extra_fields.get("tls_certificate_file").map(String::as_str), "vaulttls://"),
+            ("client key", site.extra_fields.get("tls_certificate_key_file").map(String::as_str), "vaulttls://"),
+        ] {
+            if value.is_some_and(|v| !v.trim().is_empty() && !v.starts_with(prefix)) {
+                return Err(format!("Cannot export full backup: session '{}' has an external {field}. Use key/session export or move the material into the vault first.", site.name));
+            }
+        }
+        if site.extra_fields.get("ca_certificate_dir").is_some_and(|v| !v.trim().is_empty()) {
+            return Err(format!("Cannot export full backup: session '{}' has an external CA certificate directory. Use key/session export first.", site.name));
+        }
+    }
+    Ok(())
+}
+
 fn collect_vault_keys(config_dir: &Path, vault: &dyn SecretVault) -> Result<Vec<BackupVaultKey>, String> {
     let key_dir = config_dir.join("keys");
     let ids = list_ids(&key_dir, ".key.vault", KEY_COUNT_LIMIT)?;
@@ -383,6 +408,7 @@ pub fn export_backup(
     let sessions_ini = SessionStore::read_ini_text(config_dir, vault)?
         .map(|s| normalize_to_lf(&s))
         .unwrap_or_default();
+    validate_portable_session_material(&sessions_ini)?;
     validate_key_references(&sessions_ini, &vault_keys)?;
     validate_public_key_references(&sessions_ini, &vault_keys, &vault_public_keys)?;
     validate_tls_references(&sessions_ini, &vault_tls_blobs)?;
@@ -1061,6 +1087,23 @@ mod tests {
             monitor_json: None,
             transfer_presets_ini: None,
         }
+    }
+
+    #[test]
+    fn full_backup_rejects_external_session_credentials() {
+        let mut store = SessionStore::new();
+        let mut site = crate::session_store::StoredSite::new("legacy", linscp_types::ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some("/old-machine/id".into());
+        store.upsert(site.clone());
+        assert!(validate_portable_session_material(&store.serialize_ini(None).unwrap()).unwrap_err().contains("external private key"));
+        site.private_key = None;
+        site.extra_fields.insert("tls_certificate_key_file".into(), "C:\\old\\key.pem".into());
+        store.upsert(site.clone());
+        assert!(validate_portable_session_material(&store.serialize_ini(None).unwrap()).unwrap_err().contains("external client key"));
+        site.extra_fields.clear();
+        site.extra_fields.insert("ca_certificate_dir".into(), "/old-ca".into());
+        store.upsert(site);
+        assert!(validate_portable_session_material(&store.serialize_ini(None).unwrap()).unwrap_err().contains("external CA"));
     }
 
     #[cfg(any(target_os = "linux", target_os = "android", windows))]

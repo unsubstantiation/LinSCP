@@ -12077,6 +12077,7 @@ fn import_offlineotp_entries(
     replace_same_names: bool,
 ) -> Result<(usize, usize, usize), String> {
     let mut created_files = Vec::<PathBuf>::new();
+    let mut sessions_published = false;
     let result = (|| {
         let OfflineOtpImportPlan { sites, vault_keys, ignored } = plan_offlineotp_import(imported, selection)?;
         // Stage standalone keys first, so referenced keys deduplicate against
@@ -12166,15 +12167,28 @@ fn import_offlineotp_entries(
                 let Some((hk_host, hk_port_str)) = hk.host_port.rsplit_once('@') else { continue; };
                 let Ok(hk_port) = hk_port_str.parse::<u16>() else { continue; };
                 let existing_fp = hostkey_cache.lookup(hk_host, hk_port, &hk.key_type);
-                if existing_fp.is_none() || replace_same_names {
-                    if existing_fp != Some(hk.key.as_str()) {
+                match existing_fp {
+                    Some(existing) if existing != hk.key.as_str() => return Err(format!(
+                        "Cannot import '{}': cached SSH host key for {} conflicts with an existing key. Resolve the conflict first.",
+                        candidate.site.name, hk.host_port
+                    )),
+                    Some(_) => {},
+                    None => {
                         hostkey_cache.upsert(hk_host, hk_port, &hk.key_type, &hk.key)?;
                         hostkeys_changed = true;
                     }
                 }
             }
             if let Some(preset) = candidate.transfer_preset.take() {
-                if preset_store.find(&preset.name).is_none() || replace_same_names {
+                if let Some(existing) = preset_store.find(&preset.name) {
+                    // Presets are shared with other sessions. Even an explicit
+                    // session replacement must not silently change those sessions.
+                    let mut comparable = preset.clone();
+                    comparable.name = existing.name.clone();
+                    if existing != &comparable {
+                        return Err(format!("Cannot import '{}': transfer preset '{}' conflicts with an existing preset. Resolve the conflict first.", candidate.site.name, preset.name));
+                    }
+                } else {
                     preset_store.add_or_update(preset)?;
                     presets_changed = true;
                 }
@@ -12188,6 +12202,7 @@ fn import_offlineotp_entries(
         }
         store.save_to_dir(config_root, secret_vault)
             .map_err(|error| format!("Cannot save imported sessions: {error}"))?;
+        sessions_published = true;
         if hostkeys_changed {
             hostkey_cache.save_protected(&config_root.join("sshhostkeys"), secret_vault)
                 .map_err(|error| format!("Cannot save imported SSH host keys: {error}"))?;
@@ -12210,7 +12225,7 @@ fn import_offlineotp_entries(
         Ok((staged_site_names.len(), skipped, ignored))
     })();
 
-    if result.is_err() {
+    if result.is_err() && !sessions_published {
         for path in created_files {
             let _ = std::fs::remove_file(path);
         }
@@ -13587,6 +13602,46 @@ mod tests {
                     reply.payload,
                 );
             }
+        }
+    }
+
+    #[test]
+    fn key_session_import_refuses_shared_preset_and_hostkey_conflicts() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let source_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        let dest_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        source_vault.unlock_or_setup(src.path(), "source passphrase", &NativeSecretVault::new()).unwrap();
+        dest_vault.unlock_or_setup(dst.path(), "destination passphrase", &NativeSecretVault::new()).unwrap();
+        let mut source = SessionStore::new();
+        let mut site = StoredSite::new("imported", ProtocolScheme::Sftp, "example.test");
+        site.preset = "shared".into();
+        source.upsert(site);
+        let mut presets = linscp_engine::presets::TransferPresetStore::default();
+        presets.add_or_update(linscp_engine::presets::TransferPreset { name: "shared".into(), newer_only: Some(true), ..Default::default() }).unwrap();
+        presets.save_to_dir(src.path()).unwrap();
+        let mut hostkeys = linscp_engine::hostkeys::HostKeyCache::new();
+        hostkeys.upsert("example.test", 22, "ssh-ed25519", "SHA256:source").unwrap();
+        hostkeys.save_protected(&src.path().join("sshhostkeys"), &source_vault).unwrap();
+        let entries = offlineotp_entries_from_sessions(&source, src.path(), &source_vault, None, false).unwrap();
+        let backup = offlineotp_vault::seal(&entries, "backup passphrase").unwrap();
+        let opened = || offlineotp_vault::open(&backup, "backup passphrase").unwrap();
+        let mut other = linscp_engine::presets::TransferPresetStore::default();
+        other.add_or_update(linscp_engine::presets::TransferPreset { name: "SHARED".into(), newer_only: Some(false), ..Default::default() }).unwrap();
+        other.save_to_dir(dst.path()).unwrap();
+        for replace in [false, true] {
+            let err = import_offlineotp_entries(dst.path(), SessionStore::new(), opened(), &dest_vault, None, replace).unwrap_err();
+            assert!(err.contains("preset") || err.contains("host key"), "{err}");
+            assert!(SessionStore::load_from_dir(dst.path(), &dest_vault).unwrap().find("imported").is_none());
+        }
+        presets.save_to_dir(dst.path()).unwrap();
+        let mut conflicting = linscp_engine::hostkeys::HostKeyCache::new();
+        conflicting.upsert("example.test", 22, "ssh-ed25519", "SHA256:other").unwrap();
+        conflicting.save_protected(&dst.path().join("sshhostkeys"), &dest_vault).unwrap();
+        for replace in [false, true] {
+            let err = import_offlineotp_entries(dst.path(), SessionStore::new(), opened(), &dest_vault, None, replace).unwrap_err();
+            assert!(err.contains("host key"), "{err}");
+            assert!(SessionStore::load_from_dir(dst.path(), &dest_vault).unwrap().find("imported").is_none());
         }
     }
 
