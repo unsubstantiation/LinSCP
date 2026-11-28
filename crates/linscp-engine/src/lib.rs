@@ -23,6 +23,7 @@ pub mod url_and_raw;
 pub mod xml_log;
 pub mod vault_keys;
 pub mod vault_material;
+pub mod vault_staging;
 
 use linscp_crypto::SessionMasterKey;
 use linscp_types::SessionConfig;

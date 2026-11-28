@@ -2774,12 +2774,18 @@ impl ScriptInterpreter {
             .password
             .as_deref()
             .is_some_and(|s| !s.is_empty());
-        let site = stored_site_from_spec(name, &spec);
+        let mut site = stored_site_from_spec(name, &spec);
         let site_proto = site.protocol.as_str().to_string();
         let site_user = site.username.clone();
         let site_host = site.host.clone();
+        let mut staged_keys = Vec::new();
+        let transactional = vault.supports_session_material_transactions();
+        if transactional { crate::vault_staging::stage_session_ssh_keys(&mut site, &mut staged_keys)?; }
         store.upsert(site);
-        store.save_to_dir(&self.cfg.config_dir, vault)?;
+        if transactional {
+            let imports: Vec<_> = staged_keys.iter().map(crate::vault_staging::StagedSessionKey::as_import).collect();
+            store.save_with_materials(&self.cfg.config_dir, vault, &imports)?;
+        } else { store.save_to_dir(&self.cfg.config_dir, vault)?; }
         let sessions_path = self.cfg.config_dir.join("sessions.ini");
         let sessions_loc = format!(" in {}", sessions_path.display());
         self.emit_status(&self.trp(
@@ -6549,6 +6555,33 @@ fn ssh_key_identity(line: &str) -> String {
 #[cfg(test)]
 mod console_sink_tests {
     use super::*;
+
+    #[test]
+    fn container_script_savesession_imports_key_atomically() {
+        use crate::container_credentials::{ContainerSessionVault, CredentialContainer};
+        let dir = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let key = source.path().join("id_test");
+        std::fs::write(&key, b"script private key").unwrap();
+        let path = dir.path().join("vault.dat");
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let vault = Arc::new(ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap());
+        let cfg = ScriptRunConfig { config_dir: dir.path().to_path_buf(), ..ScriptRunConfig::default() };
+        let logger = SessionLogger::open(None, 0, false, None, None, false, "").unwrap();
+        let mut interpreter = ScriptInterpreter::new(cfg, logger);
+        interpreter.set_secret_vault(vault.clone());
+        interpreter.cmd_savesession(&["site".into(), "sftp://alice@example.test".into(), format!("-privatekey={}", key.display())]).unwrap();
+        let store = SessionStore::load_from_dir(dir.path(), vault.as_ref()).unwrap();
+        let reference = store.find("site").unwrap().private_key.as_deref().unwrap();
+        let id = reference.strip_prefix("vaultkey://").unwrap();
+        assert_eq!(vault.read_ssh_key(id).unwrap().as_slice(), b"script private key");
+        assert!(!dir.path().join("sessions.ini").exists());
+        assert!(!dir.path().join("keys").exists());
+        let before = std::fs::read(&path).unwrap();
+        assert!(interpreter.cmd_savesession(&["bad".into(), "sftp://example.test".into(), format!("-privatekey={}", source.path().join("missing").display())]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
 
     fn interpreter() -> ScriptInterpreter {
         let cfg = ScriptRunConfig {

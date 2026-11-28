@@ -16,6 +16,7 @@ use linscp_engine::{
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
 use linscp_engine::vault_material::materialize_vault_key_paths;
+use linscp_engine::vault_staging::{stage_session_ssh_keys, StagedSessionKey};
 use linscp_engine::vault_keys::{valid_id as valid_vault_key_id, list_ids as list_vault_key_ids, read_file as read_vault_key_file};
 use linscp_platform::{
     config_dir, gui_os, write_exclusive_private_file, write_private_file_atomic, LocalFs,
@@ -12687,61 +12688,6 @@ fn cleanup_stale_temporary_keys(config_root: &Path) {
     }
 }
 
-struct StagedSessionKey {
-    id: String,
-    private: zeroize::Zeroizing<Vec<u8>>,
-    label: String,
-    public: String,
-}
-
-impl StagedSessionKey {
-    fn as_import(&self) -> linscp_platform::VaultMaterialImport<'_> {
-        linscp_platform::VaultMaterialImport::Ssh { id: &self.id, private: &self.private, label: &self.label, public_key: &self.public }
-    }
-}
-
-// Stage plaintext in zeroizing memory; the backend validates all existing
-// references and commits the new keys and session store in one replacement.
-fn stage_session_ssh_keys(site: &mut StoredSite, staged: &mut Vec<StagedSessionKey>) -> Result<(), String> {
-    site.extra_fields.retain(|key, _| {
-        let key = key.to_ascii_lowercase();
-        !key.contains("keyfile") && !key.ends_with("private_key_file")
-    });
-    for reference in [&mut site.private_key, &mut site.tunnel.keyfile] {
-        let Some(path) = reference.as_deref() else { continue };
-        if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
-            if !valid_vault_key_id(id) { return Err("Saved encrypted SSH key reference is invalid.".into()); }
-            continue;
-        }
-        let source = PathBuf::from(linscp_platform::terminal::expand_tilde(path));
-        if source.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pub")) { continue; }
-        let metadata = std::fs::metadata(&source).map_err(|e| format!("Cannot read private SSH key '{}': {e}", source.display()))?;
-        if !metadata.is_file() || metadata.len() > 1024 * 1024 { return Err(format!("Private SSH key '{}' is not a regular file under 1 MiB.", source.display())); }
-        use std::io::Read as _;
-        let file = std::fs::File::open(&source).map_err(|e| format!("Cannot read private SSH key '{}': {e}", source.display()))?;
-        let mut private = zeroize::Zeroizing::new(Vec::new());
-        file.take(1024 * 1024 + 1).read_to_end(&mut private).map_err(|e| e.to_string())?;
-        if private.is_empty() || private.len() > 1024 * 1024 { return Err("Invalid private SSH key size.".into()); }
-        if let Some(existing) = staged.iter().find(|key| constant_time_bytes_eq(&key.private, &private)) {
-            *reference = Some(format!("{LOCAL_VAULT_KEY_PREFIX}{}", existing.id));
-            continue;
-        }
-        let mut public_path = source.as_os_str().to_os_string();
-        public_path.push(".pub");
-        let mut public = read_bounded_key_optional(&PathBuf::from(public_path), 32 * 1024)?;
-        if public.is_empty() {
-            if let Ok(text) = std::str::from_utf8(&private) { public = derive_public_ssh_key_optional(text).unwrap_or_default(); }
-        }
-        let mut random = [0u8; 16];
-        rand::thread_rng().fill_bytes(&mut random);
-        let id = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
-        let name = source.file_name().and_then(|s| s.to_str()).unwrap_or("");
-        let label = derive_vault_key_label(name, &public, &id);
-        *reference = Some(format!("{LOCAL_VAULT_KEY_PREFIX}{id}"));
-        staged.push(StagedSessionKey { id, private, label, public });
-    }
-    Ok(())
-}
 
 fn protect_stored_ssh_keys(
     site: &mut StoredSite,
