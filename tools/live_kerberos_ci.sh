@@ -3,7 +3,13 @@
 set -euo pipefail
 root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/linscp-krb.XXXXXX")"
 chmod 755 "$root"
-trap 'sudo kill "${sshd_pid:-0}" 2>/dev/null || true; kill "${kdc_pid:-0}" 2>/dev/null || true; rm -rf "$root"' EXIT
+cleanup() {
+  if [[ -s "$root/sshd.pid" ]]; then sudo kill "$(cat "$root/sshd.pid")" 2>/dev/null || true; fi
+  if [[ -n "${sshd_pid:-}" ]]; then sudo kill "$sshd_pid" 2>/dev/null || true; fi
+  if [[ -n "${kdc_pid:-}" ]]; then kill "$kdc_pid" 2>/dev/null || true; fi
+  rm -rf "$root"
+}
+trap cleanup EXIT
 port() { python3 -c 'import socket;s=socket.socket();s.bind(("127.0.0.1",0));print(s.getsockname()[1]);s.close()'; }
 kdcport=$(port)
 sshport=$(port)
@@ -44,7 +50,12 @@ kadmin.local -r "$realm" -q "addprinc -randkey $USER@$realm"
 kadmin.local -r "$realm" -q "ktadd -k $root/user.keytab $USER@$realm"
 krb5kdc -n -r "$realm" >"$root/kdc.log" 2>&1 & kdc_pid=$!
 export KRB5CCNAME="FILE:$root/client.ccache"
-kinit -f -k -t "$root/user.keytab" "$USER@$realm"
+ready=0
+for _ in {1..30}; do
+  if kinit -f -k -t "$root/user.keytab" "$USER@$realm" 2>/dev/null; then ready=1; break; fi
+  sleep .1
+done
+if [[ "$ready" != 1 ]]; then cat "$root/kdc.log"; echo 'KDC failed to issue credentials' >&2; exit 1; fi
 ssh-keygen -q -t ed25519 -N '' -f "$root/ssh_host_key"
 cat > "$root/sshd_config" <<CONF
 ListenAddress 127.0.0.1
