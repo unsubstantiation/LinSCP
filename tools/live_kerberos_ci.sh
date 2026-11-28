@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Disposable loopback-only MIT KDC + OpenSSH. Intended for an isolated CI VM.
 set -euo pipefail
-root="$(mktemp -d "${RUNNER_TEMP:-/tmp}/linscp-krb.XXXXXX")"
+# The SSH login has a different uid; all parent directories of its Kerberos
+# configuration must be traversable. Individual keytabs remain mode 0600.
+root="$(mktemp -d /tmp/linscp-krb.XXXXXX)"
 chmod 755 "$root"
 cleanup() {
   if [[ -s "$root/sshd.pid" ]]; then sudo kill "$(cat "$root/sshd.pid")" 2>/dev/null || true; fi
@@ -29,6 +31,7 @@ cat > "$KRB5_CONFIG" <<CONF
  dns_canonicalize_hostname = false
  rdns = false
  forwardable = true
+ default_ccache_name = FILE:/tmp/krb5cc_%{uid}
 [realms]
  $realm = {
   kdc = 127.0.0.1:$kdcport
