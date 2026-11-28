@@ -46,8 +46,11 @@ The provider bridge checks for an existing destination before writing, but the
 check and write are **not atomic**. A document created or replaced concurrently
 can be overwritten even when a no-overwrite operation was requested. Provider
 writes can also leave partial documents on interruption. Avoid concurrent
-writers and do not rely on no-clobber guarantees in granted folders. Verified
-resume remains refused until checkpointing and publication have an adequate
+writers and do not rely on no-clobber guarantees in granted folders. Remote
+session downloads and moves into a granted folder, including S3 version
+downloads, require explicit per-request acknowledgement of this risk. This
+confirmation does not cover every other provider operation, such as local-pane
+copies or synchronization. Verified resume remains refused until checkpointing and publication have an adequate
 provider-specific safety contract.
 
 ## Uploads and overwrite

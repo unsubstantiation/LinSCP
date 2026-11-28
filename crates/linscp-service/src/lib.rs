@@ -1867,6 +1867,9 @@ impl CommanderService {
         if resume && exists {
             return api_error(400, "Verified resume requires a new local destination; choose another name or start a fresh download.");
         }
+        if is_saf_path(&local_dest.to_string_lossy()) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if exists && overwrite != "overwrite" {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
@@ -5042,6 +5045,11 @@ impl CommanderService {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
             }
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
+            if !upload && !tab.is_local && is_saf_path(&local.to_string_lossy()) && !resume
+                && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false)
+            {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+            }
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
                 match resolve_contained(&directory, name) { Ok(path) => path, Err(error) => return api_error(400, error) }
@@ -20131,6 +20139,13 @@ mod tests {
             Ok(())
         }
 
+        async fn s3_stat_version(&self, remote_path: &str, version_id: &str) -> Result<Option<FileEntry>, ProtoError> {
+            let versions = self.s3_versions.lock().expect("m");
+            Ok(versions.get(&(remote_path.to_string(), version_id.to_string())).map(|bytes| {
+                Self::entry_for(remote_path, &MockRemoteDoc { bytes: bytes.clone(), is_dir: false, mtime: 0 })
+            }))
+        }
+
         async fn s3_restore_version(
             &self,
             remote_path: &str,
@@ -20518,7 +20533,12 @@ mod tests {
         session.add_file("/huge.bin", &big);
         let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
         let stages_before = saf_stage_names();
-        let download = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body };
+        let unapproved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body: download_body(id, "down.txt", false, false) }).await;
+        assert_eq!(unapproved.status, 409, "{}", unapproved.payload);
+        assert_eq!(unapproved.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert!(bridge.bytes_of("down.txt").is_none());
+        let download = |mut body: Value| { body["accept_saf_publication_risk"] = json!(true); ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body } };
         // A file lands across the bridge.
         let queued = svc.dispatch_async(download(download_body(id, "down.txt", false, false))).await;
         assert_eq!(queued.status, 200, "{}", queued.payload);
@@ -20564,6 +20584,29 @@ mod tests {
     /// A WebDAV move into a granted folder stages the download, publishes
     /// across the bridge, then deletes the remote source by ETag.
     #[tokio::test]
+    async fn saf_s3_version_download_requires_publication_risk_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
+        let session = Arc::new(MockSession::new());
+        session.set_scheme(ProtocolScheme::S3);
+        session.s3_versions.lock().unwrap().insert(("/version.txt".into(), "v1".into()), b"version bytes".to_vec());
+        session.add_file("/version.txt", b"version bytes");
+        let id = insert_remote_tab(&svc, session, SAF_GRANTED_DIR);
+        let mut body = json!({"tab": id, "name": "version.txt", "version_id": "v1", "local_dir": SAF_GRANTED_DIR});
+        let request = |body| ApiEnvelope { method: "POST".into(), path: "/api/s3/version-download".into(), body };
+        let rejected = svc.dispatch_async(request(body.clone())).await;
+        assert_eq!(rejected.status, 409, "{}", rejected.payload);
+        assert_eq!(rejected.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        body["accept_saf_publication_risk"] = json!(true);
+        let accepted = svc.dispatch_async(request(body)).await;
+        assert_eq!(accepted.status, 200, "{}", accepted.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("version.txt").unwrap(), b"version bytes");
+    }
+
+    #[tokio::test]
     async fn saf_webdav_move_to_granted_folder_deletes_remote_source() {
         let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
@@ -20574,7 +20617,12 @@ mod tests {
         let session = Arc::new(MockSession::new());
         session.add_file("/gone.txt", b"moving down");
         let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
-        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"]}) }).await;
+        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"]}) }).await;
+        assert_eq!(refused.status, 409, "{}", refused.payload);
+        assert_eq!(refused.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert!(session.stat("/gone.txt").await.unwrap().is_some());
+        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(moved.status, 200, "{}", moved.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("gone.txt").as_deref(), Some(b"moving down".as_slice()), "the granted folder holds the move");

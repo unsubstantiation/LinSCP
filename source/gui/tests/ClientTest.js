@@ -524,6 +524,25 @@ function options(id) {
     window.confirm = originalConfirm;
   }
 
+  // SAF publication is an explicit per-request risk, not an overwrite preference.
+  {
+    const originalConfirm = window.confirm;
+    const requests = [];
+    const send = async approval => {
+      requests.push({...approval});
+      return {result: approval.accept_saf_publication_risk ? {success: true} : {saf_publication_risk: true}};
+    };
+    let warning = '';
+    window.confirm = message => { warning = message; return false; };
+    const declined = await window.applyDropApprovals(send, {autoOverwrite: true});
+    check('SAF risk refusal never retries', declined.cancelled && requests.length === 1 && warning.includes('overwritten'));
+    requests.length = 0;
+    window.confirm = () => true;
+    const accepted = await window.applyDropApprovals(send);
+    check('SAF risk approval is explicit', accepted.result.success && requests.length === 2 && requests[1].accept_saf_publication_risk === true);
+    window.confirm = originalConfirm;
+  }
+
   // Boot fetched what it needs.
   const doc = window.document;
   const paths = calls.map(call => call.path);

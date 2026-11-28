@@ -366,15 +366,19 @@ const expression = `
     try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt'], resume: true}); }
     catch (error) { refused = error.status === 400 && /verified resume.*granted folders/i.test(error.message || ''); }
     if (!refused) throw new Error('Verified resume into a granted folder was not refused');
-    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']});
+    refused = false;
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']}); }
+    catch (error) { refused = error.status === 409 && error.payload?.saf_publication_risk; }
+    if (!refused) throw new Error('SAF download did not require publication-risk approval');
+    await runTask('/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt'], accept_saf_publication_risk: true});
     const downloaded = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt');
     if (downloaded.content !== 'download into SAF') throw new Error('SAF download bytes differ');
     let conflict = false;
-    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt']}); }
+    try { await invoke('POST', '/api/transfer/download', {tab, local_dir: tree, remote_dir: '/', names: ['saf-down.txt'], accept_saf_publication_risk: true}); }
     catch (error) { conflict = error.status === 409; }
     if (!conflict || (await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-down.txt')).content !== 'download into SAF') throw new Error('Existing SAF destination was not protected');
     await invoke('POST', '/api/remote/save', {tab, path: '/saf-move.txt', content: 'move into SAF'});
-    await runTask('/api/transfer/move', {tab, direction: 'download', local_dir: tree, remote_dir: '/', names: ['saf-move.txt']});
+    await runTask('/api/transfer/move', {tab, direction: 'download', local_dir: tree, remote_dir: '/', names: ['saf-move.txt'], accept_saf_publication_risk: true});
     const moved = await invoke('GET', '/api/local/edit?tab=' + localTab + '&path=saf-move.txt');
     if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
@@ -425,7 +429,7 @@ const expression = `
     const beforeQueue = (await invoke('GET', '/api/transfers')).transfers.length;
     for (const [path, extra] of [['/api/transfer/download', {}], ['/api/transfer/move', {direction: 'download'}]]) {
       let refused = false;
-      try { await invoke('POST', path, {tab, local_dir: tree, remote_dir: '/', names: [remoteName], ...extra}); }
+      try { await invoke('POST', path, {tab, local_dir: tree, remote_dir: '/', names: [remoteName], accept_saf_publication_risk: true, ...extra}); }
       catch (error) { refused = error.status === 400 && (error.message || '').includes(remoteName) && /64 MiB/.test(error.message || ''); }
       if (!refused) throw new Error('Expected over-cap WebDAV to SAF refusal from ' + path);
     }
@@ -465,7 +469,7 @@ const expression = `
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-tree-down'});
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/transfer-tree-down', name: 'nested'});
     await invoke('POST', '/api/remote/save', {tab, path: '/transfer-tree-down/nested/down.txt', content: 'provider tree download'});
-    const download = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down']};
+    const download = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-tree-down'], accept_saf_publication_risk: true};
     refused = false;
     try { await invoke('POST', '/api/transfer/download', download); }
     catch (error) { refused = error.status === 409 && error.payload?.directory_copy_risk; }
@@ -479,7 +483,7 @@ const expression = `
     await invoke('POST', '/api/local/save', {tab: mergeTab, path: 'keep.txt', content: 'keep provider bytes'});
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'transfer-merge'});
     await invoke('POST', '/api/remote/save', {tab, path: '/transfer-merge/new.txt', content: 'merged server bytes'});
-    const merge = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-merge'], accept_directory_copy_risk: true};
+    const merge = {tab, local_dir: tree, remote_dir: '/', names: ['transfer-merge'], accept_directory_copy_risk: true, accept_saf_publication_risk: true};
     refused = false;
     try { await invoke('POST', '/api/transfer/download', merge); }
     catch (error) { refused = error.status === 409 && error.payload?.directory_conflicts?.includes('transfer-merge'); }

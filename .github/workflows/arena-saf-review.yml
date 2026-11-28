@@ -1,0 +1,22 @@
+name: Temporary SAF service review
+on:
+  push:
+    branches: [arena/8a2ae295-linscp]
+permissions:
+  contents: read
+jobs:
+  service:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: transfer-move-review
+      - name: Test SAF transfer and risk regressions
+        run: cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
