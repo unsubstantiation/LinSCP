@@ -1930,6 +1930,7 @@ fn build_ssh_configs(
     log_level: i32,
     ssh_log_sink: Option<SshEventLogger>,
     proxy: Option<ProxyConfig>,
+    vault: Option<Arc<dyn linscp_platform::SecretVault>>,
 ) -> (SshConnectConfig, Option<SshConnectConfig>, u16) {
     let verbose_stderr = log_level >= 1;
     let event_logger: Option<SshEventLogger> = if verbose_stderr || ssh_log_sink.is_some() {
@@ -2022,6 +2023,7 @@ fn build_ssh_configs(
             config_dir.to_path_buf(),
             interactive_confirm,
             locale.to_string(),
+            vault.clone(),
         )),
         try_agent: spec.session.keyfile.is_none() && spec.session.password.is_none(),
         agent_connector: None,
@@ -2076,6 +2078,7 @@ fn build_ssh_configs(
                     config_dir.to_path_buf(),
                     interactive_confirm,
                     locale.to_string(),
+                    vault.clone(),
                 )),
                 try_agent: t.keyfile.is_none() && t.password.is_none(),
                 agent_connector: None,
@@ -2107,6 +2110,15 @@ pub async fn connect_site_spec(
     log_level: i32,
     ssh_log_sink: Option<SshEventLogger>,
 ) -> Result<Box<dyn RemoteSession>, String> {
+    connect_site_spec_with_vault(spec, config_dir, interactive_confirm, interactive_auth, locale, log_level, ssh_log_sink, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_site_spec_with_vault(
+    spec: &ParsedSiteSpec, config_dir: &Path, interactive_confirm: bool, interactive_auth: bool,
+    locale: &str, log_level: i32, ssh_log_sink: Option<SshEventLogger>,
+    vault: Option<Arc<dyn linscp_platform::SecretVault>>,
+) -> Result<Box<dyn RemoteSession>, String> {
     validate_ssh_gssapi_policy(spec)?;
     let proxy = build_proxy_config(spec)?;
     let tls = build_tls_settings(spec)?;
@@ -2119,6 +2131,7 @@ pub async fn connect_site_spec(
         log_level,
         ssh_log_sink,
         proxy.clone(),
+        vault.clone(),
     );
     connect_site_spec_inner(
         spec,
@@ -2546,6 +2559,7 @@ pub async fn connect_gui_site_spec(
         0,
         ssh_log_sink,
         proxy.clone(),
+        None,
     );
 
     let capture: Arc<std::sync::Mutex<Option<GuiHostKeyChallenge>>> =
@@ -2619,6 +2633,7 @@ pub async fn connect_desktop_jump_tunnel(
         0,
         None,
         proxy,
+        None,
     );
     let Some(mut tun_cfg) = tunnel_ssh_cfg else {
         return Err(GuiConnectError::Failed(
@@ -2665,6 +2680,15 @@ pub async fn connect_ssh_for_shell(
     log_level: i32,
     ssh_log_sink: Option<SshEventLogger>,
 ) -> Result<(SshConnection, Option<SshJumpTunnel>), String> {
+    connect_ssh_for_shell_with_vault(spec, config_dir, interactive_confirm, interactive_auth, locale, log_level, ssh_log_sink, None).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_ssh_for_shell_with_vault(
+    spec: &ParsedSiteSpec, config_dir: &Path, interactive_confirm: bool, interactive_auth: bool,
+    locale: &str, log_level: i32, ssh_log_sink: Option<SshEventLogger>,
+    vault: Option<Arc<dyn linscp_platform::SecretVault>>,
+) -> Result<(SshConnection, Option<SshJumpTunnel>), String> {
     if !is_ssh_scheme(spec.session.protocol) {
         return Err(format!(
             "Interactive SSH shell is not supported for {} protocol.",
@@ -2682,6 +2706,7 @@ pub async fn connect_ssh_for_shell(
         log_level,
         ssh_log_sink,
         proxy,
+        vault,
     );
 
     if let Some(tun_cfg) = tunnel_ssh_cfg {
@@ -2765,12 +2790,16 @@ fn make_ssh_host_key_callback(
     config_dir: std::path::PathBuf,
     interactive_confirm: bool,
     locale: String,
+    vault: Option<Arc<dyn linscp_platform::SecretVault>>,
 ) -> HostKeyDecisionCallback {
     Arc::new(move |obs: &ObservedServerHostKey| -> Result<(), ProtoError> {
         let prefix = if is_tunnel { "TUNNELHOSTKEY" } else { "HOSTKEY" };
         let role = if is_tunnel { "tunnel" } else { "destination" };
         let cache_path = config_dir.join("sshhostkeys");
-        let mut cache = HostKeyCache::load_from_path(&cache_path).map_err(ProtoError::Transport)?;
+        let mut cache = match vault.as_ref() {
+            Some(vault) => HostKeyCache::load_protected(&cache_path, vault.as_ref()),
+            None => HostKeyCache::load_from_path(&cache_path),
+        }.map_err(ProtoError::Transport)?;
         let cached_fp = cache
             .lookup(&obs.host, obs.port, &obs.key_type)
             .map(str::to_string);
@@ -2799,7 +2828,10 @@ fn make_ssh_host_key_callback(
                         &obs.key_type,
                         &obs.sha256_fingerprint,
                     );
-                    let _ = cache.save_to_path(&cache_path);
+                    match vault.as_ref() {
+                            Some(vault) => cache.save_protected(&cache_path, vault.as_ref()),
+                            None => cache.save_to_path(&cache_path),
+                        }.map_err(ProtoError::Transport)?;
                 }
                 return Ok(());
             }
@@ -2840,7 +2872,10 @@ fn make_ssh_host_key_callback(
                             &obs.key_type,
                             &obs.sha256_fingerprint,
                         );
-                        let _ = cache.save_to_path(&cache_path);
+                        match vault.as_ref() {
+                            Some(vault) => cache.save_protected(&cache_path, vault.as_ref()),
+                            None => cache.save_to_path(&cache_path),
+                        }.map_err(ProtoError::Transport)?;
                         return Ok(());
                     }
                 }
@@ -2873,7 +2908,10 @@ fn make_ssh_host_key_callback(
                             &obs.key_type,
                             &obs.sha256_fingerprint,
                         );
-                        let _ = cache.save_to_path(&cache_path);
+                        match vault.as_ref() {
+                            Some(vault) => cache.save_protected(&cache_path, vault.as_ref()),
+                            None => cache.save_to_path(&cache_path),
+                        }.map_err(ProtoError::Transport)?;
                         return Ok(());
                     }
                 }
@@ -2959,6 +2997,26 @@ impl SecretVault for DefaultOsVault {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cli_host_key_callback_uses_virtual_vault_and_fails_closed() {
+        use crate::container_credentials::{ContainerSessionVault, CredentialContainer};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let file = CredentialContainer::acquire(&dir.path().join("vault.dat")).unwrap();
+        file.create("test password").unwrap();
+        let vault = Arc::new(ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap());
+        let mut cache = super::HostKeyCache::new();
+        cache.upsert("example.test", 22, "ssh-ed25519", "SHA256:cached").unwrap();
+        cache.save_protected(&dir.path().join("sshhostkeys"), vault.as_ref()).unwrap();
+        let callback = super::make_ssh_host_key_callback(false, String::new(), dir.path().to_path_buf(), false, "en".into(), Some(vault.clone()));
+        let mut observed = linscp_proto::ssh::ObservedServerHostKey { role: "destination".into(), host: "example.test".into(), port: 22, key_type: "ssh-ed25519".into(), sha256_fingerprint: "SHA256:cached".into(), md5_fingerprint: String::new(), pubkey_base64: String::new() };
+        assert!(callback(&observed).is_ok());
+        observed.sha256_fingerprint = "SHA256:changed".into();
+        assert!(callback(&observed).is_err());
+        assert!(!dir.path().join("sshhostkeys").exists());
+        vault.lock().unwrap();
+        assert!(callback(&observed).is_err());
+    }
     use super::*;
 
     #[test]

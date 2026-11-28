@@ -43,7 +43,7 @@ use crate::transfer::{
 };
 use crate::url_and_raw::{
     DefaultOsVault, ParsedSiteSpec, apply_env_credential_fallbacks, apply_raw_settings,
-    connect_site_spec, connect_ssh_for_shell, is_desktop_scheme, is_ssh_scheme,
+    connect_site_spec_with_vault, connect_ssh_for_shell_with_vault, is_desktop_scheme, is_ssh_scheme,
     is_webdav_scheme, parse_site_url, prompt_yes_no_tty, site_spec_from_stored,
     site_spec_from_stored_for_resave, stored_site_from_spec, validate_session_settings,
 };
@@ -806,14 +806,21 @@ impl ScriptInterpreter {
                 .push(msg.to_string());
         });
 
-        let connect_res = connect_site_spec(
-            &spec,
+        // Keep the stored spec unchanged; temporary plaintext paths exist only
+        // until the connection attempt completes, including on error.
+        let mut dial_spec = spec.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = self.secret_vault.as_deref().unwrap_or(&default_vault);
+        let _temporary_keys = crate::vault_material::materialize_vault_key_paths(&mut dial_spec, &self.cfg.config_dir, vault)?;
+        let connect_res = connect_site_spec_with_vault(
+            &dial_spec,
             &self.cfg.config_dir,
             self.is_interactive_confirm(),
             self.is_interactive_auth(),
             &self.cfg.locale,
             self.cfg.log_level,
             Some(ssh_sink),
+            self.secret_vault.clone(),
         )
         .await;
 
@@ -906,14 +913,21 @@ impl ScriptInterpreter {
                 .push(msg.to_string());
         });
 
-        let connect_res = connect_site_spec(
-            &spec,
+        // Keep the stored spec unchanged; temporary plaintext paths exist only
+        // until the connection attempt completes, including on error.
+        let mut dial_spec = spec.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = self.secret_vault.as_deref().unwrap_or(&default_vault);
+        let _temporary_keys = crate::vault_material::materialize_vault_key_paths(&mut dial_spec, &self.cfg.config_dir, vault)?;
+        let connect_res = connect_site_spec_with_vault(
+            &dial_spec,
             &self.cfg.config_dir,
             self.is_interactive_confirm(),
             self.is_interactive_auth(),
             &self.cfg.locale,
             self.cfg.log_level,
             Some(ssh_sink),
+            self.secret_vault.clone(),
         )
         .await;
 
@@ -5718,14 +5732,19 @@ impl ScriptInterpreter {
             spec.raw_fields.get("mosh_port").map_or("", String::as_str),
         )?;
 
-        let (conn, jump) = connect_ssh_for_shell(
-            &spec,
+        let mut dial_spec = spec.clone();
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = self.secret_vault.as_deref().unwrap_or(&default_vault);
+        let _temporary_keys = crate::vault_material::materialize_vault_key_paths(&mut dial_spec, &self.cfg.config_dir, vault)?;
+        let (conn, jump) = connect_ssh_for_shell_with_vault(
+            &dial_spec,
             &self.cfg.config_dir,
             self.is_interactive_confirm(),
             self.is_interactive_auth(),
             &self.cfg.locale,
             self.cfg.log_level,
             None,
+            self.secret_vault.clone(),
         )
         .await?;
 
