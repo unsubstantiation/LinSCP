@@ -3,6 +3,7 @@
 
 pub mod backup;
 pub mod config_stores;
+pub mod container_credentials;
 pub mod editor;
 pub mod filemask;
 pub mod hostkeys;
