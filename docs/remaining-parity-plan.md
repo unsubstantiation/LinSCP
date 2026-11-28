@@ -12,13 +12,13 @@ Regenerate with `python3 tools/check_upstream_parity.py --write-report`.
 
 **Area:** SCP · **Status:** partial
 
-The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. A download stages through '.filepart' and is renamed onto the destination when it is whole; an interrupted one leaves the staging file and nothing under the final name. Uploads carry '-permissions' and '-preservetime'. Continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, the speed limit, the progress meter and the interrupt behavior are the shared transfer path's and are checked here as well.
+SCP single files use native SSH exec and scp -f/-t wire framing. Engine tests exercise file transfers and a tree walked file by file against a mock SSH/SCP server. The GUI adds protocol-specific safety refusals; engine tree-walk support does not imply every GUI SCP directory operation is allowed. SCP resume is refused. The historical CLI-dependent live suite does not run in the GUI-only distribution.
 
-**Next:** The recursive form of the rcp protocol is not used: the client's own directory engine walks the tree and each file travels in the single-file form, so no 'E' record closes a level. Everything else the row states is checked by the cited cases.
+**Next:** Recursive SCP D/E wire streams are not implemented. They are deferred pending demonstrated product need and a design for untrusted records, containment, no-overwrite, symlinks, bounds, cancellation and partial-tree cleanup; no recursive stream or real-server GUI interoperability is claimed.
 
 **Acceptance criteria:**
 
-- [ ] A transfer of a tree that speaks the recursive rcp form, with an 'E' record closing each level, proved by a case that runs.
+- [ ] If recursive wire SCP is prioritized, implement and test nested D/E streams with malicious-server, containment, interruption and live OpenSSH coverage without weakening GUI safety refusals.
 
 ## transfer.ascii-automatic
 
@@ -269,15 +269,14 @@ The CLI and its external automation interfaces were removed in the GUI-only conv
 
 **Area:** Automation · **Status:** partial
 
-The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.
+The optional GUI XML action log uses the upstream session namespace and operation-shaped elements. Queue and direct GUI records serialize with one in-process lock per complete record; a transfer does not hold the lock across network awaits. Incomplete existing logs lacking the expected closing tag are preserved rather than overwritten; preview reads a bounded tail. Tests validate interleaved GUI and queue records against the project-authored pinned schema on Linux. The standalone -xmllog CLI is not shipped. See docs/remaining-parity-priorities.md for supported scope and failure boundaries. Focused Linux/Windows Rust tests and Linux GUI plus live WebDAV schema checks passed in branch run 46123944392.
 
-**Next:** The operation elements of a real session (upload, download, ls, ...) are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the group and failure structure, the masking of the secrets and the shipped fixtures. Host-side logger tests exercise masking multiple credential-bearing URL authorities and recognized secret switches, including multiline quoted values, in failure messages; this is not proof that every possible secret or malformed URL is redacted. Sensitive text logging explicitly opts out.
+**Next:** The schema is derived locally from the pinned upstream emitter, not independent proof of full upstream or consumer compatibility. Linux live WebDAV upload/download and GUI service samples are schema-checked; other real-server operations and Android schema behavior remain unverified. Logging is best-effort and errors can be silent; concurrent external writers, crashes and I/O failure can still cause loss or malformed logs. Secret redaction is not exhaustive.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Validate additional supported GUI operations and failures against real protocol fixtures and independent consumers.
+- [ ] Improve logging error visibility and crash/interprocess handling before treating it as a reliable audit trail; test Android where applicable.
 
 ## automation.dotnet
 
@@ -346,13 +345,14 @@ The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_
 
 **Area:** Localization/accessibility · **Status:** partial
 
-English, Spanish, German and French catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client, including the external-editor prompts. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated, and the translation tests keep switches, values, command names and protocol words literal in every catalog. The language selector and the backend's locale selection are filled from the shipped catalogs, and a confirmation accepts the yes letter its translated hint shows. Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages.
+English, Spanish, German and French catalogs are embedded for the native GUI and internal engine. Automated catalog, placeholder and GUI tests cover selected messages and locale behavior; they do not prove human translation quality or cover every dynamic diagnostic. Server/OS diagnostics and protocol data can remain untranslated. The standalone CLI is not shipped. Additional languages should be prioritized with community demand and human review; adding one requires registering it in Rust and assessing plural rules, RTL and input behavior.
 
-**Next:** Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.
+**Next:** Only four catalogs ship. Other upstream languages are not supported; the current singular/other API cannot express every CLDR plural category. User-facing dynamic errors and real-device/assistive-technology behavior require further review.
 
 **Acceptance criteria:**
 
-- [ ] Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships.
+- [ ] Choose additional languages based on user demand and maintained human review; register and test any new catalogs and expand plural/RTL support when needed.
+- [ ] Validate supported GUI strings and accessibility in real platform workflows; do not imply untranslated protocol data or server diagnostics are localized.
 
 ## platform.make-linux
 
@@ -512,15 +512,14 @@ CLI and browser editor support explicit legacy encodings with strict decoding an
 
 **Area:** Automation · **Status:** partial
 
-The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns="http://winscp.net/schema/session/1.0" name="user@host"|site|nosession start="...Z">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success="true|false">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The engine-script suite reads the shipped fixtures (fixtures/xml/) and a freshly produced log back the way an upstream-style consumer does - the namespace, the groups, the failure and the masked-password failure - and holds the log to the operation elements the fixtures show; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.
+The optional GUI XML action log uses the upstream session namespace and operation-shaped elements. Queue and direct GUI records serialize with one in-process lock per complete record; a transfer does not hold the lock across network awaits. Incomplete existing logs lacking the expected closing tag are preserved rather than overwritten; preview reads a bounded tail. Tests validate interleaved GUI and queue records against the project-authored pinned schema on Linux. The standalone -xmllog CLI is not shipped. See docs/remaining-parity-priorities.md for supported scope and failure boundaries. Focused Linux/Windows Rust tests and Linux GUI plus live WebDAV schema checks passed in branch run 46123944392.
 
-**Next:** Linux CI independently validates both shipped XML fixtures, an actual failed-open logger output, and a real loopback WebDAV session log with successful upload and download against the pinned XSD; it also checks that an invalid boolean is rejected. Other real-session operation elements and schema validation on Windows and Android remain unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Engine-script also reads the fixtures and produced log as an upstream-style consumer. Host-side logger tests exercise masking multiple credential-bearing URL authorities and recognized secret switches, including multiline quoted values, in failure messages; this is not proof that every possible secret or malformed URL is redacted. Sensitive text logging explicitly opts out.
+**Next:** The schema is derived locally from the pinned upstream emitter, not independent proof of full upstream or consumer compatibility. Linux live WebDAV upload/download and GUI service samples are schema-checked; other real-server operations and Android schema behavior remain unverified. Logging is best-effort and errors can be silent; concurrent external writers, crashes and I/O failure can still cause loss or malformed logs. Secret redaction is not exhaustive.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
+- [ ] Validate additional supported GUI operations and failures against real protocol fixtures and independent consumers.
+- [ ] Improve logging error visibility and crash/interprocess handling before treating it as a reliable audit trail; test Android where applicable.
 
 ## gui.local-symlink
 

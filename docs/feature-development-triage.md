@@ -8,7 +8,7 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 
 | Capability | Triage | Next focused step |
 | --- | --- | --- |
-| [`scp.curl-file-transfer`](remaining-parity-plan.md#scpcurl-file-transfer) | Optional parity | Assess recursive SCP wire protocol; current tree engine already sends individual files. |
+| [`scp.curl-file-transfer`](remaining-parity-plan.md#scpcurl-file-transfer) | Optional parity | Defer D/E wire support pending user need and a safe-stream design; existing engine walks trees file by file, while GUI rules impose additional restrictions. |
 | [`transfer.ascii-automatic`](remaining-parity-plan.md#transferascii-automatic) | Evidence | Test Android and relevant live servers; conversion and guarded uploads exist. |
 | [`transfer.filepart-resume`](remaining-parity-plan.md#transferfilepart-resume) | Development + evidence | Assess guarded-upload resume and provider limitations; retain default FTP/SFTP refusal without atomic source and explicit best-effort consent. |
 | [`transfer.resume-modes`](remaining-parity-plan.md#transferresume-modes) | Evidence | Validate GUI resume safety on physical devices and third-party servers. |
@@ -28,13 +28,13 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 | [`editing.encoding-policy`](remaining-parity-plan.md#editingencoding-policy) | Evidence | Exercise actual editing flows and encoding decisions on supported platforms. |
 | [`automation.command-interpreter`](remaining-parity-plan.md#automationcommand-interpreter) | Out of scope | Retired CLI interface; no restoration planned. |
 | [`automation.literal-gui-command`](remaining-parity-plan.md#automationliteral-gui-command) | Out of scope | Retired command interface; no restoration planned. |
-| [`automation.xml-action-log`](remaining-parity-plan.md#automationxml-action-log) | Evidence | Expand XML-log coverage via supported service workflows, not the retired CLI. |
+| [`automation.xml-action-log`](remaining-parity-plan.md#automationxml-action-log) | Evidence | GUI queue and direct records now share an in-process lock; expand real protocol and failure coverage and surface logging errors. |
 | [`automation.dotnet`](remaining-parity-plan.md#automationdotnet) | Out of scope | The .NET assembly is not planned for the GUI-only distribution. |
 | [`automation.powershell`](remaining-parity-plan.md#automationpowershell) | Out of scope | The PowerShell interface is not planned for the GUI-only distribution. |
 | [`desktop.scheme-handlers`](remaining-parity-plan.md#desktopscheme-handlers) | Development + evidence | Test real URI registration and delivery; implement missing target-platform registration if in scope. |
 | [`desktop.launcher-prefix`](remaining-parity-plan.md#desktoplauncher-prefix) | Evidence | Validate real custom-prefix desktop integration; limit platform-specific claims. |
 | [`desktop.wayland-session`](remaining-parity-plan.md#desktopwayland-session) | Evidence | Headless Weston basic window launch passed; exercise full Wayland desktop interaction, rendering, scaling and other compositors on Linux. |
-| [`locale.translations`](remaining-parity-plan.md#localetranslations) | Optional expansion | Add languages beyond the four shipped catalogs if product scope requires them. |
+| [`locale.translations`](remaining-parity-plan.md#localetranslations) | Optional expansion | Choose additional languages based on user demand and human review; plural, RTL and Rust catalog registration may require development. |
 | [`platform.make-linux`](remaining-parity-plan.md#platformmake-linux) | Evidence | Validate real menu discovery and scheme selection for custom-prefix Make installs. |
 | [`platform.cmake-linux`](remaining-parity-plan.md#platformcmake-linux) | Evidence | Validate real desktop integration and registered CTest entries for CMake installs. |
 | [`platform.debian-package`](remaining-parity-plan.md#platformdebian-package) | Investigation + evidence | Synthetic same-payload upgrade/removal passed on Ubuntu 24.04; test historical upgrades, other Debian environments and desktop integration. |
@@ -47,7 +47,7 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 | [`platform.android-saf-local-copy-move`](remaining-parity-plan.md#platformandroid-saf-local-copy-move) | Evidence | Test two granted trees, other providers, races and physical devices beyond the existing emulator fixture. |
 | [`platform.android-saf-session-transfers`](remaining-parity-plan.md#platformandroid-saf-session-transfers) | Evidence | Extend existing emulator transfer/limit coverage to other providers, races and physical devices. |
 | [`editing.non-utf8-encodings`](remaining-parity-plan.md#editingnon-utf8-encodings) | Evidence | Test non-UTF-8 and binary rejection in both editor and search. |
-| [`automation.upstream-xml-compatibility`](remaining-parity-plan.md#automationupstream-xml-compatibility) | Evidence | Expand schema and compatibility coverage for supported operations. |
+| [`automation.upstream-xml-compatibility`](remaining-parity-plan.md#automationupstream-xml-compatibility) | Evidence | The locally derived schema checks GUI and loopback WebDAV samples; independently test consumers and other operations without claiming full upstream equivalence. |
 | [`gui.local-symlink`](remaining-parity-plan.md#guilocal-symlink) | Evidence | Validate Windows privilege behavior and Android app-storage link creation. |
 | [`gui.remote-delete`](remaining-parity-plan.md#guiremote-delete) | Evidence | Test interrupted deletion and partial-failure reporting, including Android. |
 | [`backup.full-export-import`](remaining-parity-plan.md#backupfull-export-import) | Evidence | Test portability and restored SSH authentication across real platforms, plus Android interrupted recovery. |
@@ -60,3 +60,5 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 - Remote desktop: an experimental KDrive viewer exists; real server interoperability remains open. Desktop help now states that no embedded RDP fallback is provided.
 - Android: generated share filters and emulator SAF fixtures already exist. The remaining plan now names untested providers, physical devices and other missing cases rather than asking to re-register or repeat covered behavior.
 - These classifications are planning aids. New tests may uncover implementation defects, and a user/product decision may change optional scope.
+
+See [remaining parity priorities](remaining-parity-priorities.md) for the localization, XML and recursive SCP assessment.
