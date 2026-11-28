@@ -13560,10 +13560,20 @@ mod tests {
         assert_eq!(saved.status, 200, "{}", saved.payload);
         let blocked = service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
         assert_eq!(blocked.status, 409, "{}", blocked.payload);
+        let full_backup = service.dispatch(request("POST", "/api/backup/export", json!({"password":"long backup password"})));
+        assert_ne!(full_backup.status, 200);
+        assert!(full_backup.payload["error"].as_str().unwrap_or("").contains("not yet supported"));
         let exported = service.dispatch(request("POST", "/api/vault/export", json!({"password":"backup password"})));
         assert_eq!(exported.status, 200, "{}", exported.payload);
         assert!(!BASE64_STD.decode(exported.payload["data_base64"].as_str().unwrap()).unwrap().windows(b"private fixture".len()).any(|b| b == b"private fixture"));
         let before = std::fs::read(&path).unwrap();
+        {
+            let guard = service.config_lock.lock().unwrap();
+            let lock = guard.as_ref().unwrap();
+            let restore = linscp_engine::backup::import_backup_transactional(dir.path(), &linscp_engine::backup::BackupBundle::default(), service.secret_vault.as_ref(), lock);
+            assert!(restore.unwrap_err().contains("not supported"));
+            assert_eq!(std::fs::read(&path).unwrap(), before);
+        }
         assert!(!before.windows(b"hidden password".len()).any(|b| b == b"hidden password"));
         assert!(!dir.path().join("sessions.key").exists());
         assert!(!dir.path().join("sessions.ini").exists());

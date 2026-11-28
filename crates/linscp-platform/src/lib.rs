@@ -341,6 +341,9 @@ pub trait SecretVault: Send + Sync {
     }
     /// True only if session/material updates can be published as one transaction.
     fn supports_session_material_transactions(&self) -> bool { false }
+    /// The old full-backup codec operates on separate files. Virtual storage
+    /// backends must opt out until a compatible backup/restore exists.
+    fn supports_legacy_full_backup(&self) -> bool { true }
     /// Atomically publish sessions and new referenced material, or return false
     /// without side effects when unsupported. Errors must not trigger fallback.
     fn write_session_ini_with_materials(&self, _config_dir: &Path, _text: &str, _materials: &[VaultMaterialImport<'_>], _protected: &[VaultProtectedChange<'_>]) -> Result<bool, PlatformError> {

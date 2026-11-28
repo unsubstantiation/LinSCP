@@ -540,6 +540,7 @@ impl ContainerSessionVault {
 impl linscp_platform::SecretVault for ContainerSessionVault {
     fn protects_session_store(&self) -> bool { true }
     fn supports_session_material_transactions(&self) -> bool { true }
+    fn supports_legacy_full_backup(&self) -> bool { false }
 
     fn write_session_ini_with_materials(&self, config_dir: &std::path::Path, text: &str, materials: &[linscp_platform::VaultMaterialImport<'_>], protected: &[linscp_platform::VaultProtectedChange<'_>]) -> Result<bool, linscp_platform::PlatformError> {
         self.check_root(config_dir)?;

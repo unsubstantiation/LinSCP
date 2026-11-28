@@ -412,6 +412,9 @@ pub fn export_backup(
     config_dir: &Path,
     vault: &dyn SecretVault,
 ) -> Result<BackupBundle, String> {
+    if !vault.supports_legacy_full_backup() {
+        return Err("Full backup is not yet supported by this vault; use key/session export instead.".into());
+    }
     if restore_recovery_required(config_dir)? {
         return Err("Unlock the local vault and recover the interrupted restore before exporting a backup.".into());
     }
@@ -691,6 +694,7 @@ pub fn recover_interrupted_restore(
     vault: &dyn SecretVault,
     lock: &linscp_platform::ConfigDirectoryLock,
 ) -> Result<bool, String> {
+    if !vault.supports_legacy_full_backup() { return Err("Legacy full-backup recovery is not supported by this vault.".into()); }
     if !lock.covers_directory(config_dir) { return Err("Configuration lock does not match the restore directory.".into()); }
     crate::restore_journal::recover(config_dir, vault)
 }
@@ -894,6 +898,7 @@ pub fn import_backup_transactional(
     vault: &dyn SecretVault,
     lock: &linscp_platform::ConfigDirectoryLock,
 ) -> Result<(), String> {
+    if !vault.supports_legacy_full_backup() { return Err("Legacy full-backup restore is not supported by this vault.".into()); }
     if !lock.covers_directory(config_dir) {
         return Err("Configuration lock does not match the restore directory.".into());
     }
