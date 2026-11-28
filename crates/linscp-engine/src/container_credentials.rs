@@ -342,7 +342,29 @@ impl UnlockedCredentialContainer {
     /// Atomically commit sessions, private SSH keys, public-only keys and TLS
     /// material. Any conflict or dangling reference aborts the whole update.
     pub fn save_sessions_with_materials(&mut self, sessions: &SessionStore, keys: &[NewSshKey<'_>], tls: &[NewTlsMaterial<'_>], public_keys: &[NewPublicKey<'_>]) -> Result<(), String> {
+        self.save_transaction(sessions, keys, tls, public_keys, &[])
+    }
+
+    fn save_transaction(&mut self, sessions: &SessionStore, keys: &[NewSshKey<'_>], tls: &[NewTlsMaterial<'_>], public_keys: &[NewPublicKey<'_>], protected: &[linscp_platform::VaultProtectedChange<'_>]) -> Result<(), String> {
         let mut document = self.read()?;
+        let mut seen = BTreeSet::new();
+        for change in protected {
+            if !matches!(change.domain, "ssh-host-keys" | "auto-reconnect") || !seen.insert(change.domain) || change.value.len() > MAX_PROTECTED_BYTES {
+                return Err("Invalid protected transaction update".into());
+            }
+            let current = document.protected.get(change.domain).map(|value| BASE64.decode(value).map(Zeroizing::new)).transpose().map_err(|_| "Invalid protected container data")?;
+            if current.as_ref().map(|v| v.as_slice()) != change.expected {
+                return Err("Protected data changed during transaction; retry import".into());
+            }
+            if change.domain == "ssh-host-keys" {
+                let text = std::str::from_utf8(change.value).map_err(|_| "Invalid SSH host-key data")?;
+                crate::hostkeys::HostKeyCache::validate(text)?;
+            } else {
+                let value: serde_json::Value = serde_json::from_slice(change.value).map_err(|_| "Invalid reconnect data")?;
+                if !value.is_object() { return Err("Invalid reconnect data".into()); }
+            }
+            if let Some(mut old) = document.protected.insert(change.domain.into(), BASE64.encode(change.value)) { old.zeroize(); }
+        }
         if keys.len() > MAX_KEYS.saturating_sub(document.keys.len()) || tls.len() > MAX_KEYS.saturating_sub(document.tls.len()) || public_keys.len() > MAX_KEYS.saturating_sub(document.public_keys.len()) {
             return Err("Too many container materials".into());
         }
@@ -519,7 +541,7 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
     fn protects_session_store(&self) -> bool { true }
     fn supports_session_material_transactions(&self) -> bool { true }
 
-    fn write_session_ini_with_materials(&self, config_dir: &std::path::Path, text: &str, materials: &[linscp_platform::VaultMaterialImport<'_>]) -> Result<bool, linscp_platform::PlatformError> {
+    fn write_session_ini_with_materials(&self, config_dir: &std::path::Path, text: &str, materials: &[linscp_platform::VaultMaterialImport<'_>], protected: &[linscp_platform::VaultProtectedChange<'_>]) -> Result<bool, linscp_platform::PlatformError> {
         self.check_root(config_dir)?;
         let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
         let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
@@ -535,7 +557,7 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
                 linscp_platform::VaultMaterialImport::PublicKey { id, public_key } => public.push(NewPublicKey { id, public_key }),
             }
         }
-        session.save_sessions_with_materials(&sessions, &keys, &tls, &public).map_err(Self::error)?;
+        session.save_transaction(&sessions, &keys, &tls, &public, protected).map_err(Self::error)?;
         Ok(true)
     }
 
@@ -733,6 +755,35 @@ mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn protected_transaction_checks_snapshot_before_publishing() {
+        use linscp_platform::{SecretVault, VaultProtectedChange};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let host_path = dir.path().join("sshhostkeys");
+        let old = b"host@22 ssh-ed25519 SHA256:old\n";
+        let newer = b"host@22 ssh-ed25519 SHA256:new\n";
+        bridge.write_protected_file(&host_path, "ssh-host-keys", old).unwrap();
+        bridge.write_protected_file(&host_path, "ssh-host-keys", newer).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let mut sessions = SessionStore::new();
+        sessions.upsert(StoredSite::new("saved", ProtocolScheme::Sftp, "host"));
+        let stale = [VaultProtectedChange { domain: "ssh-host-keys", expected: Some(old), value: old }];
+        assert!(sessions.save_with_materials_and_protected(dir.path(), &bridge, &[], &stale).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert!(SessionStore::load_from_dir(dir.path(), &bridge).unwrap().find("saved").is_none());
+        let good = [VaultProtectedChange { domain: "ssh-host-keys", expected: Some(newer), value: old }];
+        sessions.save_with_materials_and_protected(dir.path(), &bridge, &[], &good).unwrap();
+        assert!(SessionStore::load_from_dir(dir.path(), &bridge).unwrap().find("saved").is_some());
+        match bridge.read_protected_file(&host_path, "ssh-host-keys").unwrap() {
+            linscp_platform::ProtectedFileRead::Plaintext(value) => assert_eq!(value.as_slice(), old),
+            _ => panic!("missing hostkeys"),
+        }
+    }
 
     #[test]
     fn service_transaction_publishes_materials_and_sessions_together() {

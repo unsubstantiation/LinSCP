@@ -12306,6 +12306,14 @@ impl OfflineOtpMaterialStage {
     }
 }
 
+fn container_protected_snapshot(root: &Path, vault: &dyn SecretVault, domain: &str, name: &str) -> Result<Option<zeroize::Zeroizing<Vec<u8>>>, String> {
+    match vault.read_protected_file(&root.join(name), domain).map_err(|e| e.to_string())? {
+        linscp_platform::ProtectedFileRead::Plaintext(bytes) => Ok(Some(bytes)),
+        linscp_platform::ProtectedFileRead::Missing => Ok(None),
+        linscp_platform::ProtectedFileRead::Unhandled => Err("Transactional vault does not handle protected records".into()),
+    }
+}
+
 fn import_offlineotp_entries(
     config_root: &Path,
     mut store: SessionStore,
@@ -12360,11 +12368,13 @@ fn import_offlineotp_entries(
             }
             stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)?;
         }
+        let hostkeys_snapshot = if transactional { container_protected_snapshot(config_root, secret_vault, "ssh-host-keys", "sshhostkeys")? } else { None };
         let mut hostkey_cache = linscp_engine::hostkeys::HostKeyCache::load_protected(
             &config_root.join("sshhostkeys"),
             secret_vault,
         )?;
         let mut hostkeys_changed = false;
+        let mut hostkeys_examined = false;
         let mut preset_store = linscp_engine::presets::TransferPresetStore::load_from_dir(config_root)?;
         let mut presets_changed = false;
         let mut replaced_existing_names = Vec::<String>::new();
@@ -12407,6 +12417,7 @@ fn import_offlineotp_entries(
                 let tls_ref = if transactional { materials.stage_tls(encoded, "TLS client private key")? } else { stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "TLS client private key")? };
                 candidate.site.extra_fields.insert("tls_certificate_key_file".into(), tls_ref);
             }
+            if !candidate.cached_hostkeys.is_empty() { hostkeys_examined = true; }
             for hk in &candidate.cached_hostkeys {
                 let Some((hk_host, hk_port_str)) = hk.host_port.rsplit_once('@') else { continue; };
                 let Ok(hk_port) = hk_port_str.parse::<u16>() else { continue; };
@@ -12448,29 +12459,35 @@ fn import_offlineotp_entries(
             }
             return Ok((0, skipped, ignored));
         }
-        if transactional {
-            // These stores are not yet part of the same transaction. Refuse
-            // rather than commit only some of an imported backup.
-            if hostkeys_changed || presets_changed {
-                return Err("Container import cannot yet atomically update SSH host keys or transfer presets.".into());
-            }
-            if !replaced_existing_names.is_empty() {
-                let intentions = auto_reconnect::load(config_root, secret_vault)?;
-                if replaced_existing_names.iter().any(|name| intentions.contains_key(name)) {
-                    return Err("Container import cannot yet atomically replace a session with reconnect state.".into());
-                }
-            }
+        if transactional && presets_changed {
+            return Err("Container import cannot yet atomically update transfer presets.".into());
+        }
+        let hostkeys_value = zeroize::Zeroizing::new(hostkey_cache.serialize());
+        let mut reconnect_snapshot = None;
+        let mut reconnect_value = None;
+        if transactional && !replaced_existing_names.is_empty() {
+            reconnect_snapshot = container_protected_snapshot(config_root, secret_vault, "auto-reconnect", "auto-reconnect.json")?;
+            let mut intentions = auto_reconnect::load(config_root, secret_vault)?;
+            for name in &replaced_existing_names { intentions.remove(name); }
+            reconnect_value = Some(zeroize::Zeroizing::new(serde_json::to_vec(&intentions).map_err(|e| e.to_string())?));
         }
         // An atomic write can report an error after publishing (for example,
         // if its durability barrier fails). Do not delete keys at that point.
         sessions_published = true;
         if transactional {
             let imports = materials.imports();
-            store.save_with_materials(config_root, secret_vault, &imports)
+            let mut protected = Vec::new();
+            if hostkeys_examined {
+                protected.push(linscp_platform::VaultProtectedChange { domain: "ssh-host-keys", expected: hostkeys_snapshot.as_ref().map(|v| v.as_slice()), value: hostkeys_value.as_bytes() });
+            }
+            if let Some(value) = reconnect_value.as_ref() {
+                protected.push(linscp_platform::VaultProtectedChange { domain: "auto-reconnect", expected: reconnect_snapshot.as_ref().map(|v| v.as_slice()), value });
+            }
+            store.save_with_materials_and_protected(config_root, secret_vault, &imports, &protected)
         } else {
             store.save_to_dir(config_root, secret_vault)
         }.map_err(|error| format!("Cannot save imported sessions: {error}"))?;
-        if hostkeys_changed {
+        if hostkeys_changed && !transactional {
             hostkey_cache.save_protected(&config_root.join("sshhostkeys"), secret_vault)
                 .map_err(|error| format!("Cannot save imported SSH host keys: {error}"))?;
         }
@@ -12478,7 +12495,7 @@ fn import_offlineotp_entries(
             preset_store.save_to_dir(config_root)
                 .map_err(|error| format!("Cannot save imported transfer presets: {error}"))?;
         }
-        if !replaced_existing_names.is_empty() {
+        if !transactional && !replaced_existing_names.is_empty() {
             if let Ok(mut intentions) = auto_reconnect::load(config_root, secret_vault) {
                 let before = intentions.len();
                 for replaced in &replaced_existing_names {
@@ -13559,10 +13576,11 @@ mod tests {
         for entry in &mut unsupported {
             if let CredentialEntry::Login(login) = entry { login.metadata.insert(OFFLINEOTP_CACHED_HOSTKEYS_B64.into(), BASE64_STD.encode(hostkeys.serialize())); }
         }
-        assert!(import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries: unsupported, ignored_entries: 0 }, &target, None, false).is_err());
-        assert_eq!(std::fs::read(&target_path).unwrap(), before);
-        let result = import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries, ignored_entries: 0 }, &target, None, false).unwrap();
+        let result = import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries: unsupported, ignored_entries: 0 }, &target, None, false).unwrap();
         assert_eq!(result.0, 1);
+        let imported_hostkeys = linscp_engine::hostkeys::HostKeyCache::load_protected(&target_dir.path().join("sshhostkeys"), &target).unwrap();
+        assert_eq!(imported_hostkeys.lookup("example.test", 22, "ssh-ed25519"), Some("SHA256:AbCdEf123"));
+        assert!(!target_dir.path().join("sshhostkeys").exists());
         let loaded = SessionStore::load_from_dir(target_dir.path(), &target).unwrap();
         let saved = loaded.find("site").unwrap();
         let reference = saved.private_key.as_deref().unwrap();
@@ -13571,6 +13589,12 @@ mod tests {
         assert_eq!(read_tls_blob_for_export(tls_ref, target_dir.path(), &target, "TLS key").unwrap(), b"tls private");
         assert!(!target_dir.path().join("keys").exists());
         assert!(!target_dir.path().join("sessions.ini").exists());
+        let mut intentions = auto_reconnect::Intentions::new();
+        intentions.insert("site".into(), auto_reconnect::Identity::of(saved));
+        auto_reconnect::save(target_dir.path(), &target, &intentions).unwrap();
+        import_offlineotp_entries(target_dir.path(), loaded, offlineotp_vault::ImportedCredentialVault { entries, ignored_entries: 0 }, &target, None, true).unwrap();
+        assert!(auto_reconnect::load(target_dir.path(), &target).unwrap().is_empty());
+        assert!(!target_dir.path().join("auto-reconnect.json").exists());
     }
 
     #[test]

@@ -317,6 +317,14 @@ pub enum VaultMaterialImport<'a> {
     PublicKey { id: &'a str, public_key: &'a str },
 }
 
+/// Compare and replace a protected domain as part of the session transaction.
+/// `expected` is None only when the record was absent at the snapshot.
+pub struct VaultProtectedChange<'a> {
+    pub domain: &'a str,
+    pub expected: Option<&'a [u8]>,
+    pub value: &'a [u8],
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
@@ -335,7 +343,7 @@ pub trait SecretVault: Send + Sync {
     fn supports_session_material_transactions(&self) -> bool { false }
     /// Atomically publish sessions and new referenced material, or return false
     /// without side effects when unsupported. Errors must not trigger fallback.
-    fn write_session_ini_with_materials(&self, _config_dir: &Path, _text: &str, _materials: &[VaultMaterialImport<'_>]) -> Result<bool, PlatformError> {
+    fn write_session_ini_with_materials(&self, _config_dir: &Path, _text: &str, _materials: &[VaultMaterialImport<'_>], _protected: &[VaultProtectedChange<'_>]) -> Result<bool, PlatformError> {
         Ok(false)
     }
     /// A handled backend must authenticate data, preserve domain separation,
