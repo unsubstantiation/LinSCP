@@ -57,7 +57,7 @@ jobs:
       - name: Install isolated KDrive and SSH fixture
         run: |
           sudo apt-get update -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive xfce4 dbus-x11 openssh-server
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive xfce4 dbus-x11 openssh-server xterm xdotool
           sudo useradd -m -s /bin/bash x2gotest
           echo 'x2gotest:fixture-password' | sudo chpasswd
           if getent group x2gouser >/dev/null; then sudo usermod -a -G x2gouser x2gotest; fi

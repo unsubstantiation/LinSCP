@@ -97,6 +97,9 @@ impl X2GoStartedSession {
     /// The eventual graphics handshake needs this secret; never log it.
     pub fn cookie(&self) -> &str { &self.cookie }
 
+    /// Validated X11 display number assigned by the server.
+    pub fn display(&self) -> u16 { self.display }
+
     /// Server-assigned session ID, validated for use as a shell argument.
     pub fn session_id(&self) -> &str { &self.session_id }
 
