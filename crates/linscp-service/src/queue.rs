@@ -130,6 +130,45 @@ pub enum QueueJob {
     },
 }
 
+// Preserve both the operation error and any baseline-save error. A partial
+// sync changes files before failing; an unsaved baseline can affect later plans.
+fn sync_apply_failure(error: &str, save_result: Result<(), String>) -> String {
+    match save_result {
+        Ok(()) => format!("Synchronization incomplete; some file operations may have already completed. Inspect both sides before retrying: {error}"),
+        Err(save_error) => format!("Synchronization baseline save failed after an incomplete run; some file operations may have already completed. Inspect both sides and the baseline before retrying. Operation error: {error}. Baseline error: {save_error}"),
+    }
+}
+
+// A cancellation must not hide a potentially committed move or an unsaved
+// synchronization baseline: both require explicit recovery before retrying.
+fn failure_requires_attention(error: &str) -> bool {
+    error.starts_with("Move incomplete:") || error.starts_with("Synchronization baseline save failed")
+}
+
+// Cancellation can race with an operation or a cleanup failure. Do not discard
+// the underlying diagnostic just because the cancellation flag is also set.
+fn cancellation_message(job: &QueueJob, error: &str) -> String {
+    let warning = match job {
+        QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. }
+            if matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes) =>
+                " Reconnect the FTP session before further transfers. A partial or completed destination or temporary file may remain; inspect it before retrying.",
+        QueueJob::SyncRun { .. } | QueueJob::KeepUpToDate { .. } =>
+                " Some synchronization operations may already have completed; inspect both sides before retrying.",
+        QueueJob::RemoteDownload { flags, .. } if flags.merge_directories =>
+                " A merge that had begun publication may have left files in the destination.",
+        QueueJob::RemoteUpload { .. } | QueueJob::StagedRemoteTransfer { .. } =>
+                " A partial or completed remote destination or temporary file may remain; inspect it before retrying.",
+        QueueJob::LocalCopyOrMove { .. } =>
+                " A directory operation may have left changes at the destination; inspect it before retrying.",
+        _ => "",
+    };
+    if error == "Cancelled by user." || error.is_empty() {
+        format!("Cancelled by user.{warning}")
+    } else {
+        format!("Cancelled by user.{warning} Details: {error}")
+    }
+}
+
 /// Removes user-excluded items from a synchronization plan without marking
 /// un-synchronized files as `SyncAction::None` (which would falsely record
 /// them in the two-way `SyncState` baseline). Also skips deleting any
@@ -923,11 +962,10 @@ impl QueueManager {
                 let mut g = self.inner.lock().expect("queue mutex");
                 let mut clean = false;
                 if let Some(t) = g.tasks.iter_mut().find(|t| t.id == task.id) {
-                    let committed_move_failure = result.as_ref().is_err_and(|e| e.starts_with("Move incomplete:"));
-                    if cancelled && result.is_err() && !committed_move_failure {
+                    let must_report_failure = result.as_ref().is_err_and(|e| failure_requires_attention(e));
+                    if cancelled && result.is_err() && !must_report_failure {
                         t.status = "cancelled".to_string();
-                        let reconnect = match &task.job { QueueJob::RemoteDownload { session, .. } | QueueJob::RemoteUpload { session, .. } => matches!(session.scheme(), ProtocolScheme::Ftp | ProtocolScheme::Ftps | ProtocolScheme::Ftpes), _ => false };
-                        t.error = Some(if reconnect { format!("Cancelled by user. Reconnect the FTP session before further transfers. {}", result.as_ref().err().map(String::as_str).unwrap_or("A temporary file may remain.")) } else if matches!(&task.job, QueueJob::RemoteUpload { session, .. } if session.scheme() == ProtocolScheme::S3) || matches!(&task.job, QueueJob::StagedRemoteTransfer { target_session, move_item: false, .. } if target_session.scheme() == ProtocolScheme::S3) { format!("Cancelled by user. {}", result.as_ref().err().map(String::as_str).unwrap_or("S3 upload outcome is unconfirmed.")) } else if matches!(&task.job, QueueJob::RemoteUpload { .. } | QueueJob::StagedRemoteTransfer { move_item: false, .. }) && result.as_ref().err().is_some_and(|e| e.contains("Locked temporary resource") || e.contains("Cleanup of locked temporary resource") || e.contains("WebDAV staging LOCK")) { format!("Cancelled by user. {}", result.as_ref().err().map(String::as_str).unwrap_or("Cleanup was not confirmed.")) } else if matches!(&task.job, QueueJob::RemoteDownload { flags, .. } if flags.merge_directories) { "Cancelled by user. A merge that had begun publication may have left files in the destination.".to_string() } else if matches!(&task.job, QueueJob::RemoteUpload { .. } | QueueJob::StagedRemoteTransfer { move_item: false, .. }) { "Cancelled by user. A partial or completed remote destination or temporary file may remain; inspect it before retrying.".to_string() } else { "Cancelled by user.".to_string() });
+                        t.error = Some(cancellation_message(&task.job, result.as_ref().err().map(String::as_str).unwrap_or("")));
                         clean = true;
                     } else {
                         match result {
@@ -1464,8 +1502,7 @@ impl QueueManager {
                 )
                 .await
                 {
-                    let _ = state.save(&state_file);
-                    return Err(err);
+                    return Err(sync_apply_failure(&err, state.save(&state_file)));
                 }
                 state.save(&state_file).map_err(|error| format!("Synchronization file operations completed, but the baseline could not be saved: {error}"))?;
                 Ok(())
@@ -2350,6 +2387,39 @@ async fn delete_remote_tree(
 #[cfg(test)]
 mod transfer_safety_tests {
     use super::*;
+
+    #[test]
+    fn sync_failure_reports_partial_work_and_baseline_save_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = SyncState::default();
+        let saved = sync_apply_failure("transfer interrupted", state.save(&dir.path().join("state")));
+        assert!(saved.contains("transfer interrupted"));
+        assert!(saved.contains("some file operations may have already completed"));
+        assert!(!saved.contains("baseline save failed"));
+        // A directory at the state path makes atomic replacement fail even
+        // under a privileged test runner, without relying on chmod.
+        let blocked = dir.path().join("blocked");
+        std::fs::create_dir(&blocked).unwrap();
+        let failed = sync_apply_failure("Synchronization cancelled.", state.save(&blocked));
+        assert!(failed.starts_with("Synchronization baseline save failed"), "{failed}");
+        assert!(failed.contains("Synchronization cancelled."));
+        assert!(failed.contains("Baseline error:"));
+        assert!(failure_requires_attention(&failed));
+        assert!(failure_requires_attention("Move incomplete: source remains"));
+        assert!(!failure_requires_attention(&saved));
+    }
+
+    #[test]
+    fn cancellation_preserves_error_and_warns_about_partial_local_work() {
+        let job = QueueJob::LocalCopyOrMove {
+            source: PathBuf::from("source"), target: PathBuf::from("target"),
+            move_item: false, policy: ConflictPolicy::Ask, flags: TransferFlags::default(),
+        };
+        let message = cancellation_message(&job, "provider failed during publication");
+        assert!(message.contains("provider failed during publication"));
+        assert!(message.contains("may have left changes"));
+        assert!(!cancellation_message(&job, "Cancelled by user.").contains("Details:"));
+    }
 
     #[test]
     fn unfinished_work_includes_queued_tasks_and_worker_cleanup() {
