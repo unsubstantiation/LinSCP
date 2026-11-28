@@ -28,7 +28,7 @@ cat > "$KRB5_CONFIG" <<CONF
   kdc = 127.0.0.1:$kdcport
  }
 [domain_realm]
- localhost = $realm
+ linscp-fixture.invalid = $realm
 CONF
 cat > "$KRB5_KDC_PROFILE" <<CONF
 [kdcdefaults]
@@ -44,8 +44,8 @@ cat > "$KRB5_KDC_PROFILE" <<CONF
  }
 CONF
 kdb5_util create -s -P fixture-master -r "$realm"
-kadmin.local -r "$realm" -q "addprinc -randkey host/localhost@$realm"
-kadmin.local -r "$realm" -q "ktadd -k $root/host.keytab host/localhost@$realm"
+kadmin.local -r "$realm" -q "addprinc -randkey host/linscp-fixture.invalid@$realm"
+kadmin.local -r "$realm" -q "ktadd -k $root/host.keytab host/linscp-fixture.invalid@$realm"
 kadmin.local -r "$realm" -q "addprinc -randkey $USER@$realm"
 kadmin.local -r "$realm" -q "ktadd -k $root/user.keytab $USER@$realm"
 krb5kdc -n -r "$realm" >"$root/kdc.log" 2>&1 & kdc_pid=$!

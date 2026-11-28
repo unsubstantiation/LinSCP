@@ -14,7 +14,7 @@ async fn live_kerberos_authentication_and_delegation() {
     let mut spec = parse_site_url(&format!("ssh://{user}@127.0.0.1:{port}")).unwrap();
     spec.session.hostkey = fingerprint;
     spec.raw_fields.insert("auth_gssapi".into(), "1".into());
-    spec.raw_fields.insert("logical_host".into(), "localhost".into());
+    spec.raw_fields.insert("logical_host".into(), "linscp-fixture.invalid".into());
     std::env::remove_var("SSH_AUTH_SOCK");
     std::env::set_var("KRB5CCNAME", &missing);
     assert!(connect_ssh_for_shell(&spec, Path::new("."), false, false, "en", 0, None).await.is_err(), "missing credentials must not authenticate");
