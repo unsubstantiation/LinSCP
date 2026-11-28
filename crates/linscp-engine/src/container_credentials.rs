@@ -64,7 +64,10 @@ impl Document {
     fn validate(&self) -> Result<(), String> {
         if self.version != 1 { return Err("Unsupported credential container version".into()); }
         let key = self.session_key()?;
-        SessionStore::parse_ini(&self.sessions_ini, Some(&key))?;
+        let sessions = SessionStore::parse_ini(&self.sessions_ini, Some(&key))?;
+        if sessions.sites().iter().any(|site| site.summary().has_unreadable_secret || site.setting_error.is_some()) {
+            return Err("Credential container contains unreadable session data".into());
+        }
         if self.keys.len() > MAX_KEYS { return Err("Too many container keys".into()); }
         let mut ids = BTreeSet::new();
         for record in &self.keys {
@@ -81,8 +84,33 @@ impl Document {
             let private = Zeroizing::new(BASE64.decode(&record.private_b64).map_err(|_| "Invalid container key encoding")?);
             if private.is_empty() || private.len() > MAX_KEY_BYTES { return Err("Invalid container key size".into()); }
         }
+        for site in sessions.sites() {
+            for value in [site.private_key.as_deref(), site.tunnel.keyfile.as_deref()].into_iter().flatten() {
+                if let Some(id) = value.strip_prefix("vaultkey://") {
+                    if !vault_keys::valid_id(id) || !ids.contains(&id.to_ascii_lowercase()) {
+                        return Err(format!("Session '{}' references a missing container SSH key", site.name));
+                    }
+                }
+            }
+        }
         Ok(())
     }
+}
+
+/// Input for an atomic session/key import; key material is borrowed, not logged.
+pub struct NewSshKey<'a> {
+    pub id: &'a str,
+    pub private: &'a [u8],
+    pub label: &'a str,
+    pub public_key: &'a str,
+}
+
+/// Public metadata returned by a key listing; private bytes are excluded.
+#[derive(Debug, PartialEq, Eq)]
+pub struct SshKeyInfo {
+    pub id: String,
+    pub label: String,
+    pub public_key: String,
 }
 
 /// Storage operations hold the platform lock for their whole transaction.
@@ -128,6 +156,25 @@ impl CredentialContainer {
         self.write(password, &document)
     }
 
+    /// Commit session changes and imported keys as one encrypted replacement.
+    /// Conflicts or dangling references abort before any new bytes are published.
+    pub fn save_sessions_with_keys(&self, password: &str, sessions: &SessionStore, keys: &[NewSshKey<'_>]) -> Result<(), String> {
+        let mut document = self.read(password)?;
+        for key in keys {
+            if !vault_keys::valid_id(key.id) || document.keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(key.id)) {
+                return Err("Invalid or duplicate container key ID".into());
+            }
+            if key.private.is_empty() || key.private.len() > MAX_KEY_BYTES {
+                return Err("Invalid container key size".into());
+            }
+            document.keys.push(KeyRecord { id: key.id.to_ascii_lowercase(), private_b64: BASE64.encode(key.private), label: key.label.to_owned(), public_key: key.public_key.to_owned() });
+        }
+        let updated = sessions.serialize_ini(Some(&document.session_key()?))?;
+        document.sessions_ini.zeroize();
+        document.sessions_ini = updated;
+        self.write(password, &document)
+    }
+
     /// Store a new SSH private key under an explicitly supplied, unique ID.
     /// Existing records are never silently overwritten.
     pub fn add_ssh_key(&self, password: &str, id: &str, private: &[u8], label: &str, public_key: &str) -> Result<(), String> {
@@ -137,6 +184,23 @@ impl CredentialContainer {
         }
         if private.is_empty() || private.len() > MAX_KEY_BYTES { return Err("Invalid container key size".into()); }
         document.keys.push(KeyRecord { id: id.to_ascii_lowercase(), private_b64: BASE64.encode(private), label: label.to_owned(), public_key: public_key.to_owned() });
+        self.write(password, &document)
+    }
+
+    /// List key metadata without returning private bytes.
+    pub fn list_ssh_keys(&self, password: &str) -> Result<Vec<SshKeyInfo>, String> {
+        let document = self.read(password)?;
+        Ok(document.keys.iter().map(|key| SshKeyInfo {
+            id: key.id.clone(), label: key.label.clone(), public_key: key.public_key.clone(),
+        }).collect())
+    }
+
+    /// Refuse deletion while any saved session or tunnel references the key.
+    pub fn remove_ssh_key(&self, password: &str, id: &str) -> Result<(), String> {
+        let mut document = self.read(password)?;
+        let index = document.keys.iter().position(|key| key.id.eq_ignore_ascii_case(id)).ok_or("Container key not found")?;
+        document.keys.remove(index);
+        // Validation before publication rejects now-dangling session references.
         self.write(password, &document)
     }
 
@@ -152,6 +216,48 @@ mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn transaction_import_and_key_deletion_are_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        let password = "test password";
+        vault.create(password).unwrap();
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("sample", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(format!("vaultkey://{id}"));
+        sessions.upsert(site);
+        let original = std::fs::read(&path).unwrap();
+        assert!(vault.save_sessions(password, &sessions).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+        let key = NewSshKey { id, private: b"private-key", label: "key", public_key: "public" };
+        vault.save_sessions_with_keys(password, &sessions, &[key]).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(vault.list_ssh_keys(password).unwrap()[0].id, id);
+        assert!(vault.remove_ssh_key(password, id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let dupe = NewSshKey { id, private: b"different", label: "", public_key: "" };
+        assert!(vault.save_sessions_with_keys(password, &SessionStore::new(), &[dupe]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        vault.save_sessions(password, &SessionStore::new()).unwrap();
+        vault.remove_ssh_key(password, id).unwrap();
+        assert!(vault.read_ssh_key(password, id).is_err());
+    }
+
+    #[test]
+    fn unreadable_session_secrets_are_rejected() {
+        let mut document = Document::fresh();
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("sample", ProtocolScheme::Sftp, "example.test");
+        site.password = Some("secret".into());
+        sessions.upsert(site);
+        document.sessions_ini = sessions.serialize_ini(Some(&document.session_key().unwrap())).unwrap();
+        let other = Document::fresh();
+        document.session_key_b64 = other.session_key_b64.clone();
+        assert!(document.validate().is_err());
+    }
 
     #[test]
     fn sessions_and_ssh_keys_round_trip_in_one_encrypted_file() {
