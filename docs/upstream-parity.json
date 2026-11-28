@@ -4322,7 +4322,7 @@
       "id": "desktop.wayland-session",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI.",
+      "notes": "The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI. The pure environment classification test ran on Linux in branch run 46120074371.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
         "crates/linscp-platform/src/lib.rs",
@@ -4337,11 +4337,15 @@
           "test_a_terminal_row_without_a_display_server_is_found",
           "test_startup_notification_nobody_can_complete_is_found",
           "test_detectors_that_disagree_are_found"
+        ],
+        "platform-linux": [
+          "session_environment_classification"
         ]
       },
       "verified_on": {
         "linux": [
-          "wayland-compatibility"
+          "wayland-compatibility",
+          "platform-linux"
         ]
       },
       "gap": "No real Wayland compositor, desktop environment, drag-and-drop, DPI or XWayland interoperability has been tested. Source-shape checks do not establish runtime compatibility.",
@@ -4558,7 +4562,7 @@
       "id": "platform.debian-package",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg.",
+      "notes": "debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg. The package job in branch run 46120074436 passed the synthetic upgrade, removal, purge and custom-prefix GIO/Xvfb smokes on Ubuntu 24.04. The separate general-check job failed on temporary workflow trigger policy; it is not evidence.",
       "source": [
         "debian/rules",
         "debian/control",
@@ -4574,7 +4578,7 @@
           "gui-distribution"
         ]
       },
-      "gap": "The Linux CI package smoke passed on one branch run after an earlier unexplained GUI-launch failure. Desktop menu integration, upgrades/removal and other Debian versions are not validated; the upstream CLI is deliberately omitted.",
+      "gap": "A same-payload synthetic version upgrade and removal passed on Ubuntu 24.04; migration from a historical release, real desktop menus/default selection and other Debian environments remain unverified. An earlier GUI-launch smoke failed without enough diagnostics; one later run does not establish reliability. The upstream CLI is deliberately omitted.",
       "acceptance": [
         "Investigate the intermittent launch-smoke failure and exercise package upgrade/removal and desktop integration on supported Debian environments.",
         "Do not claim the retired console client is shipped."
@@ -5633,7 +5637,7 @@
       "id": "desktop.remote",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets.",
+      "notes": "RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets. Focused ticket, launcher and fail-closed tests passed on Linux and Windows in branch run 46120074371.",
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
@@ -5654,7 +5658,8 @@
           "TestDesktopSessionDetection"
         ],
         "service": [
-          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state",
+          "desktop_requested_tunnels_do_not_fall_back_to_direct_connections"
         ],
         "ui-transport": [
           "Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject unsupported or unsafe targets",

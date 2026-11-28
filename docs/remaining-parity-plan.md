@@ -334,7 +334,7 @@ The native GUI embeds its frontend and engine in one executable; there is no sep
 
 **Area:** Desktop integration · **Status:** partial
 
-The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI.
+The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI. The pure environment classification test ran on Linux in branch run 46120074371.
 
 **Next:** No real Wayland compositor, desktop environment, drag-and-drop, DPI or XWayland interoperability has been tested. Source-shape checks do not establish runtime compatibility.
 
@@ -384,9 +384,9 @@ CMake wraps the native Tauri build, registers Rust and UI CTest entries, and ins
 
 **Area:** Packaging/platforms · **Status:** partial
 
-debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg.
+debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg. The package job in branch run 46120074436 passed the synthetic upgrade, removal, purge and custom-prefix GIO/Xvfb smokes on Ubuntu 24.04. The separate general-check job failed on temporary workflow trigger policy; it is not evidence.
 
-**Next:** The Linux CI package smoke passed on one branch run after an earlier unexplained GUI-launch failure. Desktop menu integration, upgrades/removal and other Debian versions are not validated; the upstream CLI is deliberately omitted.
+**Next:** A same-payload synthetic version upgrade and removal passed on Ubuntu 24.04; migration from a historical release, real desktop menus/default selection and other Debian environments remain unverified. An earlier GUI-launch smoke failed without enough diagnostics; one later run does not establish reliability. The upstream CLI is deliberately omitted.
 
 **Acceptance criteria:**
 
@@ -564,7 +564,7 @@ Full exports refuse external SSH/TLS material, CA directories and file-based pub
 
 **Area:** Desktop integration · **Status:** partial
 
-RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets.
+RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets. Focused ticket, launcher and fail-closed tests passed on Linux and Windows in branch run 46120074371.
 
 **Next:** The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help no longer advertises an unimplemented embedded RDP fallback; gateway responses are hints rather than a bundled viewer.
 
