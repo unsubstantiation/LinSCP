@@ -17,6 +17,9 @@ use crate::{session_store::SessionStore, vault_keys};
 const MAX_KEYS: usize = 2000;
 const MAX_KEY_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 32 * 1024;
+const MAX_TLS_BYTES: usize = 384 * 1024;
+const PUBLIC_KEY_FIELDS: &[&str] = &["linscp_public_key_file", "linscp_tunnel_public_key_file"];
+const TLS_FIELDS: &[&str] = &["ca_certificate_file", "tls_certificate_file", "certificate", "tls_certificate_key_file"];
 
 /// A private key and its public metadata. The key bytes are base64 inside the
 /// already encrypted container; they must never be saved as plaintext files.
@@ -35,11 +38,33 @@ impl Drop for KeyRecord {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct TlsRecord {
+    id: String,
+    data_b64: String,
+}
+
+impl Drop for TlsRecord {
+    fn drop(&mut self) { self.data_b64.zeroize(); }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PublicKeyRecord {
+    id: String,
+    public_key: String,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct Document {
     version: u32,
     session_key_b64: String,
     sessions_ini: String,
     keys: Vec<KeyRecord>,
+    #[serde(default)]
+    tls: Vec<TlsRecord>,
+    #[serde(default)]
+    public_keys: Vec<PublicKeyRecord>,
 }
 
 impl Drop for Document {
@@ -53,7 +78,7 @@ impl Document {
     fn fresh() -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
         rand::thread_rng().fill_bytes(&mut *key);
-        Self { version: 1, session_key_b64: BASE64.encode(&*key), sessions_ini: String::new(), keys: Vec::new() }
+        Self { version: 1, session_key_b64: BASE64.encode(&*key), sessions_ini: String::new(), keys: Vec::new(), tls: Vec::new(), public_keys: Vec::new() }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -103,11 +128,42 @@ impl Document {
             let private = Zeroizing::new(BASE64.decode(&record.private_b64).map_err(|_| "Invalid container key encoding")?);
             if private.is_empty() || private.len() > MAX_KEY_BYTES { return Err("Invalid container key size".into()); }
         }
+        if self.tls.len() > MAX_KEYS || self.public_keys.len() > MAX_KEYS { return Err("Too many container materials".into()); }
+        let mut tls_ids = BTreeSet::new();
+        for record in &self.tls {
+            if !vault_keys::valid_id(&record.id) || !tls_ids.insert(record.id.to_ascii_lowercase()) {
+                return Err("Invalid or duplicate TLS ID".into());
+            }
+            if record.data_b64.len() > (MAX_TLS_BYTES + 2) / 3 * 4 { return Err("TLS material exceeds size limit".into()); }
+            let data = Zeroizing::new(BASE64.decode(&record.data_b64).map_err(|_| "Invalid TLS encoding")?);
+            if data.is_empty() || data.len() > MAX_TLS_BYTES { return Err("Invalid TLS material size".into()); }
+        }
+        let mut public_ids: BTreeSet<String> = self.keys.iter().filter(|key| !key.public_key.is_empty()).map(|key| key.id.to_ascii_lowercase()).collect();
+        for record in &self.public_keys {
+            if !vault_keys::valid_id(&record.id) || ids.contains(&record.id.to_ascii_lowercase()) || !public_ids.insert(record.id.to_ascii_lowercase()) {
+                return Err("Invalid or duplicate public key ID".into());
+            }
+            if record.public_key.is_empty() || record.public_key.len() > MAX_METADATA_BYTES { return Err("Invalid public key size".into()); }
+        }
         for site in sessions.sites() {
             for value in [site.private_key.as_deref(), site.tunnel.keyfile.as_deref()].into_iter().flatten() {
                 if let Some(id) = value.strip_prefix("vaultkey://") {
                     if !vault_keys::valid_id(id) || !ids.contains(&id.to_ascii_lowercase()) {
                         return Err(format!("Session '{}' references a missing container SSH key", site.name));
+                    }
+                }
+            }
+            for field in PUBLIC_KEY_FIELDS {
+                if let Some(id) = site.extra_fields.get(*field).and_then(|v| v.strip_prefix("vaultpub://")) {
+                    if !vault_keys::valid_id(id) || !public_ids.contains(&id.to_ascii_lowercase()) {
+                        return Err(format!("Session '{}' references a missing container public key", site.name));
+                    }
+                }
+            }
+            for field in TLS_FIELDS {
+                if let Some(id) = site.extra_fields.get(*field).and_then(|v| v.strip_prefix("vaulttls://")) {
+                    if !vault_keys::valid_id(id) || !tls_ids.contains(&id.to_ascii_lowercase()) {
+                        return Err(format!("Session '{}' references missing container TLS material", site.name));
                     }
                 }
             }
@@ -121,6 +177,18 @@ pub struct NewSshKey<'a> {
     pub id: &'a str,
     pub private: &'a [u8],
     pub label: &'a str,
+    pub public_key: &'a str,
+}
+
+/// TLS material is held encrypted in the container and borrowed during import.
+pub struct NewTlsMaterial<'a> {
+    pub id: &'a str,
+    pub data: &'a [u8],
+}
+
+/// Public-only key material (not accompanied by an SSH private key).
+pub struct NewPublicKey<'a> {
+    pub id: &'a str,
     pub public_key: &'a str,
 }
 
@@ -258,15 +326,38 @@ impl UnlockedCredentialContainer {
 
     /// All session and key modifications are committed in a single replacement.
     pub fn save_sessions_with_keys(&mut self, sessions: &SessionStore, keys: &[NewSshKey<'_>]) -> Result<(), String> {
+        self.save_sessions_with_materials(sessions, keys, &[], &[])
+    }
+
+    /// Atomically commit sessions, private SSH keys, public-only keys and TLS
+    /// material. Any conflict or dangling reference aborts the whole update.
+    pub fn save_sessions_with_materials(&mut self, sessions: &SessionStore, keys: &[NewSshKey<'_>], tls: &[NewTlsMaterial<'_>], public_keys: &[NewPublicKey<'_>]) -> Result<(), String> {
         let mut document = self.read()?;
+        if keys.len() > MAX_KEYS.saturating_sub(document.keys.len()) || tls.len() > MAX_KEYS.saturating_sub(document.tls.len()) || public_keys.len() > MAX_KEYS.saturating_sub(document.public_keys.len()) {
+            return Err("Too many container materials".into());
+        }
         for key in keys {
-            if !vault_keys::valid_id(key.id) || document.keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(key.id)) {
+            if !vault_keys::valid_id(key.id) || document.public_keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(key.id)) || document.keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(key.id)) {
                 return Err("Invalid or duplicate container key ID".into());
             }
             if key.private.is_empty() || key.private.len() > MAX_KEY_BYTES {
                 return Err("Invalid container key size".into());
             }
             document.keys.push(KeyRecord { id: key.id.to_ascii_lowercase(), private_b64: BASE64.encode(key.private), label: key.label.to_owned(), public_key: key.public_key.to_owned() });
+        }
+        for blob in tls {
+            if !vault_keys::valid_id(blob.id) || document.tls.iter().any(|existing| existing.id.eq_ignore_ascii_case(blob.id)) {
+                return Err("Invalid or duplicate container TLS ID".into());
+            }
+            if blob.data.is_empty() || blob.data.len() > MAX_TLS_BYTES { return Err("Invalid TLS material size".into()); }
+            document.tls.push(TlsRecord { id: blob.id.to_ascii_lowercase(), data_b64: BASE64.encode(blob.data) });
+        }
+        for public in public_keys {
+            if !vault_keys::valid_id(public.id) || document.keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(public.id)) || document.public_keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(public.id)) {
+                return Err("Invalid or duplicate container public key ID".into());
+            }
+            if public.public_key.is_empty() || public.public_key.len() > MAX_METADATA_BYTES { return Err("Invalid public key size".into()); }
+            document.public_keys.push(PublicKeyRecord { id: public.id.to_ascii_lowercase(), public_key: public.public_key.to_owned() });
         }
         let updated = sessions.serialize_ini(Some(&document.session_key()?))?;
         document.sessions_ini.zeroize();
@@ -285,6 +376,36 @@ impl UnlockedCredentialContainer {
         let document = self.read()?;
         let record = document.keys.iter().find(|key| key.id.eq_ignore_ascii_case(id)).ok_or("Container key not found")?;
         Ok(Zeroizing::new(BASE64.decode(&record.private_b64).map_err(|_| "Invalid container key encoding")?))
+    }
+
+    pub fn read_tls_material(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let document = self.read()?;
+        let record = document.tls.iter().find(|record| record.id.eq_ignore_ascii_case(id)).ok_or("Container TLS material not found")?;
+        Ok(Zeroizing::new(BASE64.decode(&record.data_b64).map_err(|_| "Invalid TLS encoding")?))
+    }
+
+    pub fn read_public_key(&self, id: &str) -> Result<String, String> {
+        let document = self.read()?;
+        if let Some(key) = document.keys.iter().find(|key| key.id.eq_ignore_ascii_case(id) && !key.public_key.is_empty()) {
+            return Ok(key.public_key.clone());
+        }
+        document.public_keys.iter().find(|key| key.id.eq_ignore_ascii_case(id))
+            .map(|key| key.public_key.clone()).ok_or_else(|| "Container public key not found".into())
+    }
+
+    /// Delete only when validation confirms no saved session references it.
+    pub fn remove_tls_material(&mut self, id: &str) -> Result<(), String> {
+        let mut document = self.read()?;
+        let index = document.tls.iter().position(|record| record.id.eq_ignore_ascii_case(id)).ok_or("Container TLS material not found")?;
+        document.tls.remove(index);
+        self.write(&document)
+    }
+
+    pub fn remove_public_key(&mut self, id: &str) -> Result<(), String> {
+        let mut document = self.read()?;
+        let index = document.public_keys.iter().position(|record| record.id.eq_ignore_ascii_case(id)).ok_or("Container public-only key not found")?;
+        document.public_keys.remove(index);
+        self.write(&document)
     }
 
     pub fn remove_ssh_key(&mut self, id: &str) -> Result<(), String> {
@@ -313,6 +434,29 @@ impl ContainerSessionVault {
     pub fn new(root: &std::path::Path, unlocked: UnlockedCredentialContainer) -> Result<Self, String> {
         let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
         Ok(Self { root, unlocked: std::sync::Mutex::new(Some(unlocked)) })
+    }
+
+    /// Atomically update sessions and newly imported key materials under the
+    /// same mutex used by the SessionStore adapter.
+    pub fn save_sessions_with_materials(&self, sessions: &SessionStore, keys: &[NewSshKey<'_>], tls: &[NewTlsMaterial<'_>], public_keys: &[NewPublicKey<'_>]) -> Result<(), String> {
+        let mut guard = self.unlocked.lock().map_err(|_| "Container session is unavailable")?;
+        let session = guard.as_mut().ok_or("Vault is locked")?;
+        session.save_sessions_with_materials(sessions, keys, tls, public_keys)
+    }
+
+    pub fn read_ssh_key(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let guard = self.unlocked.lock().map_err(|_| "Container session is unavailable")?;
+        guard.as_ref().ok_or("Vault is locked")?.read_ssh_key(id)
+    }
+
+    pub fn read_tls_material(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let guard = self.unlocked.lock().map_err(|_| "Container session is unavailable")?;
+        guard.as_ref().ok_or("Vault is locked")?.read_tls_material(id)
+    }
+
+    pub fn read_public_key(&self, id: &str) -> Result<String, String> {
+        let guard = self.unlocked.lock().map_err(|_| "Container session is unavailable")?;
+        guard.as_ref().ok_or("Vault is locked")?.read_public_key(id)
     }
 
     /// Drop the derived encryption key and release the file lock.
@@ -377,6 +521,38 @@ mod tests {
     use linscp_types::ProtocolScheme;
 
     #[test]
+    fn atomic_import_covers_tls_and_public_only_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let mut unlocked = vault.unlock("test password").ok().unwrap();
+        let tls_id = "11111111111111111111111111111111";
+        let pub_id = "22222222222222222222222222222222";
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("secure", ProtocolScheme::Sftp, "example.test");
+        site.extra_fields.insert("tls_certificate_key_file".into(), format!("vaulttls://{tls_id}"));
+        site.extra_fields.insert("linscp_public_key_file".into(), format!("vaultpub://{pub_id}"));
+        sessions.upsert(site);
+        let before = std::fs::read(&path).unwrap();
+        assert!(unlocked.save_sessions_with_materials(&sessions, &[], &[], &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let tls = NewTlsMaterial { id: tls_id, data: b"private TLS material" };
+        let public = NewPublicKey { id: pub_id, public_key: "ssh-ed25519 public" };
+        unlocked.save_sessions_with_materials(&sessions, &[], &[tls], &[public]).unwrap();
+        assert_eq!(unlocked.read_tls_material(tls_id).unwrap().as_slice(), b"private TLS material");
+        assert_eq!(unlocked.read_public_key(pub_id).unwrap(), "ssh-ed25519 public");
+        let committed = std::fs::read(&path).unwrap();
+        assert!(unlocked.remove_tls_material(tls_id).is_err());
+        assert!(unlocked.remove_public_key(pub_id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        assert!(!committed.windows(b"private TLS material".len()).any(|part| part == b"private TLS material"));
+        unlocked.save_sessions_with_materials(&SessionStore::new(), &[], &[], &[]).unwrap();
+        unlocked.remove_tls_material(tls_id).unwrap();
+        unlocked.remove_public_key(pub_id).unwrap();
+    }
+
+    #[test]
     fn existing_session_store_api_uses_container_without_legacy_files() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("vault.dat");
@@ -389,6 +565,11 @@ mod tests {
         site.password = Some("secret".into());
         sessions.upsert(site);
         sessions.save_to_dir(dir.path(), &bridge).unwrap();
+        let id = "33333333333333333333333333333333";
+        let key = NewSshKey { id, private: b"private", label: "key", public_key: "public" };
+        bridge.save_sessions_with_materials(&sessions, &[key], &[], &[]).unwrap();
+        assert_eq!(bridge.read_ssh_key(id).unwrap().as_slice(), b"private");
+        assert_eq!(bridge.read_public_key(id).unwrap(), "public");
         SessionStore::protect_existing(dir.path(), &bridge).unwrap();
         assert_eq!(SessionStore::load_from_dir(dir.path(), &bridge).unwrap().find("sample").unwrap().password.as_deref(), Some("secret"));
         assert!(!dir.path().join("sessions.ini").exists());
@@ -396,6 +577,7 @@ mod tests {
         let other = tempfile::tempdir().unwrap();
         assert!(SessionStore::load_from_dir(other.path(), &bridge).is_err());
         bridge.lock().unwrap();
+        assert!(bridge.read_ssh_key(id).is_err());
         assert!(SessionStore::load_from_dir(dir.path(), &bridge).is_err());
         assert!(sessions.save_to_dir(dir.path(), &bridge).is_err());
         assert!(!dir.path().join("sessions.ini").exists());
