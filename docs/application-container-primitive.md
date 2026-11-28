@@ -1,6 +1,6 @@
 # Application container primitive (not yet integrated)
 
-`linscp_platform::container_cipher` and `container_file` are an initial building block for the planned unified store. They do **not** change where the application stores data or replace the current vault, backup, or recovery code. They are not the OfflineOTP wire format and should not be presented as an OfflineOTP-compatible file. Payload schema and application integration are future work.
+`linscp_platform::container_cipher` and `container_file` are an initial building block for the planned unified store. `linscp_engine::container_credentials` supplies a provisional credential schema and an experimental session-store bridge. They do **not** change where the application stores data or replace the current vault, backup, or recovery code. They are not the OfflineOTP wire format and should not be presented as an OfflineOTP-compatible file. Application integration and the final payload schema are future work.
 
 ## Format and use
 
@@ -15,5 +15,7 @@ The parent must already exist, be writable, and be trusted against arbitrary ren
 ## Validation and remaining work
 
 Platform tests cover a standalone authenticated-encryption vector, wrong passwords and tampering, create/no-overwrite, replacement, file and parent permissions, concurrent process locking and lock release on process termination, hard-link refusal, and reopening after an abandoned encrypted stage. The Windows ACL test verifies the sole ACE is owner-rights, the file DACL is protected from inheritance, and the parent DACL is unchanged. These are targeted tests, not a full power-loss or hostile-filesystem audit.
+
+`ContainerSessionVault` implements the optional `SecretVault` session-INI hooks so existing `SessionStore` calls can be tested against the container without `sessions.ini` or `sessions.key`. This bridge is **not** a complete `SecretVault` backend: it does not provide the service's protected-file encryption, key materialization, backup, or vault lifecycle. It is deliberately not selected by the service. When locked or used with another configuration root it fails rather than falling back to the legacy files.
 
 Before using this for real application data, integrate the stores and their schema; resolve startup while locked, backup/import, recovery, CLI and shell interactions; establish the executable-relative path and unwritable-directory UX; and test actual application workflows and crash behavior. See [the storage inventory](windows-storage-inventory.md).
