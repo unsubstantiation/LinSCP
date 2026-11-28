@@ -1,0 +1,25 @@
+name: Chunk 5 security checks
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+jobs:
+  tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libssh2-1-dev
+      - name: Platform tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform --lib -- --nocapture
+      - name: Proxy unit tests
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto proxy -- --nocapture
+      - name: Tunnel and proxy integration
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto --test ssh_sftp_scp_tunnel -- --nocapture
+      - name: Service GSSAPI policy
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service gssapi -- --nocapture
