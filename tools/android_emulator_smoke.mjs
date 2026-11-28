@@ -654,7 +654,9 @@ const expression = `
     }
     if (!offer) throw new Error('Android SEND intent did not produce a pending manifest');
     const item = offer.items.find(file => file.name === 'marker.txt');
-    const read = await invoke('GET', '/api/local/edit?path=' + encodeURIComponent(item.path));
+    const parent = item.path.slice(0, item.path.lastIndexOf('/'));
+    const local = await invoke('POST', '/api/tabs/local', {local_dir: parent, remote_dir: root});
+    const read = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=' + encodeURIComponent(item.name));
     if (read.content !== 'saf-edited') throw new Error('Shared document contents differ');
     await invoke('POST', '/api/shell/dismiss', {id: offer.id});
     return {root, incomingShareIntent: true};
