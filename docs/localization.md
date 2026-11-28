@@ -1,4 +1,4 @@
-# Linux localization
+# Localization
 
 ## Supported languages and coverage
 

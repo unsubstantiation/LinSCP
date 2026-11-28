@@ -17,19 +17,15 @@ license. The required attribution and complete terms are in `LICENSE` and
 The logo, icons and screenshots are original project artwork with separate
 redistribution terms, described in `NOTICE` and `debian/copyright`.
 
-## Runtime and vendored components
+## Runtime and third-party components
 
-| Component | Use | License / location |
-| --- | --- | --- |
-| libssh | SSH transport, authentication, host-key handling, SFTP and SCP channels | LGPL-2.1-or-later; linked dynamically from the system; not vendored |
-| OpenSSL libcrypto | Hashing, cryptographic helpers and PPK key conversion | Apache-2.0; linked from the system; not vendored |
-| libargon2 | Key derivation for encrypted PPK v3 files | CC0 1.0 or Apache-2.0 at the user's option; linked from the system; not vendored |
-| alacritty_terminal 0.26 | VT parser and grid for the embedded terminal (`crates/linscp-terminal`) | Apache-2.0; no renderer, window or GPU code, and its notice is reproduced in `NOTICE` |
-
-The current tree contains no bundled SSH protocol engine. `NOTICE` and
-`debian/copyright` identify the current third-party components and their
-licenses. Build/package metadata should continue to preserve the applicable
-notices and dynamic-linking model.
+The Rust workspace uses `russh` and `russh-sftp` for SSH transport, Rust
+cryptography and TLS crates, and Tauri for the native shell. The embedded
+terminal uses `alacritty_terminal` 0.26 (Apache-2.0). Platform runtimes and
+system libraries may also be needed. See `NOTICE`, `debian/copyright`, the
+workspace manifests and `Cargo.lock` for component information; review the
+actual dependency and license set for each distribution target. A lockfile
+records versions, not a complete license inventory.
 
 ## Repository history
 

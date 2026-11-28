@@ -36,7 +36,7 @@ The pure-Rust workspace replaces the former C++ dependencies:
 - Async runtime: `tokio` (MIT).
 - Local filesystem & platform: `crossterm` (MIT), `portable-pty` (MIT), `notify`
   (CC0/MIT), `encoding_rs` (BSD-3-Clause), `filetime` (MIT/Apache-2.0).
-- HTTP server mode: `axum` (MIT), `tower` (MIT), `tokio-tungstenite` (MIT/Apache-2.0),
+- HTTP and WebSocket dependencies: `axum` (MIT), `tower` (MIT), `tokio-tungstenite` (MIT/Apache-2.0),
   `serde`/`serde_json` (MIT/Apache-2.0).
 - Tauri v2 desktop/mobile shell (`crates/linscp-tauri`) and plugins: `tauri`
   (MIT/Apache-2.0), `tauri-plugin-dialog`/`fs`/`shell` (MIT/Apache-2.0).
@@ -46,7 +46,7 @@ The pure-Rust workspace replaces the former C++ dependencies:
   window or GPU code; the cells it produces are painted by this project's own
   canvas renderer in `ui/src/platform/terminal.ts`.
 
-All Rust crates are listed with exact versions and licenses in `Cargo.lock`;
+Rust dependency versions are recorded in `Cargo.lock`;
 a `cargo-about`/`cargo-deny` report can be generated with `cargo about generate`.
 
 The embedded terminal parses the VT stream with `alacritty_terminal` 0.26
