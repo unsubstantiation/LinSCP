@@ -63,7 +63,7 @@ jobs:
           if getent group x2gouser >/dev/null; then sudo usermod -a -G x2gouser x2gotest; fi
           sudo mkdir -p /run/sshd
           sudo ssh-keygen -A
-          sudo /usr/sbin/sshd -p 22222 -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no -o UsePAM=yes
+          sudo /usr/sbin/sshd -p 22222 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no -o UsePAM=yes
       - name: Exercise real KDrive startup and recovery
         env:
           LSCP_LIVE_X2GO: '1'

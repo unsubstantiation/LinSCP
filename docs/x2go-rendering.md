@@ -6,9 +6,7 @@ starts a new agent or resumes an existing session, opens its graphics channel,
 renders frames and server cursors, supports live window resizing (`resize`),
 optional text clipboard sync (`Selection` / `DemandSelection` / `write_selection`),
 explicit session suspend (`x2gosuspend-session`) or termination (`x2goterminate-session`),
-and forwards keyboard/pointer input through a service bridge. Live-server validation
-across diverse KDrive deployments remains required before removing the experimental
-designation. NX3 and the former external NX launch path are not supported; a KDrive
+and forwards keyboard/pointer input through a service bridge. A disposable Ubuntu 24.04 KDrive server has exercised startup, main-frame parsing, keyboard input, suspend, resume and termination through SSH; diverse servers and end-to-end WebView rendering remain unverified before removing the experimental designation. NX3 and the former external NX launch path are not supported; a KDrive
 server backend is required. Sound and X2Go server-side folder sharing are not
 implemented.
 
@@ -141,7 +139,7 @@ closes on overflow, decode errors or disconnect. A supplied transport must write
 packets, request a new main image on reinitialization, and arrange remote agent
 cleanup; the reader delivers messages and uses a heuristic to identify barrier replies.
 The page connects the opted-in text clipboard callbacks to native clipboard APIs, falling back to WebView clipboard access where available; malformed or interleaved selection chunks are discarded, and selection-demand replies preserve the requested selection (0 or 1). Server start and resume commands request clipboard mode `both` only when this viewer opts in, otherwise `none`. Clipboard permissions, provider behavior and actual protocol interoperability remain platform-dependent. Tests exercise this wiring with a simulated transport and WebView. The page
-uses `/api/x2go/open`, poll, input and close; it has not been tested against an
+uses `/api/x2go/open`, poll, input and close; this page path has not been tested against an
 actual X2Go server. Generic desktop launch/ticket requests still reject X2Go.
 
 `DesktopInput` captures keyboard, mouse buttons, motion and wheel events on the
@@ -255,13 +253,25 @@ mock integration tests use an echo server, not X2Go.
 
 ## Still required for a verified viewer
 
-- Compile and run Rust tests and verify startup, rendering, input, and cleanup
-  against actual KDrive servers on supported client platforms.
+- Extend live KDrive testing beyond the Ubuntu 24.04 loopback fixture to real remote deployments and supported client platforms, including end-to-end WebView rendering, input, cleanup and failure recovery.
 - Verify compatibility of server versions, frame and cursor semantics, keyboard
   barriers, and WebView image decoding. The one-pixel barrier has no request ID
   and can be confused with an unsolicited update.
 - Add robust recovery for failed startup replies, lifecycle failures and
   reconnects; cleanup remains best-effort after timeouts or lost SSH.
-- Support a resizable separate desktop window, resizing, cursor, clipboard,
-  optional sound, and session resume as distinct features. None is promised by
-  this experimental fixed-size in-page viewer.
+- Validate the implemented in-page resize, cursor, opt-in clipboard and session resume across real servers and platforms; add a separate desktop window and optional sound if required.
+
+## Live KDrive fixture
+
+The `X2Go KDrive integration` workflow installs Ubuntu 24.04's X2Go server and
+KDrive backend on a disposable runner, starts a loopback-only SSH server and a
+test account, and runs the opt-in `live_x2go` Rust integration test. Run it
+only on a disposable machine: it creates an account and starts services. The
+test starts XFCE, parses a main KDrive frame, sends A and Return to an X11
+terminal, checks the observed input, suspends, lists and resumes the same
+session, parses another main frame, and requests termination. Run
+[46139232341](https://github.com/unsubstantiation/LinSCP/actions/runs/46139232341)
+passed this fixture. It does not decode or display frame pixels, exercise the
+service/browser pipeline, validate clipboard, prove that XFCE remains healthy,
+or cover remote networks, other distributions, Windows clients or physical
+devices. Other existing session tests remain synthetic.
