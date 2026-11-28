@@ -21,6 +21,8 @@ jobs:
       - if: runner.os == 'Windows'
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service sync_preview_refuses_windows_case_aliases_before_deletion -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test sftp_live_cases -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
   live:
     runs-on: ubuntu-24.04
     env:
