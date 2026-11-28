@@ -20,9 +20,9 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 | [`sessions.password-at-rest`](remaining-parity-plan.md#sessionspassword-at-rest) | Evidence | Test physical Android Keystore variants and tamper/lifecycle behavior. |
 | [`sessions.proxy-settings`](remaining-parity-plan.md#sessionsproxy-settings) | Evidence | Exercise saved proxy configuration and actual proxy routing on target platforms. |
 | [`sessions.rawsettings`](remaining-parity-plan.md#sessionsrawsettings) | Evidence + scope | Test supported saved settings in GUI/service; unsupported settings must remain explicit refusals. |
-| [`security.proxy-isolation`](remaining-parity-plan.md#securityproxy-isolation) | Evidence | Test proxy isolation and negative routing behavior on supported deployments. |
+| [`security.proxy-isolation`](remaining-parity-plan.md#securityproxy-isolation) | Evidence | Linux/Windows Rust tests cover failed HTTP proxy, SOCKS downgrade and authenticated jump relay; extend real protocol and Android coverage. |
 | [`security.gui-api-token`](remaining-parity-plan.md#securitygui-api-token) | Evidence + audit | Test packaged IPC and local-process boundaries and untrusted rendering surfaces. |
-| [`security.gssapi-and-tunnels`](remaining-parity-plan.md#securitygssapi-and-tunnels) | Development + evidence | Port live KDC tests to the current transport; validate existing Windows SSPI and obtain delegation review. |
+| [`security.gssapi-and-tunnels`](remaining-parity-plan.md#securitygssapi-and-tunnels) | Development + evidence | Linux isolated KDC authentication and default-off/opt-in delegation now pass; test Windows SSPI and cross-realm/expired credentials, and obtain delegation review. |
 | [`security.gui-account`](remaining-parity-plan.md#securitygui-account) | Scope decision | Single-user native app; multi-user authentication and isolation only if server deployment becomes a goal. |
 | [`gui.native-path-drop`](remaining-parity-plan.md#guinative-path-drop) | Evidence | Exercise real desktop drop and existing Android share filter, conflict handling and bounded staging. |
 | [`editing.encoding-policy`](remaining-parity-plan.md#editingencoding-policy) | Evidence | Exercise actual editing flows and encoding decisions on supported platforms. |

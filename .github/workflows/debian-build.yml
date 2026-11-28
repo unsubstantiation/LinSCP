@@ -42,13 +42,14 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
             cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            python3-paramiko python3-pyftpdlib python3-openssl
+            python3-paramiko python3-pyftpdlib python3-openssl krb5-kdc krb5-admin-server krb5-user openssh-server
 
       - name: Check GUI distribution, workflow triggers, and X2Go
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
           python3 -m unittest discover -s tools/tests -p test_native_listeners.py
+          python3 -m unittest discover -s tools/tests -p test_native_ipc_policy.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
           python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
@@ -82,6 +83,9 @@ jobs:
           set -euo pipefail
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
+
+      - name: Exercise isolated Kerberos and SSH delegation
+        run: python3 tools/run_cargo_ci.py bash tools/live_kerberos_ci.sh
 
       - name: Validate XML action log against the pinned schema
         run: |

@@ -20,7 +20,7 @@ realm=LINSCP.TEST
 # A disposable unlocked account is needed because GitHub's runner account is
 # locked. sshd below disables password and public-key authentication.
 fixture_user="lscpkrb${RANDOM}"
-sudo useradd -M -d /tmp -s /bin/sh -p "$(openssl passwd -6 'unused-fixture-password')" "$fixture_user"
+sudo useradd -M -d /tmp -s /bin/sh -p "$(openssl rand -hex 32 | openssl passwd -6 -stdin)" "$fixture_user"
 user_created=1
 export KRB5_CONFIG="$root/krb5.conf" KRB5_KDC_PROFILE="$root/kdc.conf"
 cat > "$KRB5_CONFIG" <<CONF
