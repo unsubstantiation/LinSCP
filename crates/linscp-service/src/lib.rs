@@ -16508,6 +16508,79 @@ mod tests {
         drop(server); let _ = std::fs::remove_dir_all(tmp);
     }
 
+    /// Service routes against an actual loopback WebDAV server: one-way
+    /// synchronization, encoded editing/search, and a broken TCP delete.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_webdav_sync_encoding_and_interrupted_delete() {
+        if std::env::var_os("LSCP_LIVE_WEBDAV").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(local.join("nested")).unwrap();
+        std::fs::write(local.join("nested/file.txt"), b"sync contents").unwrap();
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        let child = Command::new("/usr/bin/python3").arg(server_path)
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_DROP_DELETE", "/partial/b.txt")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child);
+        let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("WebDAV server did not start").parse().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let post = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(post("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        session.mkdir("/sync").await.unwrap();
+        let sync_body = || json!({"tab": id, "local_dir": local, "remote_dir": "/sync", "mode": "remote", "preserve_time": false});
+        let preview = svc.dispatch_async(post("/api/sync/preview", sync_body())).await;
+        assert_eq!(preview.status, 200, "{}", preview.payload);
+        let run = svc.dispatch_async(post("/api/sync/run", sync_body())).await;
+        assert_eq!(run.status, 200, "{}", run.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/sync/nested/file.txt", Default::default()).await.unwrap(), b"sync contents");
+
+        session.mkdir("/text").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/text/legacy.txt", b"caf\xe9\r\n", Default::default()).await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/text/binary.txt", b"caf\xe9\0binary", Default::default()).await.unwrap();
+        let get = |suffix: &str| ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=%2Ftext%2Flegacy.txt{suffix}"), body: json!({}) };
+        let invalid = svc.dispatch_async(get("")).await;
+        assert_eq!(invalid.status, 400, "{}", invalid.payload);
+        let edit = svc.dispatch_async(get("&encoding=windows-1252")).await;
+        assert_eq!(edit.status, 200, "{}", edit.payload);
+        assert_eq!(edit.payload["content"], "café\r\n");
+        assert_eq!(edit.payload["info"]["eol"], "crlf");
+        let search = svc.dispatch_async(post("/api/remote/search", json!({"tab": id, "path": "/text", "pattern": "*.txt", "search_contents": true, "content_query": "café", "encoding": "windows-1252"}))).await;
+        assert_eq!(search.status, 200, "{}", search.payload);
+        assert_eq!(search.payload["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search.payload["matches"][0]["name"], "legacy.txt");
+        assert_eq!(search.payload["skipped"], 1);
+        let save = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/text/legacy.txt", "content": "naïve\n", "encoding": "windows-1252", "eol": "crlf", "base_mtime": edit.payload["info"]["mtime"]}))).await;
+        assert_eq!(save.status, 200, "{}", save.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/text/legacy.txt", Default::default()).await.unwrap(), b"na\xefve\r\n");
+        let rejected = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/text/legacy.txt", "content": "snowman ☃", "encoding": "windows-1252"}))).await;
+        assert_eq!(rejected.status, 400, "{}", rejected.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/text/legacy.txt", Default::default()).await.unwrap(), b"na\xefve\r\n");
+
+        session.mkdir("/partial").await.unwrap();
+        for (path, data) in [("/partial/a.txt", b"a".as_slice()), ("/partial/b.txt", b"b".as_slice()), ("/other.txt", b"other".as_slice())] {
+            linscp_proto::upload_bytes(session.as_ref(), path, data, Default::default()).await.unwrap();
+        }
+        let deleted = svc.dispatch_async(post("/api/remote/delete", json!({"tab": id, "names": ["other.txt", "partial"]}))).await;
+        assert_eq!(deleted.status, 200, "{}", deleted.payload);
+        assert_eq!(deleted.payload["deleted"], json!(["other.txt"]));
+        assert_eq!(deleted.payload["failed"][0]["name"], "partial");
+        assert!(deleted.payload["failed"][0]["error"].as_str().unwrap().contains("partially deleted"));
+        assert!(session.stat("/partial/a.txt").await.unwrap().is_none());
+        assert!(session.stat("/partial/b.txt").await.unwrap().is_some());
+        assert!(session.stat("/partial").await.unwrap().is_some());
+    }
+
     #[cfg(target_os = "linux")]
     async fn exercise_webdav_ignored_if_match(svc: &CommanderService, id: u64, downloaded: &Path, session: &dyn RemoteSession) {
         let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };

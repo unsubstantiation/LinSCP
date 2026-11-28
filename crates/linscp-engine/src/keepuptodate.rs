@@ -339,11 +339,14 @@ mod tests {
     impl LocalFs for ChangeDuringFirstPlan {
         fn list_roots(&self) -> Result<Vec<linscp_types::LocalRootEntry>, linscp_platform::PlatformError> { self.inner.list_roots() }
         fn list_dir(&self, path: &str) -> Result<Vec<linscp_types::FileEntry>, linscp_platform::PlatformError> {
+            let snapshot = self.inner.list_dir(path)?;
             if !self.fired.swap(true, Ordering::SeqCst) {
+                // Return the snapshot from before the change. Only a second
+                // pass can discover and transfer the new file.
                 std::fs::write(self.source.join("during.txt"), b"during").unwrap();
                 std::thread::sleep(Duration::from_millis(300));
             }
-            self.inner.list_dir(path)
+            Ok(snapshot)
         }
         fn stat(&self, path: &str) -> Result<linscp_types::FileEntry, linscp_platform::PlatformError> { self.inner.stat(path) }
         fn mkdir_all(&self, path: &str) -> Result<(), linscp_platform::PlatformError> { self.inner.mkdir_all(path) }
