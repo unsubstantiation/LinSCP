@@ -11437,17 +11437,17 @@ fn read_tls_blob_for_export(
         if !valid_vault_key_id(id) {
             return Err(format!("Saved {label} reference is invalid."));
         }
-        let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
-        let metadata = std::fs::metadata(&encrypted_path)
-            .map_err(|error| format!("Cannot read saved {label}: {error}"))?;
-        if metadata.len() > TLS_VAULT_BLOB_LIMIT + 64 {
-            return Err(format!("Saved {label} exceeds the 384 KiB interchange limit."));
-        }
-        let encrypted = std::fs::read(&encrypted_path)
-            .map_err(|error| format!("Cannot read saved {label}: {error}"))?;
-        let plain = secret_vault
-            .open_local_blob(&encrypted)
-            .map_err(|error| error.to_string())?;
+        let plain = match secret_vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::Tls, id).map_err(|e| e.to_string())? {
+            linscp_platform::VaultMaterialRead::Plaintext(value) => value,
+            linscp_platform::VaultMaterialRead::Missing => return Err(format!("Saved {label} is no longer in the vault.")),
+            linscp_platform::VaultMaterialRead::Unhandled => {
+                let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
+                let metadata = std::fs::metadata(&encrypted_path).map_err(|error| format!("Cannot read saved {label}: {error}"))?;
+                if metadata.len() > TLS_VAULT_BLOB_LIMIT + 64 { return Err(format!("Saved {label} exceeds the 384 KiB interchange limit.")); }
+                let encrypted = std::fs::read(&encrypted_path).map_err(|error| format!("Cannot read saved {label}: {error}"))?;
+                secret_vault.open_local_blob(&encrypted).map_err(|error| error.to_string())?
+            }
+        };
         if plain.is_empty() || plain.len() as u64 > TLS_VAULT_BLOB_LIMIT {
             return Err(format!("Saved {label} has an invalid size."));
         }
@@ -11810,6 +11810,28 @@ fn offlineotp_entries_from_sessions(
         }));
     }
     if include_vault_keys {
+        if let Some(keys) = secret_vault.list_vault_ssh_keys(config_root).map_err(|e| e.to_string())? {
+            let public_ids = secret_vault.list_vault_public_keys(config_root).map_err(|e| e.to_string())?
+                .ok_or("Vault does not support public-only key enumeration")?;
+            if keys.len() > 2000 || public_ids.len() > 4000 { return Err("Too many vault keys to export.".into()); }
+            for key in keys {
+                let (public_key, private_key) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_KEY_PREFIX}{}", key.id), config_root, secret_vault)?;
+                if private_key.is_empty() { return Err("Saved vault SSH key is empty.".into()); }
+                if sanitize_vault_key_label(&key.label) != key.label { return Err("Vault SSH key label is invalid.".into()); }
+                entries.push(CredentialEntry::SshKey(SshKeyRecord {
+                    label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{}:{}", key.id, key.label),
+                    public_key, private_key, host: String::new(), port: 0, username: String::new(), password: String::new(),
+                }));
+            }
+            for id in public_ids {
+                let (public_key, _) = read_offlineotp_keypair(&format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"), config_root, secret_vault)?;
+                let label = derive_vault_key_label("", &public_key, &id);
+                entries.push(CredentialEntry::SshKey(SshKeyRecord {
+                    label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}{id}:{label}"),
+                    public_key, private_key: String::new(), host: String::new(), port: 0, username: String::new(), password: String::new(),
+                }));
+            }
+        } else {
         let dir = config_root.join("keys");
         let ids = list_vault_key_ids(&dir, ".key.vault", 2000)?;
         let all_public_ids = list_vault_key_ids(&dir, ".pub", 4000)?;
@@ -11841,6 +11863,7 @@ fn offlineotp_entries_from_sessions(
                 username: String::new(), password: String::new(),
             }));
         }
+        }
     }
     if entries.is_empty() {
         return Err(if selection.is_some() {
@@ -11865,6 +11888,20 @@ fn read_export_vault_key_label(dir: &Path, id: &str, public_key: &str) -> Result
     }
 }
 
+fn read_export_public_key(config_root: &Path, vault: &dyn SecretVault, id: &str, limit: u64, required: bool) -> Result<String, String> {
+    let bytes = match vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::SshPublic, id).map_err(|e| e.to_string())? {
+        linscp_platform::VaultMaterialRead::Plaintext(value) => Some(value.to_vec()),
+        linscp_platform::VaultMaterialRead::Missing => None,
+        linscp_platform::VaultMaterialRead::Unhandled => read_vault_key_file(&config_root.join("keys").join(format!("{id}.pub")), limit as usize)?,
+    };
+    match bytes {
+        Some(value) if value.len() as u64 <= limit => String::from_utf8(value).map_err(|_| "Vault SSH public key is not UTF-8 text.".into()),
+        Some(_) => Err("SSH key exceeds OfflineOTP's 32 KiB per-key limit.".into()),
+        None if required => Err("Saved SSH public key is no longer in the vault.".into()),
+        None => Ok(String::new()),
+    }
+}
+
 fn read_offlineotp_keypair(
     path: &str,
     config_root: &Path,
@@ -11875,31 +11912,28 @@ fn read_offlineotp_keypair(
         if !valid_vault_key_id(id) {
             return Err("Saved encrypted SSH key reference is invalid.".to_string());
         }
-        let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
-        let encrypted = read_vault_key_file(&encrypted_path, 1024 * 1024 + 64)?
-            .ok_or("Saved encrypted SSH key is no longer in the vault.")?;
-        let private = secret_vault.open_local_blob(&encrypted)
-            .map_err(|error| error.to_string())?;
+        let private = match secret_vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::SshPrivate, id).map_err(|e| e.to_string())? {
+            linscp_platform::VaultMaterialRead::Plaintext(value) => value,
+            linscp_platform::VaultMaterialRead::Missing => return Err("Saved encrypted SSH key is no longer in the vault.".into()),
+            linscp_platform::VaultMaterialRead::Unhandled => {
+                let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
+                let encrypted = read_vault_key_file(&encrypted_path, 1024 * 1024 + 64)?.ok_or("Saved encrypted SSH key is no longer in the vault.")?;
+                secret_vault.open_local_blob(&encrypted).map_err(|error| error.to_string())?
+            }
+        };
         if private.len() as u64 > LIMIT {
             return Err("SSH key exceeds OfflineOTP's 32 KiB per-key limit.".to_string());
         }
         let private = String::from_utf8(private.to_vec())
             .map_err(|_| "SSH private key is not UTF-8 text.".to_string())?;
-        let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        let public = match read_vault_key_file(&public_path, LIMIT as usize)? {
-            Some(bytes) => String::from_utf8(bytes).map_err(|_| "Vault SSH public key is not UTF-8 text.")?,
-            None => String::new(),
-        };
+        let public = read_export_public_key(config_root, secret_vault, id, LIMIT, false)?;
         return Ok((public, private));
     }
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_PUBLIC_KEY_PREFIX) {
         if !valid_vault_key_id(id) {
             return Err("Saved SSH public key reference is invalid.".to_string());
         }
-        let public_path = config_root.join("keys").join(format!("{id}.pub"));
-        let public = String::from_utf8(read_vault_key_file(&public_path, LIMIT as usize)?
-            .ok_or("Saved SSH public key is no longer in the vault.")?)
-            .map_err(|_| "Vault SSH public key is not UTF-8 text.")?;
+        let public = read_export_public_key(config_root, secret_vault, id, LIMIT, true)?;
         if public.trim().is_empty() {
             return Err("Saved SSH public key contains no key text.".to_string());
         }
@@ -12221,6 +12255,12 @@ fn import_offlineotp_entries(
     selection: Option<&std::collections::HashSet<String>>,
     replace_same_names: bool,
 ) -> Result<(usize, usize, usize), String> {
+    // This importer also changes host keys and transfer presets. Until the
+    // complete import can be committed safely, never leak staged keys into
+    // legacy files when a transactional container backend is selected.
+    if secret_vault.supports_session_material_transactions() {
+        return Err("OfflineOTP import is not yet supported by the container vault.".into());
+    }
     let mut created_files = Vec::<PathBuf>::new();
     let mut sessions_published = false;
     let result = (|| {
@@ -13402,6 +13442,38 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    #[test]
+    fn container_offlineotp_export_reads_material_without_legacy_fallback() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer, NewSshKey, NewPublicKey, NewTlsMaterial};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let key_id = "11111111111111111111111111111111";
+        let pub_id = "22222222222222222222222222222222";
+        let tls_id = "33333333333333333333333333333333";
+        bridge.save_sessions_with_materials(&SessionStore::new(),
+            &[NewSshKey { id: key_id, private: b"private text", label: "my key", public_key: "ssh-ed25519 public" }],
+            &[NewTlsMaterial { id: tls_id, data: b"private tls" }],
+            &[NewPublicKey { id: pub_id, public_key: "ssh-ed25519 publiconly" }]).unwrap();
+        let (public, private) = read_offlineotp_keypair(&format!("vaultkey://{key_id}"), dir.path(), &bridge).unwrap();
+        assert_eq!(public, "ssh-ed25519 public");
+        assert_eq!(private, "private text");
+        assert_eq!(read_offlineotp_keypair(&format!("vaultpub://{pub_id}"), dir.path(), &bridge).unwrap().0, "ssh-ed25519 publiconly");
+        assert_eq!(read_tls_blob_for_export(&format!("vaulttls://{tls_id}"), dir.path(), &bridge, "TLS key").unwrap(), b"private tls");
+        let entries = offlineotp_entries_from_sessions(&SessionStore::new(), dir.path(), &bridge, None, true).unwrap();
+        assert_eq!(entries.len(), 2);
+        let keydir = dir.path().join("keys");
+        std::fs::create_dir(&keydir).unwrap();
+        let missing = "44444444444444444444444444444444";
+        std::fs::write(keydir.join(format!("{missing}.pub")), b"legacy material").unwrap();
+        assert!(read_offlineotp_keypair(&format!("vaultpub://{missing}"), dir.path(), &bridge).is_err());
+        bridge.lock().unwrap();
+        assert!(read_offlineotp_keypair(&format!("vaultkey://{key_id}"), dir.path(), &bridge).is_err());
+        assert!(offlineotp_entries_from_sessions(&SessionStore::new(), dir.path(), &bridge, None, true).is_err());
+    }
 
     #[test]
     fn container_session_staging_commits_atomically() {

@@ -353,6 +353,8 @@ pub trait SecretVault: Send + Sync {
     }
     /// None means the legacy filesystem implementation must handle the call.
     fn list_vault_ssh_keys(&self, _config_dir: &Path) -> Result<Option<Vec<VaultSshKeyInfo>>, PlatformError> { Ok(None) }
+    /// IDs of public-only keys, excluding public halves of private keys.
+    fn list_vault_public_keys(&self, _config_dir: &Path) -> Result<Option<Vec<String>>, PlatformError> { Ok(None) }
     fn import_vault_ssh_key(&self, _config_dir: &Path, _id: &str, _private: &[u8], _label: &str, _public: &str) -> Result<Option<VaultSshKeyImport>, PlatformError> { Ok(None) }
     /// Some(false) indicates a handled request whose key was not found.
     fn delete_vault_ssh_key(&self, _config_dir: &Path, _id: &str) -> Result<Option<bool>, PlatformError> { Ok(None) }

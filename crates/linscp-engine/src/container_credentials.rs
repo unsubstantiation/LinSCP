@@ -572,6 +572,14 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
         }).collect()))
     }
 
+    fn list_vault_public_keys(&self, config_dir: &std::path::Path) -> Result<Option<Vec<String>>, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        Ok(Some(document.public_keys.iter().map(|record| record.id.clone()).collect()))
+    }
+
     fn import_vault_ssh_key(&self, config_dir: &std::path::Path, id: &str, private: &[u8], label: &str, public: &str) -> Result<Option<linscp_platform::VaultSshKeyImport>, linscp_platform::PlatformError> {
         self.check_root(config_dir)?;
         if !vault_keys::valid_id(id) || private.is_empty() || private.len() > MAX_KEY_BYTES || label.len() > 512 || public.len() > MAX_METADATA_BYTES {
