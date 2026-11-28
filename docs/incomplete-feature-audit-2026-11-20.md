@@ -41,7 +41,9 @@ experimental and is not ready for production transfers.
   [Transfer safety](transfer-safety.md).
 - **Synchronization and editing:** recursive remote deletion can partially
   succeed. Remote editor saves compare modification times, not an atomic
-  compare-and-swap, so concurrent writes can still be overwritten. **Next:**
+  compare-and-swap, so concurrent writes can still be overwritten. This branch
+  reports baseline-save failures following an incomplete sync rather than
+  discarding them, and preserves cancellation diagnostics. **Next:**
   assess protocol-specific conditional saves and clearer partial-result recovery;
   exercise watcher and provider behavior on real systems.
   [Synchronization and editing](synchronization-editing.md);
