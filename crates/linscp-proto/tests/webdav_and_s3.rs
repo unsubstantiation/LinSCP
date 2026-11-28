@@ -1264,6 +1264,20 @@ async fn s3_sigv4_resumable_multipart_and_object_versioning_succeed() {
         "the changed first part must be sent again");
     assert_eq!(download_bytes(&s3, target, TransferRequest::default()).await.unwrap(), changed);
 
+    // Neither a truncated nor an expanded source may be completed under a
+    // previously reported length, even when every transmitted part succeeds.
+    let mut short_source: &[u8] = b"short";
+    let short = s3.upload("/alpha-bucket/releases/short.bin", TransferRequest::default(),
+        &mut short_source, Some(20 * 1024), None).await;
+    assert!(short.is_err(), "a truncated source must not complete");
+    assert!(s3.stat("/alpha-bucket/releases/short.bin").await.unwrap().is_none());
+    let extra_bytes = vec![b'x'; 20 * 1024 + 1];
+    let mut long_source: &[u8] = &extra_bytes;
+    let long = s3.upload("/alpha-bucket/releases/long.bin", TransferRequest::default(),
+        &mut long_source, Some(20 * 1024), None).await;
+    assert!(long.is_err(), "an expanded source must not complete");
+    assert!(s3.stat("/alpha-bucket/releases/long.bin").await.unwrap().is_none());
+
     // Byte-range GET resume + server-side CopyObject / rename / version delete
     let tail = download_bytes(
         &s3,

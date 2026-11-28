@@ -1282,6 +1282,17 @@ impl S3Session {
                 }
                 part_number += 1;
             }
+            if let Some(expected) = total_size {
+                if transferred != expected {
+                    return Err(ProtoError::Transport("S3 upload source size changed during multipart transfer.".to_string()));
+                }
+                // Also detect a growing source and let an interruptible reader
+                // report cancellation before the irreversible completion.
+                let mut extra = [0u8; 1];
+                if source.read(&mut extra).await.map_err(|e| ProtoError::Transport(format!("Checking S3 multipart source failed: {e}")))? != 0 {
+                    return Err(ProtoError::Transport("S3 upload source size changed during multipart transfer.".to_string()));
+                }
+            }
             Ok(())
         }
         .await;
