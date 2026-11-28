@@ -27,4 +27,13 @@ shared libraries are runtime dependencies. Launch LinSCP from the desktop menu
 or run `linscp-gui` in a graphical session; settings live in the normal user
 configuration directory.
 
+The Debian CI smoke runs the installed GUI under Xvfb and headless Weston
+(with the GTK Wayland backend forced). The Weston check observes a configured
+and committed Wayland toplevel, not rendered pixels or user interaction. CI
+also tests upgrade from a synthetic older version of the same package payload,
+then removal and purge; it does not validate migration from a released version.
+Package removal does not remove optional per-user file-manager integration or
+user configuration. Uninstall the integration using the command above before
+removing the package if those actions should also be removed.
+
 For an uninstalled build and test commands, see the [main README](../readme.md).

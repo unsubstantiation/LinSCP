@@ -33,11 +33,11 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 | [`automation.powershell`](remaining-parity-plan.md#automationpowershell) | Out of scope | The PowerShell interface is not planned for the GUI-only distribution. |
 | [`desktop.scheme-handlers`](remaining-parity-plan.md#desktopscheme-handlers) | Development + evidence | Test real URI registration and delivery; implement missing target-platform registration if in scope. |
 | [`desktop.launcher-prefix`](remaining-parity-plan.md#desktoplauncher-prefix) | Evidence | Validate real custom-prefix desktop integration; limit platform-specific claims. |
-| [`desktop.wayland-session`](remaining-parity-plan.md#desktopwayland-session) | Evidence | Exercise Linux Wayland/compositor workflows; do not require Wayland tests on unrelated platforms. |
+| [`desktop.wayland-session`](remaining-parity-plan.md#desktopwayland-session) | Evidence | Headless Weston basic window launch passed; exercise full Wayland desktop interaction, rendering, scaling and other compositors on Linux. |
 | [`locale.translations`](remaining-parity-plan.md#localetranslations) | Optional expansion | Add languages beyond the four shipped catalogs if product scope requires them. |
 | [`platform.make-linux`](remaining-parity-plan.md#platformmake-linux) | Evidence | Validate real menu discovery and scheme selection for custom-prefix Make installs. |
 | [`platform.cmake-linux`](remaining-parity-plan.md#platformcmake-linux) | Evidence | Validate real desktop integration and registered CTest entries for CMake installs. |
-| [`platform.debian-package`](remaining-parity-plan.md#platformdebian-package) | Investigation + evidence | Investigate recorded launch-smoke issue; test package upgrade and removal. |
+| [`platform.debian-package`](remaining-parity-plan.md#platformdebian-package) | Investigation + evidence | Synthetic same-payload upgrade/removal passed on Ubuntu 24.04; test historical upgrades, other Debian environments and desktop integration. |
 | [`platform.prefix-lookup`](remaining-parity-plan.md#platformprefix-lookup) | Evidence | Check platform-appropriate executable and resource lookup; avoid an artificial all-platform gate. |
 | [`platform.posix-runtime-services`](remaining-parity-plan.md#platformposix-runtime-services) | Evidence + scope | Test supported child-process I/O, Windows console controls and Android runtime paths as applicable. |
 | [`platform.terminal-and-console`](remaining-parity-plan.md#platformterminal-and-console) | Evidence + scope | Test the shipped terminal and embedded console; do not assume the retired CLI is installed. |

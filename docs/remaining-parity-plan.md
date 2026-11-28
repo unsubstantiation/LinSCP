@@ -334,13 +334,13 @@ The native GUI embeds its frontend and engine in one executable; there is no sep
 
 **Area:** Desktop integration · **Status:** partial
 
-The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI. The pure environment classification test ran on Linux in branch run 46120074371.
+The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI. The pure environment classification test ran on Linux in branch run 46120074371. An installed Debian package was launched on a real headless Weston compositor with DISPLAY unset and GDK_BACKEND=wayland; the test observed a LinSCP xdg-toplevel title, configuration acknowledgement and surface commit, and checked native listeners (branch run 46121989363). It used the package artifact built in run 46120074436, not a fresh build.
 
-**Next:** No real Wayland compositor, desktop environment, drag-and-drop, DPI or XWayland interoperability has been tested. Source-shape checks do not establish runtime compatibility.
+**Next:** A basic headless Weston launch is tested, but full desktop environments, user interaction, clipboard, drag-and-drop, DPI, XWayland interoperability and other compositors are not verified. Protocol logging does not validate rendered pixels.
 
 **Acceptance criteria:**
 
-- [ ] Exercise native GUI and terminal selection on real supported Wayland compositors and X11, including mixed XWayland sessions, scaling and native desktop interactions.
+- [ ] Exercise native GUI and terminal selection on full supported Wayland compositors and X11, including mixed XWayland sessions, scaling, rendering and native desktop interactions.
 
 ## locale.translations
 
