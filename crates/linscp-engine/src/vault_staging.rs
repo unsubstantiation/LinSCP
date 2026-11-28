@@ -148,3 +148,85 @@ pub fn stage_session_ssh_keys(site: &mut StoredSite, staged: &mut Vec<StagedSess
     Ok(())
 }
 
+
+/// TLS certificate and private-key files are copied into the same transaction
+/// as their referring session. No plaintext staging files are created.
+pub struct StagedTlsMaterial {
+    id: String,
+    bytes: zeroize::Zeroizing<Vec<u8>>,
+}
+
+impl StagedTlsMaterial {
+    pub fn as_import(&self) -> linscp_platform::VaultMaterialImport<'_> {
+        linscp_platform::VaultMaterialImport::Tls { id: &self.id, data: &self.bytes }
+    }
+}
+
+pub fn stage_session_tls_material(site: &mut StoredSite, staged: &mut Vec<StagedTlsMaterial>) -> Result<(), String> {
+    const LIMIT: u64 = 384 * 1024;
+    for field in ["ca_certificate_file", "tls_certificate_file", "certificate", "tls_certificate_key_file"] {
+        let Some(value) = site.extra_fields.get_mut(field) else { continue };
+        if value.is_empty() { continue; }
+        if let Some(id) = value.strip_prefix("vaulttls://") {
+            if !valid_vault_key_id(id) { return Err(format!("Invalid saved TLS reference in '{field}'")); }
+            continue;
+        }
+        let path = PathBuf::from(linscp_platform::terminal::expand_tilde(value));
+        let metadata = std::fs::metadata(&path).map_err(|e| format!("Cannot read TLS material '{}': {e}", path.display()))?;
+        if !metadata.is_file() || metadata.len() > LIMIT { return Err(format!("TLS material '{}' is not a regular file under 384 KiB", path.display())); }
+        use std::io::Read as _;
+        let file = std::fs::File::open(&path).map_err(|e| format!("Cannot read TLS material '{}': {e}", path.display()))?;
+        let mut bytes = zeroize::Zeroizing::new(Vec::new());
+        file.take(LIMIT + 1).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+        if bytes.is_empty() || bytes.len() as u64 > LIMIT { return Err("Invalid TLS material size".into()); }
+        if let Some(existing) = staged.iter().find(|entry| constant_time_bytes_eq(&entry.bytes, &bytes)) {
+            *value = format!("vaulttls://{}", existing.id);
+            continue;
+        }
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let id = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        *value = format!("vaulttls://{id}");
+        staged.push(StagedTlsMaterial { id, bytes });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::container_credentials::{ContainerSessionVault, CredentialContainer};
+    use crate::session_store::SessionStore;
+    use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn tls_material_is_committed_atomically_with_session() {
+        let root = tempfile::tempdir().unwrap();
+        let source = tempfile::tempdir().unwrap();
+        let pem = source.path().join("client.pem");
+        std::fs::write(&pem, b"private certificate material").unwrap();
+        let path = root.path().join("app.dat");
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let vault = ContainerSessionVault::new(root.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let mut site = StoredSite::new("tls", ProtocolScheme::Ftps, "example.test");
+        site.extra_fields.insert("tls_certificate_file".into(), pem.to_string_lossy().into_owned());
+        site.extra_fields.insert("tls_certificate_key_file".into(), pem.to_string_lossy().into_owned());
+        let mut staged = Vec::new();
+        stage_session_tls_material(&mut site, &mut staged).unwrap();
+        assert_eq!(staged.len(), 1);
+        let reference = site.extra_fields["tls_certificate_key_file"].clone();
+        let id = reference.strip_prefix("vaulttls://").unwrap();
+        let mut store = SessionStore::new();
+        store.upsert(site);
+        store.save_with_materials(root.path(), &vault, &[staged[0].as_import()]).unwrap();
+        assert_eq!(vault.read_tls_material(id).unwrap().as_slice(), b"private certificate material");
+        assert_eq!(SessionStore::load_from_dir(root.path(), &vault).unwrap().find("tls").unwrap().extra_fields["tls_certificate_file"], reference);
+        assert!(!root.path().join("keys").exists());
+        let before = std::fs::read(&path).unwrap();
+        let mut invalid = StoredSite::new("bad", ProtocolScheme::Ftps, "example.test");
+        invalid.extra_fields.insert("tls_certificate_key_file".into(), source.path().join("missing").to_string_lossy().into_owned());
+        assert!(stage_session_tls_material(&mut invalid, &mut Vec::new()).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+    }
+}

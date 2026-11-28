@@ -2779,11 +2779,16 @@ impl ScriptInterpreter {
         let site_user = site.username.clone();
         let site_host = site.host.clone();
         let mut staged_keys = Vec::new();
+        let mut staged_tls = Vec::new();
         let transactional = vault.supports_session_material_transactions();
-        if transactional { crate::vault_staging::stage_session_ssh_keys(&mut site, &mut staged_keys)?; }
+        if transactional {
+            crate::vault_staging::stage_session_ssh_keys(&mut site, &mut staged_keys)?;
+            crate::vault_staging::stage_session_tls_material(&mut site, &mut staged_tls)?;
+        }
         store.upsert(site);
         if transactional {
-            let imports: Vec<_> = staged_keys.iter().map(crate::vault_staging::StagedSessionKey::as_import).collect();
+            let mut imports: Vec<_> = staged_keys.iter().map(crate::vault_staging::StagedSessionKey::as_import).collect();
+            imports.extend(staged_tls.iter().map(crate::vault_staging::StagedTlsMaterial::as_import));
             store.save_with_materials(&self.cfg.config_dir, vault, &imports)?;
         } else { store.save_to_dir(&self.cfg.config_dir, vault)?; }
         let sessions_path = self.cfg.config_dir.join("sessions.ini");

@@ -16,7 +16,7 @@ use linscp_engine::{
     parse_filezilla_xml, parse_openssh_config, PreferencesStore, SessionStore, StoredSite,
 };
 use linscp_engine::vault_material::materialize_vault_key_paths;
-use linscp_engine::vault_staging::{stage_session_ssh_keys, StagedSessionKey};
+use linscp_engine::vault_staging::{stage_session_ssh_keys, stage_session_tls_material, StagedSessionKey, StagedTlsMaterial};
 use linscp_engine::vault_keys::{valid_id as valid_vault_key_id, list_ids as list_vault_key_ids, read_file as read_vault_key_file};
 use linscp_platform::{
     config_dir, gui_os, write_exclusive_private_file, write_private_file_atomic, LocalFs,
@@ -6031,8 +6031,9 @@ impl CommanderService {
         let mut protected_key_files = Vec::new();
         let transactional = self.secret_vault.supports_session_material_transactions();
         let mut staged_keys = Vec::new();
+        let mut staged_tls = Vec::new();
         let protection = if transactional {
-            stage_session_ssh_keys(&mut stored, &mut staged_keys)
+            stage_session_ssh_keys(&mut stored, &mut staged_keys).and_then(|_| stage_session_tls_material(&mut stored, &mut staged_tls))
         } else {
             protect_stored_ssh_keys(&mut stored, &cfg_root, self.secret_vault.as_ref(), &mut protected_key_files)
         };
@@ -6042,7 +6043,8 @@ impl CommanderService {
         }
         store.upsert(stored);
         let saved = if transactional {
-            let materials: Vec<_> = staged_keys.iter().map(StagedSessionKey::as_import).collect();
+            let mut materials: Vec<_> = staged_keys.iter().map(StagedSessionKey::as_import).collect();
+            materials.extend(staged_tls.iter().map(StagedTlsMaterial::as_import));
             store.save_with_materials(&cfg_root, self.secret_vault.as_ref(), &materials)
         } else {
             store.save_to_dir(&cfg_root, self.secret_vault.as_ref())
