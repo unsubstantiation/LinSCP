@@ -127,6 +127,39 @@ pub fn encode_editor_text(
     )
 }
 
+/// Bound the destination as bytes arrive, not only by untrusted stat metadata.
+struct BoundedDownload {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl tokio::io::AsyncWrite for BoundedDownload {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        if data.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "remote file exceeds the download limit")));
+        }
+        self.bytes.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+}
+
+pub async fn download_bounded(session: &dyn RemoteSession, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+    let mut sink = BoundedDownload { bytes: Vec::new(), limit, exceeded: false };
+    let result = session.download(path, TransferRequest::default(), &mut sink, None).await;
+    if sink.exceeded { return Err(format!("Remote file exceeds the {limit}-byte download limit.")); }
+    result.map_err(|e| e.to_string())?;
+    Ok(sink.bytes)
+}
+
+fn safe_search_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".."
+        && !name.contains(['/', '\\']) && !name.chars().any(char::is_control)
+}
+
 /// Reads a text file locally for the Commander editor, enforcing `MAX_GUI_EDIT_BYTES`
 /// and rejecting binary files containing NUL bytes.
 pub fn read_local_text_file(path: &Path, max_bytes: u64) -> Result<(String, Value), String> {
@@ -426,12 +459,7 @@ pub async fn read_remote_text_file(
     }
     let edit_tmp = config_root.join("edit-tmp");
     create_private_dir(&edit_tmp).map_err(|e| e.to_string())?;
-    let bytes = download_bytes(session, remote_path, TransferRequest::default())
-        .await
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_GUI_EDIT_BYTES {
-        return Err("Remote file is too large for the built-in editor.".to_string());
-    }
+    let bytes = download_bounded(session, remote_path, MAX_GUI_EDIT_BYTES as usize).await?;
     if bytes.contains(&0) {
         return Err("Refusing to edit binary file containing NUL bytes.".to_string());
     }
@@ -644,6 +672,10 @@ async fn search_remote_walk(
         if entry.name == "." || entry.name == ".." {
             continue;
         }
+        if !safe_search_entry_name(&entry.name) {
+            stats.skipped += 1;
+            continue;
+        }
         if stats.matches.len() >= limit {
             stats.truncated = true;
             return Ok(());
@@ -712,7 +744,8 @@ async fn search_remote_walk(
                 stats.truncated = true;
                 return Ok(());
             }
-            let Ok(bytes) = download_bytes(session, &full_path, TransferRequest::default()).await
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            let Ok(bytes) = download_bounded(session, &full_path, remaining as usize).await
             else {
                 stats.skipped += 1;
                 continue;

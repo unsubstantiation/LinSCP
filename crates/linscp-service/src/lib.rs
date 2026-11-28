@@ -4316,8 +4316,7 @@ impl CommanderService {
                 "File is too large for the built-in editor ({} bytes; maximum {} bytes).",
                 entry.size, ops::MAX_GUI_EDIT_BYTES));
         }
-        let bytes = match linscp_proto::download_bytes(session.as_ref(), &path,
-            linscp_proto::TransferRequest::default()).await
+        let bytes = match ops::download_bounded(session.as_ref(), &path, ops::MAX_GUI_EDIT_BYTES as usize).await
         {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error.to_string()),
@@ -8081,11 +8080,7 @@ impl CommanderService {
         if entry.size > 16 * 1024 * 1024 {
             return api_error(400, "File exceeds the 16 MiB external editor staging limit.");
         }
-        let bytes = match linscp_proto::download_bytes(
-            session.as_ref(),
-            &remote_path,
-            linscp_proto::TransferRequest::default(),
-        )
+        let bytes = match ops::download_bounded(session.as_ref(), &remote_path, 16 * 1024 * 1024)
         .await
         {
             Ok(b) => b,
@@ -19641,6 +19636,7 @@ mod tests {
         copy_unsupported: Mutex<bool>,
         fail_remove: Mutex<Option<String>>,
         listing_injection: Mutex<Option<(String, String)>>,
+        reported_sizes: Mutex<HashMap<String, u64>>,
         perms: Mutex<HashMap<String, String>>,
         modes: Mutex<HashMap<String, u32>>,
         symlinks: Mutex<Vec<(String, String)>>,
@@ -19661,6 +19657,7 @@ mod tests {
                 copy_unsupported: Mutex::new(false),
                 fail_remove: Mutex::new(None),
                 listing_injection: Mutex::new(None),
+                reported_sizes: Mutex::new(HashMap::new()),
                 perms: Mutex::new(HashMap::new()),
                 modes: Mutex::new(HashMap::new()),
                 symlinks: Mutex::new(Vec::new()),
@@ -19771,6 +19768,7 @@ mod tests {
             let perms = self.perms.lock().expect("m");
             Ok(docs.get(remote_path).map(|doc| {
                 let mut entry = Self::entry_for(remote_path, doc);
+                if let Some(size) = self.reported_sizes.lock().unwrap().get(remote_path) { entry.size = *size; }
                 if let Some(p) = perms.get(remote_path) {
                     entry.permissions = p.clone();
                 }
@@ -19789,6 +19787,7 @@ mod tests {
                 .iter()
                 .map(|path| {
                     let mut entry = Self::entry_for(path, &docs[path]);
+                    if let Some(size) = self.reported_sizes.lock().unwrap().get(path) { entry.size = *size; }
                     if let Some(p) = perms.get(path) {
                         entry.permissions = p.clone();
                     }
@@ -20020,6 +20019,33 @@ mod tests {
         let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
         service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
         7
+    }
+
+    #[tokio::test]
+    async fn search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), &tmp.path().to_string_lossy());
+        session.add_file("/normal.txt", b"hello world");
+        session.add_file("/large.txt", &vec![b'x'; ops::MAX_GUI_EDIT_BYTES as usize + 1]);
+        session.reported_sizes.lock().unwrap().insert("/large.txt".into(), 1);
+        *session.listing_injection.lock().unwrap() = Some(("/".into(), "../outside.txt".into()));
+        let req = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let search = svc.dispatch_async(req("POST", "/api/remote/search", json!({
+            "tab": id, "path": "/", "pattern": "*", "search_contents": true, "content_query": "hello"}))).await;
+        assert_eq!(search.status, 200, "{}", search.payload);
+        assert_eq!(search.payload["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search.payload["matches"][0]["name"], "normal.txt");
+        assert_eq!(search.payload["skipped"], 2);
+        let edit = svc.dispatch_async(req("GET", &format!("/api/remote/edit?tab={id}&path=%2Flarge.txt"), json!({}))).await;
+        assert_eq!(edit.status, 400, "{}", edit.payload);
+        assert!(edit.payload["error"].as_str().unwrap().contains("download limit"));
+        let preview = svc.dispatch_async(req("POST", "/api/sync/preview", json!({
+            "tab": id, "local_dir": tmp.path().to_string_lossy(), "remote_dir": "/", "mode": "local"}))).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap().contains("Invalid remote directory entry name"));
+        assert_eq!(session.bytes_of("/normal.txt"), Some(b"hello world".to_vec()));
     }
 
     #[tokio::test]

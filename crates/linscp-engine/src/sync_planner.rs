@@ -457,7 +457,7 @@ fn collect_local_tree_fs(
         {
             continue;
         }
-        if child.name.contains('/') {
+        if !valid_sync_entry_name(&child.name) {
             return Err("Invalid directory entry name.".to_string());
         }
         if child.is_symlink {
@@ -553,6 +553,14 @@ fn collect_local_tree(
     Ok(())
 }
 
+// Server/provider listings are untrusted path components, not relative paths.
+// Never let them escape the selected roots or be interpreted as separators on
+// another platform. Preserve ordinary whitespace in valid names.
+fn valid_sync_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".."
+        && !name.contains(['/', '\\']) && !name.chars().any(char::is_control)
+}
+
 async fn collect_remote_tree(
     session: &dyn RemoteSession,
     root: &str,
@@ -573,6 +581,9 @@ async fn collect_remote_tree(
             || entry.name.contains(".filepart.v")
         {
             continue;
+        }
+        if !valid_sync_entry_name(&entry.name) {
+            return Err("Invalid remote directory entry name.".to_string());
         }
         if entry.is_symlink {
             mark_ancestor_retained(retained_dirs, rel_prefix);

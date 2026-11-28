@@ -1,0 +1,17 @@
+name: Chunk 7 sync and editing checks
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+jobs:
+  tests:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine changes_during_initial_sync_trigger_an_immediate_second_pass -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names -- --nocapture
