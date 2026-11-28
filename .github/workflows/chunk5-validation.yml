@@ -23,3 +23,12 @@ jobs:
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-proto --test ssh_sftp_scp_tunnel -- --nocapture
       - name: Service GSSAPI policy
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service gssapi -- --nocapture
+  kerberos:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install isolated KDC fixture
+        run: sudo DEBIAN_FRONTEND=noninteractive apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y krb5-kdc krb5-user openssh-server libssl-dev pkg-config
+      - name: Run live Kerberos authentication and delegation
+        run: bash tools/live_kerberos_ci.sh
