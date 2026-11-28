@@ -347,7 +347,7 @@ const expression = `
     const tab = opened.tab.id;
     async function runTask(path, body) {
       const previous = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
-      const reply = await invoke('POST', path, body);
+      const reply = await invoke('POST', path, {...body, accept_saf_publication_risk: true});
       if (!reply.success) throw new Error('SAF transfer was not queued');
       for (let i = 0; i < 120; i++) {
         const task = (await invoke('GET', '/api/transfers')).transfers.find(task => !previous.has(task.id));

@@ -47,10 +47,12 @@ check and write are **not atomic**. A document created or replaced concurrently
 can be overwritten even when a no-overwrite operation was requested. Provider
 writes can also leave partial documents on interruption. Avoid concurrent
 writers and do not rely on no-clobber guarantees in granted folders. Remote
-session downloads and moves into a granted folder, including S3 version
-downloads, require explicit per-request acknowledgement of this risk. This
-confirmation does not cover every other provider operation, such as local-pane
-copies or synchronization. Verified resume remains refused until checkpointing and publication have an adequate
+session downloads and moves, S3 version downloads, local-pane copies and moves,
+desktop drops, synchronization runs and local-to-local keep-up-to-date jobs
+require explicit per-request acknowledgement when they can publish into a granted
+folder. This does not make publication atomic, and other provider operations
+such as editor saves are not covered by this transfer confirmation. Verified
+resume remains refused until checkpointing and publication have an adequate
 provider-specific safety contract.
 
 ## Uploads and overwrite

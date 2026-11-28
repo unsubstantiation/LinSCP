@@ -4244,7 +4244,7 @@
         let saved = 0, failed = 0;
         for (const entry of entries) {
           const result = entry.kind === 'directory' ?
-            await apiPost('/api/local/drop-dir', {
+            await queueWithOverwriteDecision('/api/local/drop-dir', {
               tab: tabId(), local_dir: state.local.path,
               relative_path: entry.path
             }) : await saveLocalDesktopFile(entry.file, entry.path);
@@ -4261,7 +4261,7 @@
        * empty; a file task also creates its parents so retry works alone. */
       for (const entry of entries) {
         const result = entry.kind === 'directory' ?
-          await apiPost('/api/transfer/drop-dir', {
+          await queueWithOverwriteDecision('/api/transfer/drop-dir', {
             tab: tabId(), remote_dir: state.remote.path,
             relative_path: entry.path
           }) : await queueDesktopFile(entry.file, entry.path);
@@ -6915,7 +6915,12 @@
       settings.excluded_paths = Array.from(state.syncExcludedPaths);
     }
     if (settings.delete && !confirm(t("Delete obsolete files as part of this synchronization?"))) return;
-    const result = await apiPost('/api/sync/run', settings);
+    let result = await apiPost('/api/sync/run', settings);
+    if (result && result.saf_publication_risk) {
+      if (!confirm(t("Android granted folders cannot guarantee no-overwrite during concurrent changes. Another file may be overwritten, and interruption may leave a partial document. Continue?"))) return;
+      settings.accept_saf_publication_risk = true;
+      result = await apiPost('/api/sync/run', settings);
+    }
     if (result.success) {
       closeModal('syncModal');
       switchTab('queue');
@@ -12894,7 +12899,12 @@
     if ($('kudPreserveTime')) payload.preserve_time = $('kudPreserveTime').checked;
     if ($('kudDelete') && $('kudDelete').checked) payload.delete = true;
     if ($('kudContinueOnError') && $('kudContinueOnError').checked) payload.continue_on_error = true;
-    const result = await apiPost('/api/transfer/keepuptodate', payload);
+    let result = await apiPost('/api/transfer/keepuptodate', payload);
+    if (result && result.saf_publication_risk) {
+      if (!confirm(t("Android granted folders cannot guarantee no-overwrite during concurrent changes. Another file may be overwritten, and interruption may leave a partial document. Continue?"))) return;
+      payload.accept_saf_publication_risk = true;
+      result = await apiPost('/api/transfer/keepuptodate', payload);
+    }
     if (!result.success) {
       toast(errorMessage(result.error, t('Cannot start watching the directory.')), true);
       return;

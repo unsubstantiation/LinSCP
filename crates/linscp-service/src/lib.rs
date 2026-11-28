@@ -2186,6 +2186,9 @@ impl CommanderService {
             };
             (session, remote_root.clone(), remote_root)
         };
+        if tab.is_local && is_saf_path(&display_dest) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let mask_text = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let file_mask = if mask_text.is_empty() {
             linscp_engine::filemask::FileMask::default()
@@ -3285,6 +3288,11 @@ impl CommanderService {
             if !right_is_dir {
                 return api_error(400, "The destination local directory does not exist.");
             }
+        }
+        let saf_local_target = is_saf_path(&local_root.to_string_lossy()) && opts.mode != linscp_engine::sync_planner::SyncMode::Remote;
+        let saf_other_target = is_local_tab && is_saf_path(&remote_root_raw) && opts.mode != linscp_engine::sync_planner::SyncMode::Local;
+        if (saf_local_target || saf_other_target) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
         }
         let mut excluded_paths = std::collections::BTreeSet::new();
         if let Some(raw_ex) = body.get("excluded_paths") {
@@ -5058,6 +5066,9 @@ impl CommanderService {
             };
             let (source, destination) = if upload { (local.to_string_lossy().into_owned(), other.clone()) } else { (other.clone(), local.to_string_lossy().into_owned()) };
             if tab.is_local && source == destination { return api_error(400, "Source and destination are the same file"); }
+            if tab.is_local && is_saf_path(&destination) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+            }
             let size;
             let exists;
             let is_dir;
@@ -8596,6 +8607,9 @@ impl CommanderService {
             Ok(path) => path.to_string_lossy().into_owned(),
             Err(error) => return api_error(400, error),
         };
+        if is_saf_path(&destination_dir) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         if !paths.is_empty() {
             // A path drop is not a byte drop: the items keep their own names.
             // Whether they can be read is decided when they are copied, and a
@@ -8768,6 +8782,9 @@ impl CommanderService {
             Ok(base) => base,
             Err(reply) => return reply,
         };
+        if is_saf_path(&base) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let relative = query.get("relative_path").cloned()
             .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
             .or_else(|| {
@@ -19683,7 +19700,10 @@ mod tests {
         let open_plain = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
         assert_eq!(open_plain.status, 200, "{}", open_plain.payload);
         let plain_id = open_plain.payload["tab"]["id"].as_u64().unwrap();
-        let copy_back = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
+        let denied = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
+        assert_eq!(denied.status, 409, "{}", denied.payload);
+        assert_eq!(denied.payload["saf_publication_risk"], true);
+        let copy_back = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(copy_back.status, 200, "{}", copy_back.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("plain.txt").as_deref(), Some(b"plain bytes".as_slice()), "the bridge holds the copy");
@@ -19691,7 +19711,7 @@ mod tests {
         let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
         assert_eq!(open_other.status, 200, "{}", open_other.payload);
         let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
-        let copy_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": other_id, "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["note.txt"]}) }).await;
+        let copy_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": other_id, "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["note.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(copy_tree.status, 200, "{}", copy_tree.payload);
         wait_for_task(&svc, "Completed").await;
         let other_doc = format!("{SAF_OTHER_TREE}/document/note.txt");
@@ -19749,7 +19769,7 @@ mod tests {
         let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
         assert_eq!(open_other.status, 200, "{}", open_other.payload);
         let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
-        let moved_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": other_id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["clash.txt"]}) }).await;
+        let moved_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": other_id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["clash.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(moved_tree.status, 200, "{}", moved_tree.payload);
         wait_for_task(&svc, "Completed").await;
         let other_doc = format!("{SAF_OTHER_TREE}/document/clash.txt");
@@ -19767,7 +19787,7 @@ mod tests {
             assert_eq!(link.status, 200, "{}", link.payload);
             let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
             let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
-            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
+            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"], "accept_saf_publication_risk": true}) }).await;
             assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
             let failed = wait_for_task(&svc, "Failed").await;
             assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
@@ -20700,7 +20720,10 @@ mod tests {
         assert!(items.iter().any(|i| i["action"] == "unchanged" && i["path"] == "same.txt"), "{}", planned.payload);
         assert!(!items.iter().any(|i| i["path"] == "up.txt"), "no delete, no action: {}", planned.payload);
         // A run with delete downloads and removes.
-        let run = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true}) }).await;
+        let denied = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true}) }).await;
+        assert_eq!(denied.status, 409, "{}", denied.payload);
+        assert_eq!(denied.payload["saf_publication_risk"], true);
+        let run = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true, "accept_saf_publication_risk": true}) }).await;
         assert_eq!(run.status, 200, "{}", run.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("down.txt").as_deref(), Some(b"download me".as_slice()), "the granted folder holds the download");
