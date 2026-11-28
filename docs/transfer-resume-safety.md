@@ -10,3 +10,17 @@ Resume is not a general guarantee that a file is a stable snapshot. Use a truste
 - Android Storage Access Framework granted-folder session transfers do not support verified resume. Restart as a fresh transfer; the provider bridge does not supply the required safe partial-file semantics.
 
 Linux and Windows loopback suites cover checkpoint substitution and interrupted recovery. A packaged Android emulator smoke passed verified WebDAV and best-effort SFTP resume, including refusal cases ([run 46045911600](https://github.com/unsubstantiation/LinSCP/actions/runs/46045911600)). Provider behavior, third-party server interoperability, and physical Android devices remain open validation work. These limitations are not evidence of atomic snapshot support.
+
+The internal non-GUI S3 multipart path now stores a SHA-256 digest with each
+confirmed part and only reuses it when the retry supplies matching bytes. It
+scopes new checkpoints by endpoint/account and serializes attempts sharing one
+store. It rejects source length changes before completion. This is not GUI
+upload resume: GUI conditional uploads still start fresh and retain their
+existing no-overwrite preconditions. The old bucket/key-only checkpoint records
+are not adopted; their unfinished uploads may remain, so an S3 lifecycle rule
+is still needed. The store lock is process-local and does not coordinate
+separately constructed stores or processes. Source changes during a single
+attempt and server behavior remain limitations.
+
+The multipart checkpoint regressions passed against a local HTTPS S3 fixture on
+Linux and Windows in [CI run 46131724564](https://github.com/unsubstantiation/LinSCP/actions/runs/46131724564). They cover changed and hashless parts, endpoint separation, and short/long sources; they are not production S3 provider or multi-process validation.

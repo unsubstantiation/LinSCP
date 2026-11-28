@@ -40,6 +40,16 @@ moves require confirmation, use an ETag-pinned download and exclusive upload,
 and are not transactional. Cross-server directory moves and S3-source moves
 are unsupported. Local moves require a new destination on the same filesystem.
 
+## Android granted-folder publication
+
+The provider bridge checks for an existing destination before writing, but the
+check and write are **not atomic**. A document created or replaced concurrently
+can be overwritten even when a no-overwrite operation was requested. Provider
+writes can also leave partial documents on interruption. Avoid concurrent
+writers and do not rely on no-clobber guarantees in granted folders. Verified
+resume remains refused until checkpointing and publication have an adequate
+provider-specific safety contract.
+
 ## Uploads and overwrite
 
 A local-to-remote file move uploads first, then checks the local source's
