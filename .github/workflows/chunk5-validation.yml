@@ -31,4 +31,4 @@ jobs:
       - name: Install isolated KDC fixture
         run: sudo DEBIAN_FRONTEND=noninteractive apt-get update && sudo DEBIAN_FRONTEND=noninteractive apt-get install -y krb5-kdc krb5-user openssh-server libssl-dev pkg-config
       - name: Run live Kerberos authentication and delegation
-        run: bash tools/live_kerberos_ci.sh
+        run: python3 tools/run_cargo_ci.py bash tools/live_kerberos_ci.sh
