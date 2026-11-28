@@ -11376,12 +11376,9 @@ fn read_ca_bundle_for_export(
                 )
             })?;
             let path = entry.path();
-            if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer"))
-                && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())
-            {
+            // The TLS connection loader accepts PEM files regardless of their
+            // suffix (including OpenSSL hashed .0 names). Match it here.
+            if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
                 cert_paths.push(path);
             }
         }
@@ -11393,6 +11390,9 @@ fn read_ca_bundle_for_export(
                 secret_vault,
                 "CA certificate file",
             )?;
+            if !bytes.windows(11).any(|window| window == b"-----BEGIN ") {
+                continue;
+            }
             if !combined.is_empty() && !combined.ends_with(b"\n") {
                 combined.push(b'\n');
             }
@@ -13738,7 +13738,7 @@ mod tests {
         let ca_file = src_dir.path().join("root-ca.pem");
         let ca_dir = src_dir.path().join("ca-dir");
         std::fs::create_dir_all(&ca_dir).unwrap();
-        let ca_extra = ca_dir.join("intermediate.crt");
+        let ca_extra = ca_dir.join("01234567.0");
         let tls_cert = src_dir.path().join("client.crt");
         let tls_key = src_dir.path().join("client.key");
         let pin_pub = src_dir.path().join("server-spki.pub");
