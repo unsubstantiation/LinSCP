@@ -14,3 +14,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo test -p linscp-engine xml_log
       - run: cargo test -p linscp-service xml
+      - name: Validate GUI service XML against the pinned schema
+        if: runner.os == 'Linux'
+        run: |
+          python3 -m pip install --user 'xmlschema>=3,<5'
+          export LINSCP_XML_SERVICE_OUTPUT="$RUNNER_TEMP/gui-actions.xml"
+          cargo test -p linscp-service queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log
+          python3 -m unittest discover -s tools/tests -p test_xml_schema.py

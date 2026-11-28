@@ -914,6 +914,34 @@ mod tests {
     }
 
     #[test]
+    fn xml_log_shared_writers_preserve_concurrent_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("shared.xml");
+        let lock = Arc::new(Mutex::new(()));
+        let mut threads = Vec::new();
+        for writer in 0..4 {
+            let path = path.clone();
+            let lock = Arc::clone(&lock);
+            threads.push(std::thread::spawn(move || {
+                let mut logger = SessionLogger::open_shared_xml(path, lock);
+                for index in 0..25 {
+                    logger.record_mkdir(&format!("/{writer}-{index}"), Ok(()));
+                }
+            }));
+        }
+        for thread in threads { thread.join().unwrap(); }
+        let xml = std::fs::read_to_string(path).unwrap();
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let values: std::collections::HashSet<_> = parsed.descendants()
+            .filter(|n| n.has_tag_name((SESSION_XML_NAMESPACE, "filename")))
+            .filter_map(|n| n.attribute("value")).collect();
+        assert_eq!(values.len(), 100, "{xml}");
+        for writer in 0..4 { for index in 0..25 {
+            assert!(values.contains(format!("/{writer}-{index}").as_str()));
+        }}
+    }
+
+    #[test]
     fn xml_log_rejects_incomplete_existing_file_without_truncating_it() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("incomplete.xml");

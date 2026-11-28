@@ -94,6 +94,8 @@ jobs:
           /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
           export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
           python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          export LINSCP_XML_SERVICE_OUTPUT="$RUNNER_TEMP/linscp-gui-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log -- --nocapture
           /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
 
       - name: Exercise live protocol integration tests

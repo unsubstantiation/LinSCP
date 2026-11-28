@@ -21559,6 +21559,9 @@ mod tests {
         assert_eq!(xml.matches("<rm>").count(), 1, "{xml}");
         assert_eq!(xml.matches("</session>").count(), 1, "{xml}");
         assert!(xml.ends_with("</session>\n"), "{xml}");
+        if let Some(path) = std::env::var_os("LINSCP_XML_SERVICE_OUTPUT") {
+            std::fs::write(path, xml).expect("write GUI XML schema sample");
+        }
         // An unfinished existing log is never erased by a subsequent operation.
         let path = tmp.path().join("actions.xml");
         std::fs::write(&path, b"<session>unfinished").unwrap();

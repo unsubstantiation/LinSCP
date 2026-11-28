@@ -36,6 +36,18 @@ class XmlSchemaTests(unittest.TestCase):
         self.schema.validate(pathlib.Path(path))
 
 
+    def test_interleaved_gui_queue_actions_when_requested(self):
+        path = os.environ.get('LINSCP_XML_SERVICE_OUTPUT')
+        if not path:
+            self.skipTest('GUI service operation log not requested')
+        self.schema.validate(pathlib.Path(path))
+        root = ET.parse(path).getroot()
+        ns = {'s': 'http://winscp.net/schema/session/1.0'}
+        self.assertEqual([node.tag.rsplit('}', 1)[-1] for node in root],
+                         ['mkdir', 'upload', 'rm'])
+        self.assertEqual(root.find('s:upload/s:destination', ns).get('value'), '/remote')
+        self.assertEqual(root.find('s:upload/s:result', ns).get('success'), 'true')
+
     def test_live_webdav_actions_when_requested(self):
         path = os.environ.get('LINSCP_XML_LIVE_OUTPUT')
         if not path:
