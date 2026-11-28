@@ -297,6 +297,18 @@ pub enum VaultMaterialRead {
     Plaintext(Zeroizing<Vec<u8>>),
 }
 
+/// Public SSH key metadata returned by a vault backend.
+pub struct VaultSshKeyInfo {
+    pub id: String,
+    pub label: String,
+}
+
+pub struct VaultSshKeyImport {
+    pub id: String,
+    pub label: String,
+    pub deduplicated: bool,
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
@@ -324,6 +336,11 @@ pub trait SecretVault: Send + Sync {
     fn read_vault_material(&self, _config_dir: &Path, _kind: VaultMaterialKind, _id: &str) -> Result<VaultMaterialRead, PlatformError> {
         Ok(VaultMaterialRead::Unhandled)
     }
+    /// None means the legacy filesystem implementation must handle the call.
+    fn list_vault_ssh_keys(&self, _config_dir: &Path) -> Result<Option<Vec<VaultSshKeyInfo>>, PlatformError> { Ok(None) }
+    fn import_vault_ssh_key(&self, _config_dir: &Path, _id: &str, _private: &[u8], _label: &str, _public: &str) -> Result<Option<VaultSshKeyImport>, PlatformError> { Ok(None) }
+    /// Some(false) indicates a handled request whose key was not found.
+    fn delete_vault_ssh_key(&self, _config_dir: &Path, _id: &str) -> Result<Option<bool>, PlatformError> { Ok(None) }
     /// The local password vault protects the entire session store, not just secrets.
     fn protects_session_store(&self) -> bool { false }
     fn seal_session_store(&self, _plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {

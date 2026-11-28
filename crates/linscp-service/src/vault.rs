@@ -142,6 +142,17 @@ impl CommanderService {
             Ok(_) => return api_error(423, "Unlock the local vault before choosing an SSH key."),
             Err(error) => return api_error(500, error.to_string()),
         }
+        match self.secret_vault.list_vault_ssh_keys(&config_root) {
+            Ok(Some(entries)) => {
+                let mut keys: Vec<Value> = entries.into_iter().map(|entry| json!({
+                    "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{}", entry.id), "label": entry.label,
+                })).collect();
+                keys.sort_by(|left, right| left["label"].as_str().cmp(&right["label"].as_str()));
+                return ApiReply { status: 200, payload: json!({"success": true, "keys": keys}) };
+            }
+            Ok(None) => {},
+            Err(error) => return api_error(500, format!("Cannot list vault keys: {error}")),
+        }
         let key_dir = config_root.join("keys");
         let entries = match std::fs::read_dir(&key_dir) {
             Ok(entries) => entries,
@@ -197,6 +208,13 @@ impl CommanderService {
         if !users.is_empty() {
             return api_error(409, format!("Cannot delete this key: stored sessions use it: {}. Change or delete those sessions first.", users.join(", ")));
         }
+        match self.secret_vault.delete_vault_ssh_key(&config_root, id) {
+            Ok(Some(true)) => return ApiReply { status: 200, payload: json!({"success": true, "deleted": true}) },
+            Ok(Some(false)) => return api_error(404, "SSH key is no longer in the vault."),
+            Ok(None) => {},
+            Err(error) if error.to_string().contains("references a missing container") => return api_error(409, error.to_string()),
+            Err(error) => return api_error(500, format!("Could not delete encrypted SSH key: {error}")),
+        }
         let key_dir = config_root.join("keys");
         // Never traverse a symlink masquerading as the vault key directory.
         match std::fs::symlink_metadata(&key_dir) {
@@ -251,10 +269,22 @@ impl CommanderService {
         }
         let derived_public = derive_public_ssh_key_optional(private_key).unwrap_or_default();
         let plaintext = zeroize::Zeroizing::new(private_key.as_bytes().to_vec());
-        let encryption_result = self.secret_vault.seal_local_blob(&plaintext);
         if let Some(Value::String(private_key)) = body.get_mut("private_key") {
             zeroize::Zeroize::zeroize(private_key);
         }
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let candidate = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let label = derive_vault_key_label(&name, &derived_public, &candidate);
+        match self.secret_vault.import_vault_ssh_key(&config_root, &candidate, &plaintext, &label, &derived_public) {
+            Ok(Some(result)) => return ApiReply { status: 200, payload: json!({
+                "success": true, "reference": format!("{LOCAL_VAULT_KEY_PREFIX}{}", result.id),
+                "label": result.label, "deduplicated": result.deduplicated,
+            }) },
+            Ok(None) => {},
+            Err(error) => return api_error(400, error.to_string()),
+        }
+        let encryption_result = self.secret_vault.seal_local_blob(&plaintext);
         let encrypted = match encryption_result {
             Ok(encrypted) => encrypted,
             Err(error) => return api_error(400, error.to_string()),

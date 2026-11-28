@@ -528,6 +528,61 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
         linscp_platform::password_vault::open_blob_with_master_key(encrypted, &master)
     }
 
+    fn list_vault_ssh_keys(&self, config_dir: &std::path::Path) -> Result<Option<Vec<linscp_platform::VaultSshKeyInfo>>, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        Ok(Some(document.keys.iter().map(|key| linscp_platform::VaultSshKeyInfo {
+            id: key.id.clone(),
+            label: if key.label.is_empty() { format!("SSH key {}", &key.id[..8]) } else { key.label.clone() },
+        }).collect()))
+    }
+
+    fn import_vault_ssh_key(&self, config_dir: &std::path::Path, id: &str, private: &[u8], label: &str, public: &str) -> Result<Option<linscp_platform::VaultSshKeyImport>, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        if !vault_keys::valid_id(id) || private.is_empty() || private.len() > MAX_KEY_BYTES || label.len() > 512 || public.len() > MAX_METADATA_BYTES {
+            return Err(Self::error("Invalid SSH key or metadata"));
+        }
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
+        let mut document = session.read().map_err(Self::error)?;
+        for record in &mut document.keys {
+            let existing = Zeroizing::new(BASE64.decode(&record.private_b64).map_err(Self::error)?);
+            let equal = existing.len() == private.len() && existing.iter().zip(private).fold(0u8, |diff, (a, b)| diff | (a ^ b)) == 0;
+            if equal {
+                let mut changed = false;
+                if record.label.is_empty() && !label.is_empty() { record.label = label.to_owned(); changed = true; }
+                if record.public_key.is_empty() && !public.is_empty() { record.public_key = public.to_owned(); changed = true; }
+                let existing_id = record.id.clone();
+                let existing_label = if record.label.is_empty() { format!("SSH key {}", &existing_id[..8]) } else { record.label.clone() };
+                if changed { session.write(&document).map_err(Self::error)?; }
+                return Ok(Some(linscp_platform::VaultSshKeyImport { id: existing_id, label: existing_label, deduplicated: true }));
+            }
+        }
+        if document.keys.len() >= MAX_KEYS || document.keys.iter().any(|record| record.id.eq_ignore_ascii_case(id)) || document.public_keys.iter().any(|record| record.id.eq_ignore_ascii_case(id)) {
+            return Err(Self::error("Duplicate SSH key ID or too many keys"));
+        }
+        let label = if label.is_empty() { format!("SSH key {}", &id[..8]) } else { label.to_owned() };
+        document.keys.push(KeyRecord { id: id.to_ascii_lowercase(), private_b64: BASE64.encode(private), label: label.clone(), public_key: public.to_owned() });
+        session.write(&document).map_err(Self::error)?;
+        Ok(Some(linscp_platform::VaultSshKeyImport { id: id.to_ascii_lowercase(), label, deduplicated: false }))
+    }
+
+    fn delete_vault_ssh_key(&self, config_dir: &std::path::Path, id: &str) -> Result<Option<bool>, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        if !vault_keys::valid_id(id) { return Err(Self::error("Invalid SSH key ID")); }
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
+        let mut document = session.read().map_err(Self::error)?;
+        let Some(index) = document.keys.iter().position(|key| key.id.eq_ignore_ascii_case(id)) else { return Ok(Some(false)); };
+        document.keys.remove(index);
+        // Validation refuses deletion if any saved private or public reference
+        // would become dangling, before publishing the modified container.
+        session.write(&document).map_err(Self::error)?;
+        Ok(Some(true))
+    }
+
     fn read_vault_material(&self, config_dir: &std::path::Path, kind: linscp_platform::VaultMaterialKind, id: &str) -> Result<linscp_platform::VaultMaterialRead, linscp_platform::PlatformError> {
         self.check_root(config_dir)?;
         if !vault_keys::valid_id(id) { return Err(Self::error("Invalid vault material ID")); }
@@ -599,6 +654,44 @@ mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn vault_ssh_key_hooks_deduplicate_and_guard_references() {
+        use linscp_platform::SecretVault;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let unlocked = vault.unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        let backend: &dyn SecretVault = &bridge;
+        let id = "11111111111111111111111111111111";
+        let alternate = "22222222222222222222222222222222";
+        let created = backend.import_vault_ssh_key(dir.path(), id, b"private-material", "first", "public").unwrap().unwrap();
+        assert_eq!(created.id, id);
+        assert!(!created.deduplicated);
+        let duplicate = backend.import_vault_ssh_key(dir.path(), alternate, b"private-material", "second", "public").unwrap().unwrap();
+        assert_eq!(duplicate.id, id);
+        assert!(duplicate.deduplicated);
+        assert_eq!(duplicate.label, "first");
+        assert_eq!(backend.list_vault_ssh_keys(dir.path()).unwrap().unwrap().len(), 1);
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("saved", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(format!("vaultkey://{id}"));
+        sessions.upsert(site);
+        sessions.save_to_dir(dir.path(), backend).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        assert!(backend.delete_vault_ssh_key(dir.path(), id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        SessionStore::new().save_to_dir(dir.path(), backend).unwrap();
+        assert_eq!(backend.delete_vault_ssh_key(dir.path(), id).unwrap(), Some(true));
+        assert_eq!(backend.delete_vault_ssh_key(dir.path(), id).unwrap(), Some(false));
+        assert!(!dir.path().join("keys").exists());
+        let wrong = tempfile::tempdir().unwrap();
+        assert!(backend.list_vault_ssh_keys(wrong.path()).is_err());
+        bridge.lock().unwrap();
+        assert!(backend.list_vault_ssh_keys(dir.path()).is_err());
+    }
 
     #[test]
     fn atomic_import_covers_tls_and_public_only_keys() {
