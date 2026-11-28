@@ -116,7 +116,7 @@ impl X2GoInput {
 pub struct X2GoBridge {
     commands: mpsc::Sender<Command>,
     messages: mpsc::Receiver<Value>,
-    task: JoinHandle<Result<(), &'static str>>,
+    task: JoinHandle<Result<ExitMode, &'static str>>,
     allow_clipboard: bool,
 }
 
@@ -178,24 +178,40 @@ impl X2GoBridge {
     }
 
     /// Terminates the bridge and waits for the remote-agent cleanup attempt.
-    /// Dropping without close also releases the channels and schedules cleanup.
+    /// The shutdown task continues if its caller is cancelled.
     pub async fn close(self) -> Result<(), &'static str> {
-        let Self { commands, messages, task, .. } = self;
-        // Release backpressure first so a full output queue cannot delay close.
-        drop(messages);
-        let _ = commands.send(Command::Close).await;
-        drop(commands);
-        task.await.map_err(|_| "KDrive bridge task failed.")?
+        self.finish(ExitMode::Terminate).await
     }
 
     /// Suspends the remote X2Go session without terminating its desktop.
     pub async fn suspend(self) -> Result<(), &'static str> {
-        let Self { commands, messages, task, .. } = self;
-        drop(messages);
-        let _ = commands.send(Command::Suspend).await;
-        drop(commands);
-        task.await.map_err(|_| "KDrive bridge task failed.")?
+        self.finish(ExitMode::Suspend).await
     }
+
+    async fn finish(self, requested: ExitMode) -> Result<(), &'static str> {
+        // Own the receiver until the actor exits. Dropping it before the actor
+        // processes Suspend makes output.closed() race with the command and
+        // can terminate a desktop the user explicitly asked to preserve.
+        // Detach this operation so cancelling an HTTP request cannot recreate
+        // the same race or abandon a queued lifecycle command.
+        tokio::spawn(async move {
+            let Self { commands, messages, task, .. } = self;
+            let command = match requested {
+                ExitMode::Terminate => Command::Close,
+                ExitMode::Suspend => Command::Suspend,
+            };
+            let _ = commands.send(command).await;
+            drop(commands);
+            let outcome = task.await.map_err(|_| "KDrive bridge task failed.")?;
+            drop(messages);
+            match outcome {
+                Ok(actual) if actual == requested => Ok(()),
+                Ok(_) => Err("X2Go session ended before the requested action was applied."),
+                Err(error) => Err(error),
+            }
+        }).await.map_err(|_| "KDrive shutdown task failed.")?
+    }
+
 }
 
 #[cfg(test)]
@@ -209,7 +225,7 @@ pub(crate) fn test_bridge(client: tokio::io::DuplexStream, cleanup_signal: onesh
 
 async fn run<C, F>(mut reader: KDriveReader, mut writer: KDriveWriter,
                    mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>,
-                   allow_clipboard: bool, cleanup: C, server_silence: Duration) -> Result<(), &'static str>
+                   allow_clipboard: bool, cleanup: C, server_silence: Duration) -> Result<ExitMode, &'static str>
 where
     C: FnOnce(ExitMode) -> F,
     F: Future<Output = Result<(), &'static str>>,
@@ -301,7 +317,7 @@ where
         ExitMode::Suspend => "X2Go session suspend failed.",
     };
     if cleanup(exit_mode).await.is_err() { return Err(cleanup_err); }
-    result
+    result.map(|()| exit_mode)
 }
 
 #[cfg(test)]
@@ -389,6 +405,63 @@ mod tests {
         // Dropping the viewer releases the bounded output queue and triggers cleanup.
         drop(bridge);
         assert!(tokio::time::timeout(Duration::from_secs(1), observed).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn suspend_preserves_session_with_full_output_queue() {
+        for _ in 0..100 {
+            let (client, mut server) = tokio::io::duplex(1024);
+            let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+            let (reader, writer) = channel.into_halves();
+            let (signal, observed) = oneshot::channel();
+            let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+                let _ = signal.send(mode);
+                Ok(())
+            });
+            server.write_all(&header(9)).await.unwrap();
+            server.write_all(&header(9)).await.unwrap();
+            tokio::task::yield_now().await;
+            assert!(tokio::time::timeout(Duration::from_secs(1), bridge.suspend()).await.unwrap().is_ok());
+            assert_eq!(observed.await.unwrap(), ExitMode::Suspend);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_suspend_still_finishes_suspend_cleanup() {
+        let (client, _server) = tokio::io::duplex(1024);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (reader, writer) = channel.into_halves();
+        let (started, observed) = oneshot::channel();
+        let (release, wait) = oneshot::channel();
+        let (finished, done) = oneshot::channel();
+        let bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+            let _ = started.send(mode);
+            let _ = wait.await;
+            let _ = finished.send(());
+            Ok(())
+        });
+        let task = tokio::spawn(bridge.suspend());
+        assert_eq!(observed.await.unwrap(), ExitMode::Suspend);
+        task.abort();
+        let _ = task.await;
+        release.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), done).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn suspend_does_not_claim_success_after_remote_disconnect() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (reader, writer) = channel.into_halves();
+        let (signal, observed) = oneshot::channel();
+        let mut bridge = X2GoBridge::spawn_with_mode(reader, writer, false, move |mode| async move {
+            let _ = signal.send(mode);
+            Ok(())
+        });
+        server.write_all(&header(10)).await.unwrap();
+        assert_eq!(bridge.next_message().await.unwrap()["type"], "disconnect");
+        assert_eq!(observed.await.unwrap(), ExitMode::Terminate);
+        assert!(bridge.suspend().await.is_err());
     }
 
     #[tokio::test]

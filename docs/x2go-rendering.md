@@ -60,7 +60,12 @@ bounded backpressure, and supports explicit session suspend (`x2gosuspend-sessio
 or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. The service
 can associate a bridge with the exact connected SSH tab and exposes nonblocking
 poll, input, and close routes. Closing or reconnecting a tab releases its bridge;
-an abandoned viewer lease expires after 60 seconds. The experimental X2Go
+an abandoned viewer lease expires after 60 seconds. Explicit suspend keeps the
+output receiver alive until the actor processes the suspend command, even when
+the output queue is full or the requesting API future is cancelled. It reports
+an error rather than claiming suspension when the bridge already terminated.
+This only protects the local lifecycle ordering; a broken SSH connection or
+server-side failure can still leave the remote session's state unknown. The experimental X2Go
 open route registers that bridge and the page polls it, forwards input, and
 requests close. Poll, input and close carry a service-issued generation so
 delayed requests from an earlier viewer cannot operate on a replacement bridge.
