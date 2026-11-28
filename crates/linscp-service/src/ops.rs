@@ -147,12 +147,21 @@ impl tokio::io::AsyncWrite for BoundedDownload {
     fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
 }
 
-pub async fn download_bounded(session: &dyn RemoteSession, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+async fn download_bounded_counted(session: &dyn RemoteSession, path: &str, limit: usize) -> (Result<Vec<u8>, String>, usize) {
     let mut sink = BoundedDownload { bytes: Vec::new(), limit, exceeded: false };
     let result = session.download(path, TransferRequest::default(), &mut sink, None).await;
-    if sink.exceeded { return Err(format!("Remote file exceeds the {limit}-byte download limit.")); }
-    result.map_err(|e| e.to_string())?;
-    Ok(sink.bytes)
+    // An oversized write can be larger than the bytes retained in the sink.
+    // Charge the full permitted amount to the search budget in that case.
+    let consumed = if sink.exceeded { limit } else { sink.bytes.len() };
+    if sink.exceeded { return (Err(format!("Remote file exceeds the {limit}-byte download limit.")), consumed); }
+    match result {
+        Ok(_) => (Ok(sink.bytes), consumed),
+        Err(error) => (Err(error.to_string()), consumed),
+    }
+}
+
+pub async fn download_bounded(session: &dyn RemoteSession, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+    download_bounded_counted(session, path, limit).await.0
 }
 
 fn safe_search_entry_name(name: &str) -> bool {
@@ -745,13 +754,14 @@ async fn search_remote_walk(
                 return Ok(());
             }
             let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
-            let Ok(bytes) = download_bounded(session, &full_path, remaining as usize).await
-            else {
+            stats.scanned += 1;
+            let (result, consumed) = download_bounded_counted(session, &full_path, remaining as usize).await;
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add(consumed as u64);
+            let Ok(bytes) = result else {
                 stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
                 continue;
             };
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;

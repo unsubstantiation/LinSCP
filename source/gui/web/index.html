@@ -7124,7 +7124,7 @@
   async function changeEditorEncoding() {
     if (!state.editor || !state.editor.path) return;
     const chosen = ($('editorEncoding') && $('editorEncoding').value) || 'UTF-8';
-    if (!state.editor.dirty) {
+    if (!state.editor.dirty && !state.editor.isNew) {
       await openEditor(state.editor.path, state.editor.side, state.editor.readOnly, chosen);
     } else {
       markDirty();
@@ -7329,7 +7329,7 @@
 
   function markDirty() {
     if (state.editor.readOnly) return;
-    state.editor.dirty = getEditorValue() !== state.editor.original || editorFormatChanged();
+    state.editor.dirty = state.editor.isNew || getEditorValue() !== state.editor.original || editorFormatChanged();
     $('editorStatus').textContent = state.editor.dirty
       ? t("Modified - not saved")
       : t("No changes");

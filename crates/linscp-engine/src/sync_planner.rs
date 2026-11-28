@@ -569,13 +569,28 @@ fn valid_sync_entry_name(name: &str) -> bool {
             return false;
         }
         let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
-        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+            | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³")
             || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT"))
                 && matches!(stem.as_bytes()[3], b'1'..=b'9')) {
             return false;
         }
     }
     true
+}
+
+#[cfg(any(windows, test))]
+fn reject_case_aliases<'a>(paths: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    let mut seen = BTreeMap::<String, &str>::new();
+    for path in paths {
+        let key = path.to_lowercase();
+        if let Some(previous) = seen.insert(key, path.as_str()) {
+            if previous != path.as_str() {
+                return Err(format!("Synchronization paths differ only by case: '{previous}' and '{path}'."));
+            }
+        }
+    }
+    Ok(())
 }
 
 async fn collect_remote_tree(
@@ -721,6 +736,12 @@ pub async fn plan_synchronization(
         &mut remote_retained,
     )
     .await?;
+
+    // Windows paths are normally case-insensitive. Do not turn two distinct
+    // remote spellings (or differing local/remote spellings) into destructive
+    // independent actions against the same local file.
+    #[cfg(windows)]
+    reject_case_aliases(local_map.keys().chain(remote_map.keys()))?;
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(local_map.keys().cloned());
@@ -1728,9 +1749,17 @@ mod tests {
         }
         assert!(valid_sync_entry_name("normal file.txt"));
         #[cfg(windows)]
-        for name in ["CON", "con.txt", "AUX.txt", "LPT1.txt", "COM9", "trailing.", "trailing ", "a?b"] {
+        for name in ["CON", "con.txt", "AUX.txt", "LPT1.txt", "COM9", "COM¹.txt", "LPT³", "trailing.", "trailing ", "a?b"] {
             assert!(!valid_sync_entry_name(name), "accepted {name:?}");
         }
+    }
+
+    #[test]
+    fn case_alias_check_refuses_colliding_paths() {
+        let same = vec!["folder/File.txt".to_string(), "folder/File.txt".to_string()];
+        assert!(reject_case_aliases(same.iter()).is_ok());
+        let collision = vec!["folder/File.txt".to_string(), "folder/file.txt".to_string()];
+        assert!(reject_case_aliases(collision.iter()).unwrap_err().contains("differ only by case"));
     }
 
     #[cfg(unix)]

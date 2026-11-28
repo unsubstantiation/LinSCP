@@ -4786,6 +4786,18 @@ function options(id) {
     doc.getElementById('editorEncoding').value = 'windows-1252';
     window.markDirty();
     window.closeEditor();
+    await window.openNewFileInEditor('/tmp/slowremote/new-encoding.txt', 'remote');
+    window.markDirty();
+    const editCount = calls.filter(c => c.path === '/api/remote/edit').length;
+    doc.getElementById('editorEncoding').value = 'windows-1252';
+    await window.changeEditorEncoding();
+    check('changing a new empty file encoding never tries to reload a nonexistent file',
+      calls.filter(c => c.path === '/api/remote/edit').length === editCount &&
+      doc.getElementById('editorEncoding').value === 'windows-1252');
+    await window.saveEditorFile();
+    const newEncodingSave = JSON.parse(calls.filter(c => c.path === '/api/remote/save').pop().options.body);
+    check('new empty file saves selected encoding', newEncodingSave.create_only === true && newEncodingSave.encoding === 'windows-1252');
+    window.closeEditor();
     window.openSearch();
     check('search defaults to backend lowercase utf-8', doc.getElementById('searchEncoding').value === 'utf-8');
     window.closeModal('searchModal');

@@ -16567,6 +16567,19 @@ mod tests {
         assert_eq!(rejected.status, 400, "{}", rejected.payload);
         assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/text/legacy.txt", Default::default()).await.unwrap(), b"na\xefve\r\n");
 
+        session.mkdir("/utf16").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/utf16/bom.txt", b"\xff\xfeC\0a\0f\0\xe9\0\r\0\n\0", Default::default()).await.unwrap();
+        let utf16 = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=%2Futf16%2Fbom.txt&encoding=utf-16le"), body: json!({}) }).await;
+        assert_eq!(utf16.status, 200, "{}", utf16.payload);
+        assert_eq!(utf16.payload["content"], "Café\r\n");
+        assert_eq!(utf16.payload["info"]["bom"], true);
+        let utf16_search = svc.dispatch_async(post("/api/remote/search", json!({"tab": id, "path": "/utf16", "pattern": "*.txt", "search_contents": true, "content_query": "Café", "encoding": "utf-16le"}))).await;
+        assert_eq!(utf16_search.status, 200, "{}", utf16_search.payload);
+        assert_eq!(utf16_search.payload["matches"].as_array().unwrap().len(), 1);
+        let utf16_save = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/utf16/bom.txt", "content": "ok\n", "encoding": "utf-16le", "eol": "crlf", "bom": true, "base_mtime": utf16.payload["info"]["mtime"]}))).await;
+        assert_eq!(utf16_save.status, 200, "{}", utf16_save.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/utf16/bom.txt", Default::default()).await.unwrap(), b"\xff\xfeo\0k\0\r\0\n\0");
+
         session.mkdir("/partial").await.unwrap();
         for (path, data) in [("/partial/a.txt", b"a".as_slice()), ("/partial/b.txt", b"b".as_slice()), ("/other.txt", b"other".as_slice())] {
             linscp_proto::upload_bytes(session.as_ref(), path, data, Default::default()).await.unwrap();
@@ -19278,6 +19291,7 @@ mod tests {
     struct MockBridge {
         docs: Mutex<HashMap<String, MockDoc>>,
         mtime: i64,
+        listing_injection: Mutex<Option<String>>,
     }
 
     /// A second granted tree, so cross-tree copies and moves have somewhere
@@ -19286,7 +19300,7 @@ mod tests {
 
     impl MockBridge {
         fn with_file(name: &str, content: &[u8]) -> Self {
-            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271 };
+            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271, listing_injection: Mutex::new(None) };
             bridge.add_file(&Self::doc_uri(name), content);
             bridge
         }
@@ -19336,7 +19350,13 @@ mod tests {
             let docs = self.docs.lock().expect("m");
             let mut uris: Vec<String> = docs.keys().filter(|uri| Self::parent_of(uri) == tree_uri).cloned().collect();
             uris.sort();
-            Ok(uris.iter().map(|uri| self.entry_for_uri(uri, &docs[uri])).collect())
+            let mut entries: Vec<FileEntry> = uris.iter().map(|uri| self.entry_for_uri(uri, &docs[uri])).collect();
+            if let Some(name) = self.listing_injection.lock().expect("m").as_ref() {
+                let mut injected = self.entry_for_uri(tree_uri, &MockDoc { bytes: Some(Vec::new()) });
+                injected.name = name.clone();
+                entries.push(injected);
+            }
+            Ok(entries)
         }
         fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> {
             let docs = self.docs.lock().expect("m");
@@ -20127,6 +20147,48 @@ mod tests {
         assert_eq!(session.bytes_of("/normal.txt"), Some(b"hello world".to_vec()));
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sync_preview_refuses_windows_case_aliases_before_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("Case.txt"), b"keep").unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/case.txt", b"remote");
+        let id = insert_remote_tab(&svc, session.clone(), &local.to_string_lossy());
+        let preview = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body: json!({
+            "tab": id, "local_dir": local, "remote_dir": "/", "mode": "local", "delete": true
+        }) }).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap_or("").contains("differ only by case"));
+        assert_eq!(std::fs::read(local.join("Case.txt")).unwrap(), b"keep");
+        assert_eq!(session.bytes_of("/case.txt"), Some(b"remote".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn remote_search_charges_failed_oversized_reads_to_total_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), &tmp.path().to_string_lossy());
+        let oversized = vec![b'x'; ops::MAX_SEARCH_FILE_BYTES as usize + 1];
+        for index in 0..9 {
+            let path = format!("/{index:02}.txt");
+            session.add_file(&path, &oversized);
+            session.reported_sizes.lock().unwrap().insert(path, 1);
+        }
+        let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/search".into(), body: json!({
+            "tab": id, "path": "/", "pattern": "*", "search_contents": true, "content_query": "needle"
+        }) }).await;
+        assert_eq!(result.status, 200, "{}", result.payload);
+        assert_eq!(result.payload["scanned"], 8);
+        assert_eq!(result.payload["skipped"], 8);
+        assert_eq!(result.payload["bytes_scanned"], ops::MAX_SEARCH_TOTAL_BYTES);
+        assert_eq!(result.payload["truncated"], true);
+    }
+
     #[tokio::test]
     async fn remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names() {
         let tmp = tempfile::tempdir().unwrap();
@@ -20457,6 +20519,27 @@ mod tests {
     /// files need no action without delete; a run with delete downloads the
     /// remote-only file and removes the deleted ones; an upload run carries
     /// a granted-only file up.
+    #[tokio::test]
+    async fn saf_search_and_sync_reject_provider_path_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("safe.txt", b"safe"));
+        *bridge.listing_injection.lock().unwrap() = Some("../outside.filepart".to_string());
+        let fs = Arc::new(NativeLocalFs::with_saf(bridge.clone()));
+        let search = ops::search_saf_bounded_with_encoding(fs.as_ref(), SAF_GRANTED_DIR, &FileMask::default(), None, false, None, 500).unwrap();
+        assert_eq!(search.skipped, 1);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0]["name"], "safe.txt");
+        let svc = CommanderService::new(tmp.path().join("config"), fs);
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session, SAF_GRANTED_DIR);
+        let preview = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body: json!({
+            "tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote"
+        }) }).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap_or("").contains("Invalid directory entry name"));
+        assert_eq!(bridge.bytes_of("safe.txt").as_deref(), Some(b"safe".as_slice()));
+    }
+
     #[tokio::test]
     async fn saf_sync_preview_and_run_moves_bytes_both_ways() {
         // The shared check keeps its plain rules and accepts a granted root.

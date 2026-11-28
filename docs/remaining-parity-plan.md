@@ -89,27 +89,25 @@ The HTTP-backed downloads and uploads report the bytes as they move: the byte-pr
 
 **Area:** Synchronization · **Status:** partial
 
-Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server; the same plan and upload run against the mock SFTP server.
+One-way synchronization can preview and queue recursive uploads and downloads; host tests cover mock SFTP and loopback WebDAV. A packaged Android emulator covers synchronization in both directions through an external-storage DocumentsProvider and WebDAV.
 
-**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which mirrors the local tree onto the remote side and prunes the excluded subtrees from the plan.
+**Next:** The loopback WebDAV upload and mock SFTP cases do not establish compatibility with production servers, other Android providers, or physical devices. Windows service evidence uses the mock provider; the live WebDAV case is Linux-only.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Exercise one-way synchronization on production-like servers and other Android providers and physical devices.
 
 ## sync.keepuptodate-inotify
 
 **Area:** Synchronization · **Status:** partial
 
-A file that arrives in the watched tree wakes the watcher, so the next pass runs straight away instead of waiting for the rescan interval.
+Keep-up-to-date uses filesystem notifications with polling fallback for native roots and polls granted Android folders. An event received during the initial pass is retained so a subsequent pass can discover changes not in its initial snapshot.
 
-**Next:** The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the arrival waking the watcher with an interval far longer than the wait it took.
+**Next:** Linux and Windows host tests exercise native watcher and fallback; the packaged Android emulator exercises interval polling and cancellation with the external-storage provider. Other providers, physical devices and broader live-server behavior remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
+- [ ] Exercise long-running watcher and polling behavior with other providers, real servers and physical devices.
 
 ## sessions.site-manager
 
@@ -507,11 +505,11 @@ Session transfers with a granted local side stage through private temporary file
 
 CLI and browser editor support explicit legacy encodings with strict decoding and encoding, line-ending and BOM controls. When opening undecodable text the browser offers an encoding retry; content search accepts an encoding and skips binary or undecodable files. Remote editor and search downloads are bounded by streamed bytes, not just server-reported sizes.
 
-**Next:** GUI behavior is exercised with a stub service, and service encoding/search cases use local or mock fixtures; live-server non-UTF-8 round trips and packaged Android remain unverified. Binary detection is heuristic, not a guarantee that arbitrary binary data is rejected.
+**Next:** Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Exercise non-UTF-8 editor and search against live servers and packaged Android, including binary and invalid-sequence cases.
+- [ ] Exercise additional encodings and negative cases against other servers, Android providers and physical devices.
 - [ ] Retain strict refusal of unrepresentable output and document binary detection limits.
 
 ## automation.upstream-xml-compatibility
@@ -547,12 +545,11 @@ Symbolic links can be created in a local pane, not just over SFTP: the other pan
 
 Remote deletes walk the selected tree, unlink symlinks without following them, reject unsafe server-provided child names, and report errors per selected name. A missing top-level entry is treated as already deleted. Partial failures are included in the service response and shown in the GUI error log; a failed child operation never counts the whole tree as deleted.
 
-**Next:** Recursive remote deletion is not transactional and may leave a partially deleted tree after an error. Linux and Windows mock-session tests inject a child deletion failure and verify the partial result is reported; the GUI test verifies the message reaches the error log. Live-server interruption and Android-device behavior remain unverified.
+**Next:** Recursive remote deletion is not transactional and can leave a partially deleted tree. Linux loopback WebDAV and a packaged Android emulator deliberately drop TCP during a child delete and verify the partial result; Windows uses a mock failure. Physical devices and production-server interruption remain unverified.
 
 **Acceptance criteria:**
 
-- [ ] Exercise actual connection interruption and resulting partial deletion against a live server.
-- [ ] Exercise the partial-failure report on Android and retain the non-transactional warning.
+- [ ] Exercise interruption against other production-like servers and physical devices; retain the non-transactional warning.
 
 ## backup.full-export-import
 

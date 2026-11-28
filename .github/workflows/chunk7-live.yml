@@ -16,6 +16,11 @@ jobs:
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine sync_planner::tests -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-platform recommendations_mention_all_protocols -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service remote_search_charges_failed_oversized_reads_to_total_budget -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service saf_search_and_sync_reject_provider_path_components -- --nocapture
+      - if: runner.os == 'Windows'
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service sync_preview_refuses_windows_case_aliases_before_deletion -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names -- --nocapture
   live:
     runs-on: ubuntu-24.04
     env:
