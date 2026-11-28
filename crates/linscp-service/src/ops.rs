@@ -2053,12 +2053,25 @@ pub fn take_shell_manifest(config_root: &Path, id: &str) -> Result<Value, String
     let path = config_root
         .join("shell-manifests")
         .join(format!("{safe_id}.json"));
-    let val = read_shell_manifest_file(&path)
+    // Claim by renaming first. On Windows multiple DeleteFile calls may
+    // succeed while deletion is pending, so unlink-after-read is not a claim.
+    // A unique same-directory name makes only one rename succeed.
+    let mut rnd = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut rnd);
+    let suffix = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let claimed = path.with_file_name(format!(".claim-{safe_id}-{suffix}"));
+    std::fs::rename(&path, &claimed)
         .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
-    // Two consumers can both open the same manifest. Only the one that
-    // successfully unlinks it owns the hand-off and may queue its items.
-    std::fs::remove_file(&path)
-        .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
+    let val = match read_shell_manifest_file(&claimed) {
+        Ok(val) => val,
+        Err(error) => {
+            if let Err(restore) = std::fs::rename(&claimed, &path) {
+                return Err(format!("Cannot read claimed shell upload: {error}; cannot restore it: {restore}"));
+            }
+            return Err(format!("Cannot read pending shell upload: {error}"));
+        }
+    };
+    std::fs::remove_file(&claimed).map_err(|e| format!("Cannot finish claiming shell upload: {e}"))?;
     Ok(val)
 }
 
