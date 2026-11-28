@@ -5688,12 +5688,12 @@
           "android-emulator"
         ]
       },
-      "gap": "The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help mentions an ironrdp WASM fallback; no implementation was found in the audited crates or shared frontend.",
+      "gap": "The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help no longer advertises an unimplemented embedded RDP fallback; gateway responses are hints rather than a bundled viewer.",
       "acceptance": [
         "Test RDP launches against a disposable server, including viewer resolution, TLS/NLA options, jump-host relay and credential handling.",
         "Test VNC and SPICE viewer launches against disposable servers, including TLS options and generated viewer tickets where supported.",
         "Validate and complete the existing experimental X2Go KDrive viewer against real servers on intended platforms, including rendering, input, SSH forwarding and lifecycle; test X11/Waypipe and jump-host policy separately.",
-        "Confirm whether the advertised ironrdp fallback is a product requirement; implement and review it if retained or correct the help text. Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit."
+        "Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit."
       ]
     },
     {

@@ -432,8 +432,8 @@ pub fn launch_remote_desktop(
 ///
 /// Callers (CLI `--help`, Tauri updater) can surface this verbatim.
 pub fn desktop_recommendations() -> &'static str {
-    "Remote desktop (dual-mode: native viewer when a display is present, .rdp/.vv file or HTML5 gateway in headless HTTP mode):\n\
-     \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). Embedded fallback: Devolutions/ironrdp WASM (HTML5/WebSocket) when no native viewer is installed.\n\
+    "Remote desktop (native viewer when available; otherwise a ticket file or guidance to use an external viewer):\n\
+     \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). No embedded RDP viewer is provided.\n\
      \x20 VNC  — Linux: tigervnc-viewer / remmina / gvncviewer (TigerVNC, recommended for 5900-5999). Windows: TightVNC / RealVNC viewer. Android: androidVNC / VNC Viewer (443).\n\
      \x20 SPICE — Linux/Windows: remote-viewer / virt-viewer (virt-viewer, recommended for QEMU/KVM). Fallback: spicy (spice-gtk). Uses spice://host:port?tls-port=... and .vv virt-viewer files.\n\
      \x20 X2Go KDrive — experimental built-in viewer; a KDrive server is required. NX is not supported.\n\
@@ -538,9 +538,11 @@ mod tests {
     #[test]
     fn recommendations_mention_all_protocols() {
         let rec = desktop_recommendations();
-        for proto in ["RDP", "VNC", "SPICE", "X2Go", "X11", "XDMCP", "ironrdp"] {
+        for proto in ["RDP", "VNC", "SPICE", "X2Go", "X11", "XDMCP"] {
             assert!(rec.contains(proto), "missing {proto}");
         }
+        assert!(rec.contains("No embedded RDP viewer is provided"));
+        assert!(!rec.contains("ironrdp"));
     }
 
     #[test]

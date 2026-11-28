@@ -57,6 +57,6 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 ## Audit notes
 
 - GSSAPI: the historical libssh/KDC plan was for retired CLI tests. Current russh uses runtime Linux GSSAPI or Windows SSPI; provider construction is not live authentication evidence.
-- Remote desktop: an experimental KDrive viewer exists; real server interoperability remains open. The desktop help advertises an ironrdp fallback not found in the audited code.
+- Remote desktop: an experimental KDrive viewer exists; real server interoperability remains open. Desktop help now states that no embedded RDP fallback is provided.
 - Android: generated share filters and emulator SAF fixtures already exist. The remaining plan now names untested providers, physical devices and other missing cases rather than asking to re-register or repeat covered behavior.
 - These classifications are planning aids. New tests may uncover implementation defects, and a user/product decision may change optional scope.

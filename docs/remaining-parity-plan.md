@@ -573,14 +573,14 @@ Full exports refuse external SSH/TLS material, CA directories and file-based pub
 
 RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}). Android viewer launch is restricted in both the frontend and native bridge to allowed schemes and no userinfo; RDP/VNC/SPICE viewer URIs additionally refuse paths, queries and fragments. The debug APK emulator smoke invokes the native bridge directly to test unsafe URI refusals.
 
-**Next:** The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help mentions an ironrdp WASM fallback; no implementation was found in the audited crates or shared frontend.
+**Next:** The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help no longer advertises an unimplemented embedded RDP fallback; gateway responses are hints rather than a bundled viewer.
 
 **Acceptance criteria:**
 
 - [ ] Test RDP launches against a disposable server, including viewer resolution, TLS/NLA options, jump-host relay and credential handling.
 - [ ] Test VNC and SPICE viewer launches against disposable servers, including TLS options and generated viewer tickets where supported.
 - [ ] Validate and complete the existing experimental X2Go KDrive viewer against real servers on intended platforms, including rendering, input, SSH forwarding and lifecycle; test X11/Waypipe and jump-host policy separately.
-- [ ] Confirm whether the advertised ironrdp fallback is a product requirement; implement and review it if retained or correct the help text. Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit.
+- [ ] Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit.
 
 ## platform.android-saf-synchronization
 
