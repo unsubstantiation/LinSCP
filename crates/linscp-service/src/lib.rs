@@ -12247,6 +12247,65 @@ fn plan_offlineotp_import(
     Ok(OfflineOtpImportPlan { sites, vault_keys, ignored })
 }
 
+#[derive(Default)]
+struct OfflineOtpMaterialStage {
+    ssh: Vec<StagedSessionKey>,
+    public: Vec<(String, String)>,
+    tls: Vec<(String, zeroize::Zeroizing<Vec<u8>>)>,
+}
+
+fn random_vault_material_id() -> String {
+    let mut random = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut random);
+    random.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+impl OfflineOtpMaterialStage {
+    fn stage_key(&mut self, key: &SshKeyRecord) -> Result<(Option<String>, Option<String>), String> {
+        if key.private_key.len() > 32 * 1024 || key.public_key.len() > 32 * 1024 {
+            return Err("Imported SSH key exceeds the 32 KiB per-key limit.".into());
+        }
+        let public = if key.public_key.is_empty() { derive_public_ssh_key_optional(&key.private_key).unwrap_or_default() } else { key.public_key.clone() };
+        if key.private_key.is_empty() {
+            if public.is_empty() { return Err("Imported SSH key is empty.".into()); }
+            if let Some((id, _)) = self.public.iter().find(|(_, value)| *value == public) {
+                return Ok((None, Some(format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"))));
+            }
+            let id = random_vault_material_id();
+            self.public.push((id.clone(), public));
+            return Ok((None, Some(format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"))));
+        }
+        if let Some(existing) = self.ssh.iter().find(|record| constant_time_bytes_eq(&record.private, key.private_key.as_bytes())) {
+            if !public.is_empty() && existing.public != public {
+                return Err("Imported records contain conflicting public keys for the same private key.".into());
+            }
+            return Ok((Some(format!("{LOCAL_VAULT_KEY_PREFIX}{}", existing.id)), (!existing.public.is_empty()).then(|| format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{}", existing.id))));
+        }
+        let id = random_vault_material_id();
+        let label = derive_vault_key_label(&key.label, &public, &id);
+        let public_ref = (!public.is_empty()).then(|| format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"));
+        self.ssh.push(StagedSessionKey { id: id.clone(), private: zeroize::Zeroizing::new(key.private_key.as_bytes().to_vec()), label, public });
+        Ok((Some(format!("{LOCAL_VAULT_KEY_PREFIX}{id}")), public_ref))
+    }
+
+    fn stage_tls(&mut self, encoded: &str, label: &str) -> Result<String, String> {
+        let bytes = zeroize::Zeroizing::new(decode_imported_tls_b64(encoded, label)?);
+        if let Some((id, _)) = self.tls.iter().find(|(_, existing)| constant_time_bytes_eq(existing, &bytes)) {
+            return Ok(format!("{LOCAL_VAULT_TLS_PREFIX}{id}"));
+        }
+        let id = random_vault_material_id();
+        self.tls.push((id.clone(), bytes));
+        Ok(format!("{LOCAL_VAULT_TLS_PREFIX}{id}"))
+    }
+
+    fn imports(&self) -> Vec<linscp_platform::VaultMaterialImport<'_>> {
+        let mut imports: Vec<_> = self.ssh.iter().map(StagedSessionKey::as_import).collect();
+        imports.extend(self.public.iter().map(|(id, public_key)| linscp_platform::VaultMaterialImport::PublicKey { id, public_key }));
+        imports.extend(self.tls.iter().map(|(id, data)| linscp_platform::VaultMaterialImport::Tls { id, data }));
+        imports
+    }
+}
+
 fn import_offlineotp_entries(
     config_root: &Path,
     mut store: SessionStore,
@@ -12255,12 +12314,8 @@ fn import_offlineotp_entries(
     selection: Option<&std::collections::HashSet<String>>,
     replace_same_names: bool,
 ) -> Result<(usize, usize, usize), String> {
-    // This importer also changes host keys and transfer presets. Until the
-    // complete import can be committed safely, never leak staged keys into
-    // legacy files when a transactional container backend is selected.
-    if secret_vault.supports_session_material_transactions() {
-        return Err("OfflineOTP import is not yet supported by the container vault.".into());
-    }
+    let transactional = secret_vault.supports_session_material_transactions();
+    let mut materials = OfflineOtpMaterialStage::default();
     let mut created_files = Vec::<PathBuf>::new();
     let mut sessions_published = false;
     let result = (|| {
@@ -12268,6 +12323,10 @@ fn import_offlineotp_entries(
         // Stage standalone keys first, so referenced keys deduplicate against
         // the restored user label rather than inventing a session-derived one.
         for key in &vault_keys {
+            if transactional {
+                materials.stage_key(key)?;
+                continue;
+            }
             let dir = config_root.join("keys");
             if key.private_key.is_empty() {
                 let found = match std::fs::read_dir(&dir) {
@@ -12323,29 +12382,29 @@ fn import_offlineotp_entries(
             // Serialized paths are local to the exporting computer and are never trusted on import.
             clear_imported_key_paths(&mut candidate.site);
             if let Some(key) = candidate.ssh_key.as_ref() {
-                let (private_path, public_path) = stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)?;
+                let (private_path, public_path) = if transactional { materials.stage_key(key)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
                 candidate.site.private_key = private_path;
                 if let Some(public) = public_path {
                     candidate.site.extra_fields.insert("linscp_public_key_file".into(), public);
                 }
             }
             if let Some(key) = candidate.tunnel_key.as_ref() {
-                let (private_path, public_path) = stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)?;
+                let (private_path, public_path) = if transactional { materials.stage_key(key)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
                 candidate.site.tunnel.keyfile = private_path;
                 if let Some(public) = public_path {
                     candidate.site.extra_fields.insert("linscp_tunnel_public_key_file".into(), public);
                 }
             }
             if let Some(encoded) = candidate.ca_cert_b64.as_deref() {
-                let tls_ref = stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "CA certificate")?;
+                let tls_ref = if transactional { materials.stage_tls(encoded, "CA certificate")? } else { stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "CA certificate")? };
                 candidate.site.extra_fields.insert("ca_certificate_file".into(), tls_ref);
             }
             if let Some(encoded) = candidate.tls_cert_b64.as_deref() {
-                let tls_ref = stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "TLS client certificate")?;
+                let tls_ref = if transactional { materials.stage_tls(encoded, "TLS client certificate")? } else { stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "TLS client certificate")? };
                 candidate.site.extra_fields.insert("tls_certificate_file".into(), tls_ref);
             }
             if let Some(encoded) = candidate.tls_key_b64.as_deref() {
-                let tls_ref = stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "TLS client private key")?;
+                let tls_ref = if transactional { materials.stage_tls(encoded, "TLS client private key")? } else { stage_offlineotp_tls_blob(config_root, encoded, secret_vault, &mut created_files, "TLS client private key")? };
                 candidate.site.extra_fields.insert("tls_certificate_key_file".into(), tls_ref);
             }
             for hk in &candidate.cached_hostkeys {
@@ -12383,13 +12442,34 @@ fn import_offlineotp_entries(
             staged_site_names.push(candidate.site.name);
         }
         if staged_site_names.is_empty() {
+            if transactional && !materials.imports().is_empty() {
+                store.save_with_materials(config_root, secret_vault, &materials.imports())
+                    .map_err(|error| format!("Cannot save imported SSH keys: {error}"))?;
+            }
             return Ok((0, skipped, ignored));
+        }
+        if transactional {
+            // These stores are not yet part of the same transaction. Refuse
+            // rather than commit only some of an imported backup.
+            if hostkeys_changed || presets_changed {
+                return Err("Container import cannot yet atomically update SSH host keys or transfer presets.".into());
+            }
+            if !replaced_existing_names.is_empty() {
+                let intentions = auto_reconnect::load(config_root, secret_vault)?;
+                if replaced_existing_names.iter().any(|name| intentions.contains_key(name)) {
+                    return Err("Container import cannot yet atomically replace a session with reconnect state.".into());
+                }
+            }
         }
         // An atomic write can report an error after publishing (for example,
         // if its durability barrier fails). Do not delete keys at that point.
         sessions_published = true;
-        store.save_to_dir(config_root, secret_vault)
-            .map_err(|error| format!("Cannot save imported sessions: {error}"))?;
+        if transactional {
+            let imports = materials.imports();
+            store.save_with_materials(config_root, secret_vault, &imports)
+        } else {
+            store.save_to_dir(config_root, secret_vault)
+        }.map_err(|error| format!("Cannot save imported sessions: {error}"))?;
         if hostkeys_changed {
             hostkey_cache.save_protected(&config_root.join("sshhostkeys"), secret_vault)
                 .map_err(|error| format!("Cannot save imported SSH host keys: {error}"))?;
@@ -13442,6 +13522,75 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    #[test]
+    fn container_offlineotp_import_is_atomic_for_sessions_and_materials() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer, NewSshKey, NewTlsMaterial};
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_file = CredentialContainer::acquire(&source_dir.path().join("vault.dat")).unwrap();
+        source_file.create("test password").unwrap();
+        let source = ContainerSessionVault::new(source_dir.path(), source_file.unlock("test password").ok().unwrap()).unwrap();
+        let key_id = "11111111111111111111111111111111";
+        let tls_id = "22222222222222222222222222222222";
+        let mut site = StoredSite::new("site", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(format!("vaultkey://{key_id}"));
+        site.extra_fields.insert("tls_certificate_key_file".into(), format!("vaulttls://{tls_id}"));
+        let mut sessions = SessionStore::new();
+        sessions.upsert(site);
+        source.save_sessions_with_materials(&sessions,
+            &[NewSshKey { id: key_id, private: b"private material", label: "key", public_key: "ssh-ed25519 public" }],
+            &[NewTlsMaterial { id: tls_id, data: b"tls private" }], &[]).unwrap();
+        let entries = offlineotp_entries_from_sessions(&sessions, source_dir.path(), &source, None, true).unwrap();
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("vault.dat");
+        let target_file = CredentialContainer::acquire(&target_path).unwrap();
+        target_file.create("test password").unwrap();
+        let target = ContainerSessionVault::new(target_dir.path(), target_file.unlock("test password").ok().unwrap()).unwrap();
+        let mut bad = entries.clone();
+        for entry in &mut bad {
+            if let CredentialEntry::Login(login) = entry { login.metadata.insert(OFFLINEOTP_TLS_KEY_B64.into(), "invalid base64".into()); }
+        }
+        let before = std::fs::read(&target_path).unwrap();
+        assert!(import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries: bad, ignored_entries: 0 }, &target, None, false).is_err());
+        assert_eq!(std::fs::read(&target_path).unwrap(), before);
+        let mut unsupported = entries.clone();
+        let mut hostkeys = linscp_engine::hostkeys::HostKeyCache::new();
+        hostkeys.upsert("example.test", 22, "ssh-ed25519", "SHA256:AbCdEf123").unwrap();
+        for entry in &mut unsupported {
+            if let CredentialEntry::Login(login) = entry { login.metadata.insert(OFFLINEOTP_CACHED_HOSTKEYS_B64.into(), BASE64_STD.encode(hostkeys.serialize())); }
+        }
+        assert!(import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries: unsupported, ignored_entries: 0 }, &target, None, false).is_err());
+        assert_eq!(std::fs::read(&target_path).unwrap(), before);
+        let result = import_offlineotp_entries(target_dir.path(), SessionStore::new(), offlineotp_vault::ImportedCredentialVault { entries, ignored_entries: 0 }, &target, None, false).unwrap();
+        assert_eq!(result.0, 1);
+        let loaded = SessionStore::load_from_dir(target_dir.path(), &target).unwrap();
+        let saved = loaded.find("site").unwrap();
+        let reference = saved.private_key.as_deref().unwrap();
+        assert_eq!(read_offlineotp_keypair(reference, target_dir.path(), &target).unwrap().1, "private material");
+        let tls_ref = saved.extra_fields.get("tls_certificate_key_file").unwrap();
+        assert_eq!(read_tls_blob_for_export(tls_ref, target_dir.path(), &target, "TLS key").unwrap(), b"tls private");
+        assert!(!target_dir.path().join("keys").exists());
+        assert!(!target_dir.path().join("sessions.ini").exists());
+    }
+
+    #[test]
+    fn container_offlineotp_import_preserves_standalone_keys_without_sessions() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer};
+        let dir = tempfile::tempdir().unwrap();
+        let file = CredentialContainer::acquire(&dir.path().join("vault.dat")).unwrap();
+        file.create("test password").unwrap();
+        let vault = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let key = SshKeyRecord { label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}11111111111111111111111111111111:My key"), public_key: "ssh-ed25519 public".into(), private_key: "private key".into(), host: String::new(), port: 0, username: String::new(), password: String::new() };
+        let imported = offlineotp_vault::ImportedCredentialVault { entries: vec![CredentialEntry::SshKey(key)], ignored_entries: 0 };
+        assert_eq!(import_offlineotp_entries(dir.path(), SessionStore::new(), imported, &vault, None, false).unwrap().0, 0);
+        let exported = offlineotp_entries_from_sessions(&SessionStore::new(), dir.path(), &vault, None, true).unwrap();
+        assert_eq!(exported.len(), 1);
+        match &exported[0] {
+            CredentialEntry::SshKey(key) => { assert_eq!(key.private_key, "private key"); assert!(key.label.ends_with(":My key")); },
+            _ => panic!("Expected a standalone key"),
+        }
+        assert!(!dir.path().join("keys").exists());
+    }
 
     #[test]
     fn container_offlineotp_export_reads_material_without_legacy_fallback() {
