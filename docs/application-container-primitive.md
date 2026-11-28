@@ -1,0 +1,19 @@
+# Application container primitive (not yet integrated)
+
+`linscp_platform::container_cipher` and `container_file` are an initial building block for the planned unified store. They do **not** change where the application stores data or replace the current vault, backup, or recovery code. They are not the OfflineOTP wire format and should not be presented as an OfflineOTP-compatible file. Payload schema and application integration are future work.
+
+## Format and use
+
+The `LSCPDAT1` envelope contains an eight-byte magic/version, 16-byte random salt, 12-byte random nonce, and AES-256-GCM ciphertext/tag. The entire 36-byte header is authenticated. Argon2id v1.3 derives the 32-byte key with 64 MiB, three iterations and one lane. Passwords are 6–1024 UTF-16 code units; plaintext is bounded at 16 MiB. Every seal uses a fresh salt and nonce. Decrypted bytes are returned in a zeroizing buffer. This version fixes its KDF parameters; future changes need a new format version, never an unauthenticated fallback.
+
+`ContainerFile::try_acquire(path)` acquires a nonblocking exclusive OS lock on a persistent sibling `<filename>.lock`. Keep the guard throughout each read/modify/write operation. `create` publishes only if the target does not exist. `save` authenticates the existing target with the supplied password before replacing it, so corrupt data or a wrong password does not become an empty vault. The caller is responsible for treating errors as errors, keeping plaintext out of logs and disk, and making application-level updates under the same guard. Password changes require a separately designed operation; `save` intentionally does not change the password.
+
+Writes create a random same-directory file exclusively, encrypt in memory, flush the temporary file, publish atomically, and flush the parent directory. Windows creates each file with a protected owner-rights DACL at creation time; Unix uses mode `0600`. Neither changes the parent permissions. A failure from the final directory flush means the new file may already be published but durability was not confirmed: reload and reconcile instead of assuming no change. A crash before publication can leave an encrypted temporary file. This primitive does not yet automatically remove such orphan files.
+
+The parent must already exist, be writable, and be trusted against arbitrary renames by other users. An advisory sidecar lock only coordinates cooperating processes; it does not prevent a hostile writer from replacing files in a shared directory. The stable lock file must not be removed while clients may be running. Existing vault and lock paths are checked as ordinary singly linked files without following the final link; atomic replacement does not provide security against hostile modification of the containing directory. Temporary ciphertext and the lock are additional files, even though the intended persistent application data is consolidated into one container.
+
+## Validation and remaining work
+
+Platform tests cover a standalone authenticated-encryption vector, wrong passwords and tampering, create/no-overwrite, replacement, file and parent permissions, concurrent process locking and lock release on process termination, hard-link refusal, and reopening after an abandoned encrypted stage. The Windows ACL test verifies the sole ACE is owner-rights, the file DACL is protected from inheritance, and the parent DACL is unchanged. These are targeted tests, not a full power-loss or hostile-filesystem audit.
+
+Before using this for real application data, integrate the stores and their schema; resolve startup while locked, backup/import, recovery, CLI and shell interactions; establish the executable-relative path and unwritable-directory UX; and test actual application workflows and crash behavior. See [the storage inventory](windows-storage-inventory.md).
