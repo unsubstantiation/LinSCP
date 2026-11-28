@@ -2107,14 +2107,41 @@ pub fn list_shell_manifests(config_root: &Path) -> Vec<Value> {
     out
 }
 
+/// Serialize cooperating consumers across processes. On Windows, concurrent
+/// rename calls can each succeed against handles opened before another rename;
+/// unique target names alone do not make a rename an exclusive claim. The lock
+/// file must remain in place so all processes continue to lock the same inode.
+fn lock_shell_manifest_claims(dir: &Path) -> Result<std::fs::File, String> {
+    use linscp_platform::PlatformError;
+    let lock_path = dir.join(".claim.lock");
+    let file = match linscp_platform::create_private_file(&lock_path) {
+        Ok(file) => file,
+        Err(PlatformError::Io(error)) if error.kind() == std::io::ErrorKind::AlreadyExists =>
+            linscp_platform::open_private_file_no_follow(&lock_path).map_err(|e| e.to_string())?,
+        Err(error) => return Err(error.to_string()),
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if file.try_lock().is_ok() { return Ok(file); }
+        if std::time::Instant::now() >= deadline {
+            return Err("Timed out acquiring the shell upload claim lock.".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
 pub fn take_shell_manifest(config_root: &Path, id: &str) -> Result<Value, String> {
     let safe_id = validate_leaf_name(id)?;
     let path = config_root
         .join("shell-manifests")
         .join(format!("{safe_id}.json"));
-    // Claim by renaming first. On Windows multiple DeleteFile calls may
-    // succeed while deletion is pending, so unlink-after-read is not a claim.
-    // A unique same-directory name makes only one rename succeed.
+    // The lock serializes cooperating processes before rename, read and
+    // removal. It is released when the handle is dropped, including on error.
+    let dir = path.parent().ok_or("Invalid shell manifest directory.")?;
+    let _claim_lock = lock_shell_manifest_claims(dir)?;
+    // Rename before reading so an interruption never leaves a published
+    // manifest that could be consumed a second time. A crash can leave a
+    // hidden claim that requires manual recovery.
     let mut rnd = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut rnd);
     let suffix = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
@@ -2166,11 +2193,74 @@ mod tests {
                 let root = root.path();
                 let id = &id;
                 let barrier = &barrier;
-                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id).is_ok() }));
+                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id) }));
             }
-            threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count()
+            threads.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
         });
-        assert_eq!(results, 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "claim results: {results:?}");
+    }
+
+    #[test]
+    fn shell_manifest_claim_child() {
+        let Some(root) = std::env::var_os("LINSCP_TEST_CLAIM_ROOT") else { return; };
+        let id = std::env::var("LINSCP_TEST_CLAIM_ID").unwrap();
+        let worker = std::env::var("LINSCP_TEST_CLAIM_WORKER").unwrap();
+        let root = PathBuf::from(root);
+        std::fs::write(root.join(format!("ready-{worker}")), b"ready").unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        while !root.join("start").exists() {
+            assert!(std::time::Instant::now() < deadline, "claim start timed out");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if take_shell_manifest(&root, &id).is_ok() { println!("CLAIM_WON"); }
+    }
+
+    #[test]
+    fn shell_manifest_is_claimed_by_only_one_process() {
+        use std::process::{Command, Stdio};
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, b"test").unwrap();
+        let doc = record_shell_upload_manifest(root.path(), &[file]).unwrap();
+        let id = doc["id"].as_str().unwrap();
+        let mut children = Vec::new();
+        for worker in 0..8 {
+            children.push(Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "ops::tests::shell_manifest_claim_child", "--nocapture"])
+                .env("LINSCP_TEST_CLAIM_ROOT", root.path()).env("LINSCP_TEST_CLAIM_ID", id)
+                .env("LINSCP_TEST_CLAIM_WORKER", worker.to_string())
+                .stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap());
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while !(0..8).all(|worker| root.path().join(format!("ready-{worker}")).exists()) {
+            assert!(std::time::Instant::now() < deadline, "claim workers did not start");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        std::fs::write(root.path().join("start"), b"start").unwrap();
+        let mut winners = 0;
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(output.status.success(), "child failed: {}", String::from_utf8_lossy(&output.stderr));
+            if String::from_utf8_lossy(&output.stdout).contains("CLAIM_WON") { winners += 1; }
+        }
+        assert_eq!(winners, 1);
+        assert!(list_shell_manifests(root.path()).is_empty());
+        assert!(root.path().join("shell-manifests/.claim.lock").exists());
+    }
+
+    #[test]
+    fn malformed_claim_is_restored_and_lock_is_reusable() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, b"test").unwrap();
+        let doc = record_shell_upload_manifest(root.path(), &[file]).unwrap();
+        let id = doc["id"].as_str().unwrap();
+        let path = root.path().join("shell-manifests").join(format!("{id}.json"));
+        std::fs::write(&path, b"bad json").unwrap();
+        assert!(take_shell_manifest(root.path(), id).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), b"bad json");
+        std::fs::write(&path, serde_json::to_vec(&doc).unwrap()).unwrap();
+        assert_eq!(take_shell_manifest(root.path(), id).unwrap(), doc);
     }
 
     #[test]

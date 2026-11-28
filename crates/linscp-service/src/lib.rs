@@ -20752,6 +20752,7 @@ mod tests {
     /// across the bridge, then deletes the remote source by ETag.
     #[tokio::test]
     async fn saf_s3_version_download_requires_publication_risk_consent() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = tempfile::tempdir().unwrap();
         let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
         let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
@@ -20842,6 +20843,7 @@ mod tests {
 
     #[tokio::test]
     async fn saf_sync_preview_and_run_moves_bytes_both_ways() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         // The shared check keeps its plain rules and accepts a granted root.
         assert!(check_sync_local_dir(SAF_GRANTED_DIR).is_ok(), "a granted root passes structurally");
         assert_eq!(check_sync_local_dir("relative/dir").unwrap_err(), "An absolute local directory is required.");
@@ -20921,6 +20923,7 @@ mod tests {
     /// carries a granted-only file up and the task completes.
     #[tokio::test]
     async fn saf_keep_up_to_date_polls_a_granted_folder() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-watch-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
         let bridge = Arc::new(MockBridge::with_file("watch.txt", b"watch me"));
@@ -20940,6 +20943,7 @@ mod tests {
     /// by the initial catch-up pass (which the older one-pass test covered).
     #[tokio::test]
     async fn saf_keep_up_to_date_rechecks_after_poll_interval() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         use std::time::Duration;
         use linscp_engine::keepuptodate::{run_keep_up_to_date, KeepUpToDateOptions};
         let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
@@ -20967,6 +20971,7 @@ mod tests {
     /// rescan interval is long; the queued task must not perform another pass.
     #[tokio::test]
     async fn saf_keep_up_to_date_cancels_during_poll_wait() {
+        let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         use std::time::Duration;
         let tmp = tempfile::tempdir().unwrap();
         let bridge = Arc::new(MockBridge::with_file("first.txt", b"first"));
