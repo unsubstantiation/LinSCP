@@ -121,7 +121,7 @@ impl GuardedKDriveSession {
                 Ok(Self { reader, writer, agent, desktop_started: false })
             }
             _ => {
-                if agent.close().await.is_err() {
+                if agent.cleanup_after_failure().await.is_err() {
                     return Err(ProtoError::Transport("X2Go graphics setup failed and agent cleanup could not be confirmed.".into()));
                 }
                 Err(ProtoError::Transport("X2Go graphics setup failed; agent cleanup was requested.".into()))

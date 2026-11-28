@@ -1,0 +1,36 @@
+name: X2Go KDrive integration
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  kdrive:
+    name: Ubuntu KDrive over SSH
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x2go-live-kdrive
+      - name: Install a disposable KDrive fixture
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive xfce4 dbus-x11 openssh-server xterm xdotool
+          sudo useradd -m -s /bin/bash x2gotest
+          # This is a throwaway account on an ephemeral, loopback-only CI runner.
+          echo 'x2gotest:fixture-password' | sudo chpasswd
+          if getent group x2gouser >/dev/null; then sudo usermod -a -G x2gouser x2gotest; fi
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          sudo /usr/sbin/sshd -p 22222 -o ListenAddress=127.0.0.1 -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no -o UsePAM=yes
+      - name: Exercise KDrive startup, frames, input and recovery
+        env:
+          LSCP_LIVE_X2GO: '1'
+        run: cargo test -p linscp-proto --test live_x2go -- --nocapture

@@ -1098,6 +1098,35 @@ async fn handle_mock_s3(
 }
 
 #[tokio::test]
+async fn s3_multipart_checkpoints_are_scoped_to_the_endpoint() {
+    let pki = common::generate_test_tls_pki(2);
+    let first = Arc::new(Mutex::new(MockS3State::new()));
+    let second = Arc::new(Mutex::new(MockS3State::new()));
+    second.lock().await.fail_part_2_once.store(false, Ordering::SeqCst);
+    let port_a = spawn_https_router(Router::new().fallback(handle_mock_s3).with_state(Arc::clone(&first)), &pki).await;
+    let port_b = spawn_https_router(Router::new().fallback(handle_mock_s3).with_state(Arc::clone(&second)), &pki).await;
+    let store = MultipartResumeStore::new_in_memory();
+    let connect = |port| S3ConnectConfig {
+        use_https: true, host: "localhost".into(), port,
+        region: Some("us-east-1".into()), access_key_id: "AKIAIOSFODNN7EXAMPLE".into(),
+        secret_access_key: Zeroizing::new("wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY".into()),
+        path_style: true, multipart_threshold: 16 * 1024, min_part_size: 8 * 1024,
+        abort_multipart_on_error: false, resume_store: store.clone(),
+        tls: TlsSettings { pinned_public_key: Some(pki.server_spki_pin.clone()),
+            ca_cert_pem: Some(pki.ca_cert_pem.clone()), ..Default::default() },
+        ..Default::default()
+    };
+    let a = S3Session::connect(connect(port_a), None, 0).await.unwrap();
+    let b = S3Session::connect(connect(port_b), None, 0).await.unwrap();
+    let target = "/alpha-bucket/releases/shared.bin";
+    let payload = vec![0x35; 20 * 1024];
+    assert!(upload_bytes(&a, target, &payload, TransferRequest::default()).await.is_err());
+    upload_bytes(&b, target, &payload, TransferRequest::default()).await.unwrap();
+    assert_eq!(download_bytes(&b, target, TransferRequest::default()).await.unwrap(), payload);
+    assert_eq!(second.lock().await.part_1_uploads.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
 async fn s3_sigv4_resumable_multipart_and_object_versioning_succeed() {
     let pki = common::generate_test_tls_pki(2);
     let state = Arc::new(Mutex::new(MockS3State::new()));
@@ -1220,6 +1249,34 @@ async fn s3_sigv4_resumable_multipart_and_object_versioning_succeed() {
     .await
     .unwrap();
     assert_eq!(reassembled, large_payload);
+
+    // A same-length source changed between attempts must not reuse a stale
+    // uploaded part merely because the target key and total size match.
+    state.lock().await.fail_part_2_once.store(true, Ordering::SeqCst);
+    let before = state.lock().await.part_1_uploads.load(Ordering::SeqCst);
+    let original = vec![b'a'; 20 * 1024];
+    let mut changed = original.clone();
+    changed[7] = b'b';
+    let target = "/alpha-bucket/releases/changed-source.bin";
+    assert!(upload_bytes(&s3, target, &original, TransferRequest::default()).await.is_err());
+    upload_bytes(&s3, target, &changed, TransferRequest::default()).await.unwrap();
+    assert_eq!(state.lock().await.part_1_uploads.load(Ordering::SeqCst), before + 2,
+        "the changed first part must be sent again");
+    assert_eq!(download_bytes(&s3, target, TransferRequest::default()).await.unwrap(), changed);
+
+    // Neither a truncated nor an expanded source may be completed under a
+    // previously reported length, even when every transmitted part succeeds.
+    let mut short_source: &[u8] = b"short";
+    let short = s3.upload("/alpha-bucket/releases/short.bin", TransferRequest::default(),
+        &mut short_source, Some(20 * 1024), None).await;
+    assert!(short.is_err(), "a truncated source must not complete");
+    assert!(s3.stat("/alpha-bucket/releases/short.bin").await.unwrap().is_none());
+    let extra_bytes = vec![b'x'; 20 * 1024 + 1];
+    let mut long_source: &[u8] = &extra_bytes;
+    let long = s3.upload("/alpha-bucket/releases/long.bin", TransferRequest::default(),
+        &mut long_source, Some(20 * 1024), None).await;
+    assert!(long.is_err(), "an expanded source must not complete");
+    assert!(s3.stat("/alpha-bucket/releases/long.bin").await.unwrap().is_none());
 
     // Byte-range GET resume + server-side CopyObject / rename / version delete
     let tail = download_bytes(
@@ -1902,6 +1959,22 @@ async fn s3_multipart_resumes_from_its_sidecar_and_refuses_a_hidden_completion_f
     .await
     .unwrap();
     assert_eq!(reassembled, payload);
+
+    // An older, hashless checkpoint must reupload its part after restart.
+    state.lock().await.fail_part_2_once.store(true, Ordering::SeqCst);
+    let target = "/alpha-bucket/releases/hashless.bin";
+    let before = state.lock().await.part_1_uploads.load(Ordering::SeqCst);
+    assert!(upload_bytes(&resumed, target, &payload, TransferRequest::default()).await.is_err());
+    let mut sidecar: serde_json::Value = serde_json::from_slice(&std::fs::read(&sidecar_path).unwrap()).unwrap();
+    for checkpoint in sidecar.as_object_mut().unwrap().values_mut() {
+        checkpoint.as_object_mut().unwrap().remove("completed_part_sha256");
+    }
+    std::fs::write(&sidecar_path, serde_json::to_vec(&sidecar).unwrap()).unwrap();
+    let legacy = connect_with(MultipartResumeStore::with_sidecar_file(sidecar_path.clone()), "AKIAIOSFODNN7EXAMPLE").await.unwrap();
+    upload_bytes(&legacy, target, &payload, TransferRequest::default()).await.unwrap();
+    assert_eq!(state.lock().await.part_1_uploads.load(Ordering::SeqCst), before + 2,
+        "hashless parts must not be silently reused");
+    assert_eq!(download_bytes(&legacy, target, TransferRequest::default()).await.unwrap(), payload);
 
     // A failure the server reports inside a successful status still fails.
     state.lock().await.complete_reports_error.store(true, Ordering::SeqCst);

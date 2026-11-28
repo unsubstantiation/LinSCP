@@ -46,7 +46,7 @@ export interface KDriveViewerTransport {
   /** Write one complete KDrive event on the authenticated graphics channel. */
   write(packet: Uint8Array): Promise<void>;
   /** Close the graphics channel and arrange cleanup of the remote agent. */
-  close(): void;
+  close(failed?: boolean): void;
   /** Request a main image after reinitialization; fail if this cannot be done. */
   requestMainImage(): Promise<void>;
 }
@@ -82,6 +82,7 @@ export class KDriveViewerSession {
   private activeCursorSerial: number | null = null;
   private selectionChunks: Uint8Array[] = [];
   private selectionBytes = 0;
+  private activeSelection: number | null = null;
   private closed = false;
   private chain: Promise<void> = Promise.resolve();
   private pendingMessages = 0;
@@ -267,18 +268,20 @@ export class KDriveViewerSession {
   }
 
   private applySelection(sel: KDriveSelectionPayload): void {
-    if (sel.format !== 0 || sel.compressedSize !== 0) {
+    const reset = () => {
       this.selectionChunks = [];
       this.selectionBytes = 0;
-      return;
-    }
+      this.activeSelection = null;
+    };
+    if (sel.format !== 0 || sel.compressedSize !== 0) { reset(); return; }
     if (sel.first) {
-      this.selectionChunks = [];
-      this.selectionBytes = 0;
+      reset();
+      this.activeSelection = sel.selection;
     }
-    if (this.selectionBytes + sel.data.byteLength > MAX_SELECTION_ACCUM) {
-      this.selectionChunks = [];
-      this.selectionBytes = 0;
+    // A missing first chunk or interleaved selections must not silently
+    // assemble unrelated clipboard bytes into a new local clipboard value.
+    if (this.activeSelection !== sel.selection || this.selectionBytes + sel.data.byteLength > MAX_SELECTION_ACCUM) {
+      reset();
       return;
     }
     this.selectionChunks.push(sel.data);
@@ -290,8 +293,7 @@ export class KDriveViewerSession {
         merged.set(chunk, offset);
         offset += chunk.byteLength;
       }
-      this.selectionChunks = [];
-      this.selectionBytes = 0;
+      reset();
       const text = new TextDecoder('utf-8', { fatal: false }).decode(merged);
       try { this.options.onSelection?.(text, sel.selection); } catch { /* ignore UI callback error */ }
     }
@@ -311,7 +313,9 @@ export class KDriveViewerSession {
     finally { if (timer !== undefined) clearTimeout(timer); this.cancelMainRequest = null; }
   }
 
-  public close(): void {
+  public close(): void { this.closeInternal(false); }
+
+  private closeInternal(failed: boolean): void {
     if (this.closed) return;
     this.closed = true;
     this.cancelMainRequest?.(new Error('KDrive viewer is closed.'));
@@ -321,12 +325,12 @@ export class KDriveViewerSession {
     // and clear its own cache; otherwise discard pixels immediately.
     try { this.frames.reset(); } catch { /* frame is still decoding */ }
     this.renderer.destroy();
-    try { this.transport.close(); } catch { /* cleanup is best-effort */ }
+    try { this.transport.close(failed); } catch { /* cleanup is best-effort */ }
   }
 
   private fail(): void {
     if (this.closed) return;
-    this.close();
+    this.closeInternal(true);
     try { this.options.onError?.(new Error('The KDrive viewer session ended.')); } catch { /* UI callbacks cannot prevent cleanup */ }
   }
 }

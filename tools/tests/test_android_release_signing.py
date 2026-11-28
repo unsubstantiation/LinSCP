@@ -301,11 +301,9 @@ class RepositoryConfigurationTests(unittest.TestCase):
 
     def test_the_published_apk_is_the_release_build(self):
         workflow = self.workflow()
-        self.assertIn('name: linscp-android-release', workflow)
         self.assertIn('path: android-artifacts/linscp-android-release.apk', workflow)
-        # Releases are managed by hand, so the APK is stored uncompressed in
-        # the artifact envelope GitHub always zips - compression-level: 0.
-        self.assertIn('compression-level: 0', workflow)
+        # Publish the APK itself rather than an artifact ZIP envelope.
+        self.assertIn('archive: false', workflow)
         self.assertNotIn('linscp-android-debug', workflow)
         # The release build is the one without --debug; the debug flag may only
         # appear on builds that feed a test (the DevTools smoke test, or the

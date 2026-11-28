@@ -111,6 +111,7 @@ struct InnerState {
     x2go: HashMap<u64, X2GoRegistered>,
     x2go_next_generation: u64,
     x2go_pending: std::collections::HashSet<u64>,
+    x2go_stopping: std::collections::HashSet<u64>,
     desktop_tunnels: HashMap<u64, (Option<u64>, linscp_proto::tunnel::LocalForwardRelay)>,
     next_desktop_tunnel_id: u64,
     monitors: monitor::Monitors,
@@ -155,11 +156,28 @@ impl Drop for InnerState {
 // them. It is not an authentication credential; normal API access controls apply.
 struct X2GoRegistered { generation: String, bridge: x2go_bridge::X2GoBridge }
 
+fn x2go_clipboard_opt_in(body: &Value) -> bool {
+    // The current field is authoritative even if malformed; never turn on
+    // sharing via the legacy alias when an explicit current field is present.
+    match body.get("allow_clipboard") {
+        Some(value) => value.as_bool().unwrap_or(false),
+        None => body.get("clipboard").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
 /// Clears a tab's in-progress reservation even if an open request is cancelled.
 struct X2GoOpenReservation { state: Arc<Mutex<InnerState>>, tab: u64 }
 impl Drop for X2GoOpenReservation {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() { state.x2go_pending.remove(&self.tab); }
+    }
+}
+
+// Kept by the detached shutdown task, including when its API caller cancels.
+struct X2GoStopReservation { state: Arc<Mutex<InnerState>>, tab: u64 }
+impl Drop for X2GoStopReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() { state.x2go_stopping.remove(&self.tab); }
     }
 }
 
@@ -265,6 +283,7 @@ impl CommanderService {
                 terminals: terminal_bridge::TerminalRegistry::default(),
                 x2go: HashMap::new(),
                 x2go_pending: std::collections::HashSet::new(),
+                x2go_stopping: std::collections::HashSet::new(),
                 x2go_next_generation: 0,
                 desktop_tunnels: HashMap::new(),
                 next_desktop_tunnel_id: 0,
@@ -1867,6 +1886,9 @@ impl CommanderService {
         if resume && exists {
             return api_error(400, "Verified resume requires a new local destination; choose another name or start a fresh download.");
         }
+        if is_saf_path(&local_dest.to_string_lossy()) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if exists && overwrite != "overwrite" {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Destination exists", "conflicts": [target_leaf]}) };
@@ -2183,6 +2205,9 @@ impl CommanderService {
             };
             (session, remote_root.clone(), remote_root)
         };
+        if tab.is_local && is_saf_path(&display_dest) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let mask_text = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim().to_string();
         let file_mask = if mask_text.is_empty() {
             linscp_engine::filemask::FileMask::default()
@@ -3283,6 +3308,11 @@ impl CommanderService {
                 return api_error(400, "The destination local directory does not exist.");
             }
         }
+        let saf_local_target = is_saf_path(&local_root.to_string_lossy()) && opts.mode != linscp_engine::sync_planner::SyncMode::Remote;
+        let saf_other_target = is_local_tab && is_saf_path(&remote_root_raw) && opts.mode != linscp_engine::sync_planner::SyncMode::Local;
+        if (saf_local_target || saf_other_target) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let mut excluded_paths = std::collections::BTreeSet::new();
         if let Some(raw_ex) = body.get("excluded_paths") {
             let Some(arr) = raw_ex.as_array() else {
@@ -3437,13 +3467,35 @@ impl CommanderService {
     /// Starts only on an existing authenticated tab; no host or credentials
     /// from the request can redirect the graphics connection to another host.
     async fn x2go_open(&self, body: Value) -> ApiReply {
+        // Keep the tab reservation through the entire startup, even if the
+        // requesting transport disappears. If nobody can receive a successful
+        // open, release the registered bridge using its generation.
+        let service = self.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let reply = service.x2go_open_inner(body).await;
+            if let Err(reply) = sender.send(reply) {
+                if reply.payload.get("success").and_then(Value::as_bool) == Some(true) {
+                    let cleanup = json!({"tab": reply.payload["tab"], "generation": reply.payload["generation"]});
+                    let resumed = reply.payload.get("resumed").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = service.x2go_finish(cleanup, resumed).await;
+                }
+            }
+        });
+        match receiver.await {
+            Ok(reply) => reply,
+            Err(_) => api_error(500, "X2Go startup task failed; remote state is unknown."),
+        }
+    }
+
+    async fn x2go_open_inner(&self, body: Value) -> ApiReply {
         use linscp_proto::x2go_control::{
-            resume_command, resume_guarded_agent, start_command, start_guarded_agent, X2GoDesktop, X2GoLink,
+            resume_command, resume_guarded_agent_with_clipboard, start_command, start_guarded_agent_with_clipboard, X2GoDesktop, X2GoLink,
         };
         use linscp_proto::x2go_transport::GuardedKDriveSession;
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
         let resume_session_id = body.get("resume_session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        let allow_clipboard = body.get("clipboard").and_then(Value::as_bool).unwrap_or(false);
+        let allow_clipboard = x2go_clipboard_opt_in(&body);
         let desktop = match body.get("desktop").and_then(Value::as_str) {
             Some("XFCE") => Some(X2GoDesktop::Xfce),
             Some("MATE") => Some(X2GoDesktop::Mate),
@@ -3462,7 +3514,13 @@ impl CommanderService {
         }
         let (session, ssh) = {
             let mut state = self.state.lock().expect("state mutex");
-            if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) { return api_error(409, "An X2Go viewer is already open or starting for this tab."); }
+            // An abandoned viewer may have expired and completed cleanup with
+            // nobody left to call close. Reap it only after the actor finishes;
+            // never race an in-flight suspend or terminate on the same tab.
+            if state.x2go.get(&id).is_some_and(|entry| entry.bridge.is_finished()) {
+                state.x2go.remove(&id);
+            }
+            if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) || state.x2go_stopping.contains(&id) { return api_error(409, "An X2Go viewer is already open, starting, or stopping for this tab."); }
             let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else { return api_error(400, "Not connected"); };
             let Some(session) = tab.remote.as_ref().cloned() else { return api_error(400, "Not connected"); };
             let Some(ssh) = session.ssh_connection().cloned() else { return api_error(400, "This session has no SSH connection."); };
@@ -3477,12 +3535,12 @@ impl CommanderService {
             _ => return api_error(400, "Could not check the X2Go server."),
         }
         let (agent, is_resumed) = if let Some(resume_id) = resume_session_id {
-            match resume_guarded_agent(ssh.clone(), resume_id, width, height, X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+            match resume_guarded_agent_with_clipboard(ssh.clone(), resume_id, width, height, X2GoLink::Lan, std::time::Duration::from_secs(75), allow_clipboard).await {
                 Ok(agent) => (agent, true),
                 Err(error) => return api_error(400, error.to_string()),
             }
         } else {
-            match start_guarded_agent(ssh.clone(), width, height, desktop.expect("desktop validated"), X2GoLink::Lan, std::time::Duration::from_secs(75)).await {
+            match start_guarded_agent_with_clipboard(ssh.clone(), width, height, desktop.expect("desktop validated"), X2GoLink::Lan, std::time::Duration::from_secs(75), allow_clipboard).await {
                 Ok(agent) => (agent, false),
                 Err(error) => return api_error(400, error.to_string()),
             }
@@ -3503,7 +3561,7 @@ impl CommanderService {
         let bridge = x2go_bridge::X2GoBridge::start_with_options(channel, allow_clipboard);
         let generation = match self.register_x2go_bridge(id, &ssh, bridge) {
             Ok(generation) => generation,
-            Err(bridge) => return match bridge.close().await {
+            Err(bridge) => return match if is_resumed { bridge.suspend().await } else { bridge.close().await } {
                 Ok(()) => api_error(409, "The selected SSH session changed while X2Go was starting."),
                 Err(_) => api_error(409, "The SSH session changed while X2Go was starting; agent cleanup could not be confirmed."),
             },
@@ -3632,6 +3690,10 @@ impl CommanderService {
         let Some(text) = body.get("text").and_then(Value::as_str) else {
             return api_error(400, "Clipboard text is required.");
         };
+        let selection = match body.get("selection") {
+            None => 0,
+            Some(value) => match value.as_u64() { Some(value @ 0..=1) => value as u32, _ => return api_error(400, "Invalid X2Go clipboard selection.") },
+        };
         let input = {
             let state = self.state.lock().expect("state mutex");
             match state.x2go.get(&id).filter(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
@@ -3639,43 +3701,46 @@ impl CommanderService {
                 None => return api_error(400, "X2Go viewer is not open."),
             }
         };
-        match input.write_clipboard(text).await {
+        match input.write_clipboard(selection, text).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error),
         }
     }
 
     async fn x2go_suspend(&self, body: Value) -> ApiReply {
-        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
-        let bridge = {
-            let mut state = self.state.lock().expect("state mutex");
-            if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
-                state.x2go.remove(&id).map(|entry| entry.bridge)
-            } else {
-                None
-            }
-        };
-        let Some(bridge) = bridge else {
-            return api_error(400, "X2Go viewer is not open.");
-        };
-        match bridge.suspend().await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true, "suspended": true}) },
-            Err(error) => api_error(400, error),
-        }
+        self.x2go_finish(body, true).await
     }
 
     async fn x2go_close(&self, body: Value) -> ApiReply {
+        self.x2go_finish(body, false).await
+    }
+
+    async fn x2go_finish(&self, body: Value, suspend: bool) -> ApiReply {
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
         let bridge = {
             let mut state = self.state.lock().expect("state mutex");
             if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
-                state.x2go.remove(&id).map(|entry| entry.bridge)
+                let bridge = state.x2go.remove(&id).map(|entry| entry.bridge);
+                if bridge.is_some() { state.x2go_stopping.insert(id); }
+                bridge
             } else { None }
         };
-        let Some(bridge) = bridge else { return ApiReply { status: 200, payload: json!({"success": true}) }; };
-        match bridge.close().await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, error),
+        let Some(bridge) = bridge else {
+            return if suspend { api_error(400, "X2Go viewer is not open.") }
+                else { ApiReply { status: 200, payload: json!({"success": true}) } };
+        };
+        // Serialize a replacement viewer behind remote shutdown. The detached
+        // task owns the reservation so cancellation of the API request cannot
+        // let an old suspend/terminate race a new session on the same tab.
+        let reservation = X2GoStopReservation { state: self.state.clone(), tab: id };
+        let task = tokio::spawn(async move {
+            let _reservation = reservation;
+            if suspend { bridge.suspend().await } else { bridge.close().await }
+        });
+        match task.await {
+            Ok(Ok(())) => ApiReply { status: 200, payload: json!({"success": true, "suspended": suspend}) },
+            Ok(Err(error)) => api_error(400, error),
+            Err(_) => api_error(400, "X2Go shutdown task failed; remote state is unknown."),
         }
     }
 
@@ -5042,6 +5107,11 @@ impl CommanderService {
                 return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
             }
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
+            if !upload && !tab.is_local && is_saf_path(&local.to_string_lossy()) && !resume
+                && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false)
+            {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+            }
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
                 match resolve_contained(&directory, name) { Ok(path) => path, Err(error) => return api_error(400, error) }
@@ -5050,6 +5120,9 @@ impl CommanderService {
             };
             let (source, destination) = if upload { (local.to_string_lossy().into_owned(), other.clone()) } else { (other.clone(), local.to_string_lossy().into_owned()) };
             if tab.is_local && source == destination { return api_error(400, "Source and destination are the same file"); }
+            if tab.is_local && is_saf_path(&destination) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+            }
             let size;
             let exists;
             let is_dir;
@@ -5110,6 +5183,9 @@ impl CommanderService {
             }
             if !parsed_mask.is_empty() && !parsed_mask.accepts(name, is_dir, size, src_mtime.max(0) as u64, name) {
                 continue;
+            }
+            if move_item && upload && !tab.is_local && is_saf_path(&local.to_string_lossy()) {
+                return api_error(400, "Moving from an Android granted folder to a remote session is unsupported; copy the file and delete it manually after verifying it.");
             }
             if (resume || append) && is_dir { return api_error(400, "Resume and append are supported only for individual files."); }
             if (resume || append) && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders; append is also unsupported."); }
@@ -8585,6 +8661,12 @@ impl CommanderService {
             Ok(path) => path.to_string_lossy().into_owned(),
             Err(error) => return api_error(400, error),
         };
+        if is_saf_path(&destination_dir) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
+        if !paths.is_empty() && is_saf_path(&destination_dir) {
+            return api_error(400, "Native path drops into granted folders are not supported safely; use a byte drop or copy from a local pane.");
+        }
         if !paths.is_empty() {
             // A path drop is not a byte drop: the items keep their own names.
             // Whether they can be read is decided when they are copied, and a
@@ -8757,6 +8839,9 @@ impl CommanderService {
             Ok(base) => base,
             Err(reply) => return reply,
         };
+        if is_saf_path(&base) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
+            return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
+        }
         let relative = query.get("relative_path").cloned()
             .or_else(|| body.get("relative_path").and_then(Value::as_str).map(str::to_string))
             .or_else(|| {
@@ -9264,6 +9349,18 @@ impl CommanderService {
     /// The local path a drop lands on: the panel directory, the relative
     /// sub-path a folder drop carried, and the leaf name.
     fn drop_destination(&self, base: &str, name: &str, relative: &str) -> Result<PathBuf, String> {
+        if is_saf_path(base) {
+            let mut uri = base.to_string();
+            if !relative.is_empty() {
+                let path = ops::validate_relative_subpath(relative)?;
+                for component in path.components() {
+                    let leaf = component.as_os_str().to_str().ok_or("Invalid dropped path")?;
+                    uri = resolve_contained(&uri, leaf)?;
+                }
+            }
+            if !name.is_empty() { uri = resolve_contained(&uri, &ops::validate_leaf_name(name)?)?; }
+            return Ok(PathBuf::from(uri));
+        }
         let mut target = PathBuf::from(base);
         if !relative.is_empty() {
             target.push(ops::validate_relative_subpath(relative)?);
@@ -13347,6 +13444,15 @@ mod tests {
         assert!(saved_sudo_credentials(&tab, &store).is_none());
     }
 
+    #[test]
+    fn x2go_clipboard_opt_in_uses_the_gui_field_and_defaults_off() {
+        assert!(!x2go_clipboard_opt_in(&json!({})));
+        assert!(x2go_clipboard_opt_in(&json!({"allow_clipboard": true})));
+        assert!(!x2go_clipboard_opt_in(&json!({"allow_clipboard": false, "clipboard": true})));
+        assert!(!x2go_clipboard_opt_in(&json!({"allow_clipboard": "true", "clipboard": true})));
+        assert!(x2go_clipboard_opt_in(&json!({"clipboard": true})));
+    }
+
     #[tokio::test]
     async fn x2go_open_rejects_invalid_requests_without_starting_an_agent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13410,6 +13516,58 @@ mod tests {
         assert_eq!(closed.status, 200);
         assert!(cleanup.await.is_ok());
         assert_eq!(svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=1", json!({}))).status, 400);
+    }
+
+    #[tokio::test]
+    async fn x2go_reopen_reaps_finished_abandoned_bridge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, server) = tokio::io::duplex(1024);
+        let (signal, cleanup) = tokio::sync::oneshot::channel();
+        svc.state.lock().unwrap().x2go.insert(7, X2GoRegistered {
+            generation: "1".into(), bridge: x2go_bridge::test_bridge(client, signal),
+        });
+        drop(server);
+        cleanup.await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if svc.state.lock().unwrap().x2go.get(&7).unwrap().bridge.is_finished() { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let open = ApiEnvelope { method: "POST".into(), path: "/api/x2go/open".into(), body: json!({"tab":7,"desktop":"XFCE","width":800,"height":600}) };
+        assert_eq!(svc.dispatch_async(open).await.status, 400); // no connected tab, but no stale-viewer conflict
+        assert!(!svc.state.lock().unwrap().x2go.contains_key(&7));
+    }
+
+    #[tokio::test]
+    async fn x2go_reopen_waits_for_cancelled_suspend_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, _server) = tokio::io::duplex(1024);
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        svc.state.lock().unwrap().x2go.insert(7, X2GoRegistered {
+            generation: "1".into(), bridge: x2go_bridge::test_blocked_bridge(client, started, wait),
+        });
+        let other = svc.clone();
+        let request = tokio::spawn(async move {
+            other.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/x2go/suspend".into(), body: json!({"tab":7,"generation":"1"}) }).await
+        });
+        observed.await.unwrap();
+        request.abort();
+        let _ = request.await;
+        let open = || ApiEnvelope { method: "POST".into(), path: "/api/x2go/open".into(), body: json!({"tab":7,"desktop":"XFCE","width":800,"height":600}) };
+        assert_eq!(svc.dispatch_async(open()).await.status, 409);
+        assert!(svc.state.lock().unwrap().x2go_stopping.contains(&7));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !svc.state.lock().unwrap().x2go_stopping.contains(&7) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(svc.dispatch_async(open()).await.status, 400); // no connected tab, not stuck stopping
     }
 
     #[tokio::test]
@@ -19668,11 +19826,31 @@ mod tests {
         let done = wait_for_task(&svc, "Completed").await;
         assert_eq!(done["bytes_total"], json!(13), "{}", done);
         assert_eq!(std::fs::read(right.join("note.txt")).unwrap(), b"granted bytes".to_vec());
+        // Drop requests cannot create provider documents without per-request consent.
+        for (path, mut body) in [
+            ("/api/local/drop", json!({"local_dir": SAF_GRANTED_DIR, "name": "dropped.txt", "data_base64": "ZHJvcA=="})),
+            ("/api/local/drop-dir", json!({"local_dir": SAF_GRANTED_DIR, "relative_path": "empty"})),
+        ] {
+            let request = |body| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+            let denied = svc.dispatch(request(body.clone()));
+            assert_eq!(denied.status, 409, "{}", denied.payload);
+            assert_eq!(denied.payload["saf_publication_risk"], true);
+            body["accept_saf_publication_risk"] = json!(true);
+            let accepted = svc.dispatch(request(body));
+            assert_eq!(accepted.status, 200, "{}", accepted.payload);
+        }
+        assert_eq!(bridge.bytes_of("dropped.txt").as_deref(), Some(b"drop".as_slice()));
         // Plain pane to granted pane.
         let open_plain = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
         assert_eq!(open_plain.status, 200, "{}", open_plain.payload);
         let plain_id = open_plain.payload["tab"]["id"].as_u64().unwrap();
-        let copy_back = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
+        let watch = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/keepuptodate".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "count": 1}) }).await;
+        assert_eq!(watch.status, 409, "{}", watch.payload);
+        assert_eq!(watch.payload["saf_publication_risk"], true);
+        let denied = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
+        assert_eq!(denied.status, 409, "{}", denied.payload);
+        assert_eq!(denied.payload["saf_publication_risk"], true);
+        let copy_back = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(copy_back.status, 200, "{}", copy_back.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("plain.txt").as_deref(), Some(b"plain bytes".as_slice()), "the bridge holds the copy");
@@ -19680,7 +19858,7 @@ mod tests {
         let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
         assert_eq!(open_other.status, 200, "{}", open_other.payload);
         let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
-        let copy_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": other_id, "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["note.txt"]}) }).await;
+        let copy_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": other_id, "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["note.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(copy_tree.status, 200, "{}", copy_tree.payload);
         wait_for_task(&svc, "Completed").await;
         let other_doc = format!("{SAF_OTHER_TREE}/document/note.txt");
@@ -19738,7 +19916,7 @@ mod tests {
         let open_other = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": SAF_GRANTED_DIR, "other_local_dir": SAF_OTHER_TREE}}) }).await;
         assert_eq!(open_other.status, 200, "{}", open_other.payload);
         let other_id = open_other.payload["tab"]["id"].as_u64().unwrap();
-        let moved_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": other_id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["clash.txt"]}) }).await;
+        let moved_tree = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": other_id, "direction": "upload", "local_dir": SAF_GRANTED_DIR, "remote_dir": SAF_OTHER_TREE, "names": ["clash.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(moved_tree.status, 200, "{}", moved_tree.payload);
         wait_for_task(&svc, "Completed").await;
         let other_doc = format!("{SAF_OTHER_TREE}/document/clash.txt");
@@ -19756,7 +19934,7 @@ mod tests {
             assert_eq!(link.status, 200, "{}", link.payload);
             let open_parent = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": tmp, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
             let parent_id = open_parent.payload["tab"]["id"].as_u64().unwrap();
-            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"]}) }).await;
+            let moved_dir = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": parent_id, "direction": "upload", "local_dir": tmp, "remote_dir": SAF_GRANTED_DIR, "names": ["linked"], "accept_saf_publication_risk": true}) }).await;
             assert_eq!(moved_dir.status, 200, "{}", moved_dir.payload);
             let failed = wait_for_task(&svc, "Failed").await;
             assert!(failed["error"].as_str().unwrap_or("").contains("symbolic link"), "{}", failed);
@@ -19787,6 +19965,7 @@ mod tests {
         lost: Mutex<bool>,
         scheme_override: Mutex<Option<ProtocolScheme>>,
         copy_unsupported: Mutex<bool>,
+        mutate_local_after_upload: Mutex<Option<PathBuf>>,
         fail_remove: Mutex<Option<String>>,
         listing_injection: Mutex<Option<(String, String)>>,
         reported_sizes: Mutex<HashMap<String, u64>>,
@@ -19808,6 +19987,7 @@ mod tests {
                 lost: Mutex::new(false),
                 scheme_override: Mutex::new(None),
                 copy_unsupported: Mutex::new(false),
+                mutate_local_after_upload: Mutex::new(None),
                 fail_remove: Mutex::new(None),
                 listing_injection: Mutex::new(None),
                 reported_sizes: Mutex::new(HashMap::new()),
@@ -19901,6 +20081,9 @@ mod tests {
                 self.modes.lock().expect("m").insert(path.to_string(), mode);
             }
             self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
+            if let Some(local) = self.mutate_local_after_upload.lock().expect("m").take() {
+                std::fs::write(local, b"changed while uploading").expect("mutate local fixture");
+            }
             if let Some(report) = progress { report(sent, sent); }
             Ok(sent)
         }
@@ -20121,6 +20304,13 @@ mod tests {
                 .expect("m")
                 .remove(&(remote_path.to_string(), name.to_string()));
             Ok(())
+        }
+
+        async fn s3_stat_version(&self, remote_path: &str, version_id: &str) -> Result<Option<FileEntry>, ProtoError> {
+            let versions = self.s3_versions.lock().expect("m");
+            Ok(versions.get(&(remote_path.to_string(), version_id.to_string())).map(|bytes| {
+                Self::entry_for(remote_path, &MockRemoteDoc { bytes: bytes.clone(), is_dir: false, mtime: 0 })
+            }))
         }
 
         async fn s3_restore_version(
@@ -20510,7 +20700,12 @@ mod tests {
         session.add_file("/huge.bin", &big);
         let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
         let stages_before = saf_stage_names();
-        let download = |body: Value| ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body };
+        let unapproved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body: download_body(id, "down.txt", false, false) }).await;
+        assert_eq!(unapproved.status, 409, "{}", unapproved.payload);
+        assert_eq!(unapproved.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert!(bridge.bytes_of("down.txt").is_none());
+        let download = |mut body: Value| { body["accept_saf_publication_risk"] = json!(true); ApiEnvelope { method: "POST".into(), path: "/api/transfer/download".into(), body } };
         // A file lands across the bridge.
         let queued = svc.dispatch_async(download(download_body(id, "down.txt", false, false))).await;
         assert_eq!(queued.status, 200, "{}", queued.payload);
@@ -20556,6 +20751,29 @@ mod tests {
     /// A WebDAV move into a granted folder stages the download, publishes
     /// across the bridge, then deletes the remote source by ETag.
     #[tokio::test]
+    async fn saf_s3_version_download_requires_publication_risk_consent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("seed.txt", b"seed"));
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
+        let session = Arc::new(MockSession::new());
+        session.set_scheme(ProtocolScheme::S3);
+        session.s3_versions.lock().unwrap().insert(("/version.txt".into(), "v1".into()), b"version bytes".to_vec());
+        session.add_file("/version.txt", b"version bytes");
+        let id = insert_remote_tab(&svc, session, SAF_GRANTED_DIR);
+        let mut body = json!({"tab": id, "name": "version.txt", "version_id": "v1", "local_dir": SAF_GRANTED_DIR});
+        let request = |body| ApiEnvelope { method: "POST".into(), path: "/api/s3/version-download".into(), body };
+        let rejected = svc.dispatch_async(request(body.clone())).await;
+        assert_eq!(rejected.status, 409, "{}", rejected.payload);
+        assert_eq!(rejected.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        body["accept_saf_publication_risk"] = json!(true);
+        let accepted = svc.dispatch_async(request(body)).await;
+        assert_eq!(accepted.status, 200, "{}", accepted.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(bridge.bytes_of("version.txt").unwrap(), b"version bytes");
+    }
+
+    #[tokio::test]
     async fn saf_webdav_move_to_granted_folder_deletes_remote_source() {
         let _leak_lock = SAF_STAGE_LEAK_LOCK.lock().expect("saf stage lock");
         let tmp = std::env::temp_dir().join(format!("linscp-saf-move-{}", std::process::id()));
@@ -20566,7 +20784,12 @@ mod tests {
         let session = Arc::new(MockSession::new());
         session.add_file("/gone.txt", b"moving down");
         let id = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
-        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"]}) }).await;
+        let refused = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"]}) }).await;
+        assert_eq!(refused.status, 409, "{}", refused.payload);
+        assert_eq!(refused.payload["saf_publication_risk"], true);
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert!(session.stat("/gone.txt").await.unwrap().is_some());
+        let moved = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(), body: json!({"tab": id, "direction": "download", "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "names": ["gone.txt"], "accept_saf_publication_risk": true}) }).await;
         assert_eq!(moved.status, 200, "{}", moved.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("gone.txt").as_deref(), Some(b"moving down".as_slice()), "the granted folder holds the move");
@@ -20644,7 +20867,10 @@ mod tests {
         assert!(items.iter().any(|i| i["action"] == "unchanged" && i["path"] == "same.txt"), "{}", planned.payload);
         assert!(!items.iter().any(|i| i["path"] == "up.txt"), "no delete, no action: {}", planned.payload);
         // A run with delete downloads and removes.
-        let run = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true}) }).await;
+        let denied = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true}) }).await;
+        assert_eq!(denied.status, 409, "{}", denied.payload);
+        assert_eq!(denied.payload["saf_publication_risk"], true);
+        let run = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/run".into(), body: json!({"tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "local", "delete": true, "accept_saf_publication_risk": true}) }).await;
         assert_eq!(run.status, 200, "{}", run.payload);
         wait_for_task(&svc, "Completed").await;
         assert_eq!(bridge.bytes_of("down.txt").as_deref(), Some(b"download me".as_slice()), "the granted folder holds the download");
@@ -21906,6 +22132,88 @@ mod tests {
         assert!(saved_path.is_file());
         let export_dir_mode_after = gui_os::stat_extended(&export_dir).unwrap().mode & 0o777;
         assert_eq!(export_dir_mode_after, export_dir_mode_before);
+    }
+
+    #[tokio::test]
+    async fn granted_folder_move_upload_api_refuses_before_queueing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("source.txt", b"source"));
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
+        let session = Arc::new(MockSession::new());
+        let tab = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let response = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(),
+            body: json!({"tab": tab, "direction": "upload", "local_dir": SAF_GRANTED_DIR,
+                "remote_dir": "/", "names": ["source.txt"]}) }).await;
+        assert_eq!(response.status, 400, "{}", response.payload);
+        assert!(response.payload["error"].as_str().unwrap_or("").contains("granted folder"));
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert_eq!(bridge.bytes_of("source.txt").unwrap(), b"source");
+        assert!(session.bytes_of("/source.txt").is_none());
+    }
+
+    #[tokio::test]
+    async fn granted_folder_move_upload_refuses_before_remote_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = svc.queue.enqueue(None, "upload", "move".into(),
+            "content://fixture/tree/file".into(), "/file".into(), 1, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: PathBuf::from("content://fixture/tree/file"),
+                remote_dest: "/file".into(), allow_overwrite: false, delete_source: true,
+                cleanup_path: None, flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        for _ in 0..100 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (tasks, _) = svc.queue.snapshot();
+        let task = tasks.iter().find(|task| task["id"].as_u64() == Some(id)).unwrap();
+        assert_eq!(task["status"], "Failed", "{task}");
+        assert!(task["error"].as_str().unwrap_or("").contains("granted folder"), "{task}");
+        assert!(session.bytes_of("/file").is_none());
+    }
+
+    #[tokio::test]
+    async fn move_upload_keeps_a_source_changed_during_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        std::fs::write(&source, b"original").unwrap();
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        *session.mutate_local_after_upload.lock().unwrap() = Some(source.clone());
+        let id = svc.queue.enqueue(None, "upload", "move".into(),
+            source.to_string_lossy().into_owned(), "/source.txt".into(), 8, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: source.clone(), remote_dest: "/source.txt".into(),
+                allow_overwrite: false, delete_source: true, cleanup_path: None,
+                flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        for _ in 0..100 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (tasks, _) = svc.queue.snapshot();
+        let task = tasks.iter().find(|task| task["id"].as_u64() == Some(id)).unwrap();
+        assert_eq!(task["status"], "Failed", "{task}");
+        assert!(task["error"].as_str().unwrap_or("").contains("local source changed"), "{task}");
+        assert_eq!(std::fs::read(&source).unwrap(), b"changed while uploading");
+        assert_eq!(session.bytes_of("/source.txt").unwrap(), b"original");
+
+        // A stable source is still moved, rather than merely copied.
+        let stable = tmp.path().join("stable.txt");
+        std::fs::write(&stable, b"stable").unwrap();
+        svc.queue.enqueue(None, "upload", "stable move".into(),
+            stable.to_string_lossy().into_owned(), "/stable.txt".into(), 6, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: stable.clone(), remote_dest: "/stable.txt".into(),
+                allow_overwrite: false, delete_source: true, cleanup_path: None,
+                flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        let completed = wait_for_task(&svc, "Completed").await;
+        assert_eq!(completed["status"], "Completed");
+        assert!(!stable.exists());
+        assert_eq!(session.bytes_of("/stable.txt").unwrap(), b"stable");
     }
 
     #[tokio::test]

@@ -65,13 +65,18 @@ impl X2GoLink {
 /// desktop value is used in the session ID; the actual desktop is started
 /// separately after the graphics connection is ready.
 pub fn start_command(width: u16, height: u16, desktop: X2GoDesktop, link: X2GoLink) -> Result<String, &'static str> {
+    start_command_with_clipboard(width, height, desktop, link, false)
+}
+
+/// Clipboard is enabled server-side only after an explicit per-viewer opt-in.
+pub fn start_command_with_clipboard(width: u16, height: u16, desktop: X2GoDesktop, link: X2GoLink, allow_clipboard: bool) -> Result<String, &'static str> {
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION ||
         u32::from(width) * u32::from(height) > MAX_PIXELS {
         return Err("Invalid X2Go desktop dimensions.");
     }
     Ok(format!(
-        "x2gostartagent {width}x{height} {} 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K {} none",
-        link.argument(), desktop.argument()
+        "x2gostartagent {width}x{height} {} 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K {} {}",
+        link.argument(), desktop.argument(), if allow_clipboard { "both" } else { "none" }
     ))
 }
 
@@ -91,6 +96,9 @@ pub struct X2GoStartedSession {
 impl X2GoStartedSession {
     /// The eventual graphics handshake needs this secret; never log it.
     pub fn cookie(&self) -> &str { &self.cookie }
+
+    /// Validated X11 display number assigned by the server.
+    pub fn display(&self) -> u16 { self.display }
 
     /// Server-assigned session ID, validated for use as a shell argument.
     pub fn session_id(&self) -> &str { &self.session_id }
@@ -142,103 +150,100 @@ pub fn validate_session_id(session_id: &str) -> Result<&str, &'static str> {
 
 /// Builds a validated `x2goresume-session` command without arbitrary shell input.
 pub fn resume_command(session_id: &str, width: u16, height: u16, link: X2GoLink) -> Result<String, &'static str> {
+    resume_command_with_clipboard(session_id, width, height, link, false)
+}
+
+pub fn resume_command_with_clipboard(session_id: &str, width: u16, height: u16, link: X2GoLink, allow_clipboard: bool) -> Result<String, &'static str> {
     let id = validate_session_id(session_id)?;
     if width == 0 || height == 0 || width > MAX_DIMENSION || height > MAX_DIMENSION ||
         u32::from(width) * u32::from(height) > MAX_PIXELS {
         return Err("Invalid X2Go desktop dimensions.");
     }
-    Ok(format!("x2goresume-session {id} {width}x{height} {} 16m-jpeg-9 us pc105/us 0 none", link.argument()))
+    Ok(format!("x2goresume-session {id} {width}x{height} {} 16m-jpeg-9 us pc105/us 0 {}", link.argument(), if allow_clipboard { "both" } else { "none" }))
 }
 
 impl Drop for X2GoStartedSession {
     fn drop(&mut self) { self.cookie.zeroize(); }
 }
 
-/// Owns an already-started, validated agent. Releasing the guard triggers a
-/// single bounded termination attempt over the same authenticated SSH session.
-/// This does not start an agent and must be created immediately after a valid
-/// startup response, before graphics setup. Explicit `close` reports cleanup
-/// failure; dropping schedules best-effort cleanup without blocking.
-///
-/// Runtime shutdown, process termination, broken SSH, and malformed or missing
-/// startup replies can still leave remote agents behind. The caller must expose
-/// cleanup failures and must not claim that Drop guarantees remote termination.
+/// Action requested from the independently running lifecycle task.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AgentCleanup { Terminate, Suspend }
+
+/// Owns a validated agent. An abandoned newly started agent is terminated;
+/// an abandoned resumed session is suspended to avoid destroying its desktop.
+/// Remote state is still unknown if SSH fails, times out, or the runtime exits.
 pub struct X2GoAgentGuard {
     session: X2GoStartedSession,
     ssh: Option<Arc<SshConnection>>,
-    release: Option<tokio::sync::oneshot::Sender<bool>>,
+    release: Option<tokio::sync::oneshot::Sender<AgentCleanup>>,
     cleanup: Option<tokio::task::JoinHandle<Result<(), ProtoError>>>,
+    on_drop: AgentCleanup,
 }
 
 impl X2GoAgentGuard {
-    /// The handle must be the runtime that owns the SSH connection, and it must
-    /// remain running until cleanup finishes. The connection must be the same
-    /// destination on which the agent was started, never a new direct session.
+    /// Use the same authenticated destination connection that started the agent.
     pub fn new(runtime: &tokio::runtime::Handle, ssh: Arc<SshConnection>, session: X2GoStartedSession) -> Self {
-        let command = session.terminate_command();
+        Self::with_connection(runtime, ssh, session, AgentCleanup::Terminate)
+    }
+
+    fn resumed(runtime: &tokio::runtime::Handle, ssh: Arc<SshConnection>, session: X2GoStartedSession) -> Self {
+        Self::with_connection(runtime, ssh, session, AgentCleanup::Suspend)
+    }
+
+    fn with_connection(runtime: &tokio::runtime::Handle, ssh: Arc<SshConnection>, session: X2GoStartedSession, on_drop: AgentCleanup) -> Self {
+        let terminate = session.terminate_command();
+        let suspend = session.suspend_command();
         let connection = Arc::clone(&ssh);
-        let cleanup = async move {
+        let mut guard = Self::with_actions(runtime, session, on_drop, move |action| async move {
+            let (command, failure) = match action {
+                AgentCleanup::Terminate => (terminate, "Could not terminate the X2Go agent."),
+                AgentCleanup::Suspend => (suspend, "Could not suspend the X2Go session."),
+            };
             let output = ssh.exec_command_bounded(&command, Duration::from_secs(10), 8192).await?;
-            if output.exit_code != Some(0) {
-                return Err(ProtoError::Transport("Could not terminate the X2Go agent.".into()));
-            }
+            if output.exit_code != Some(0) { return Err(ProtoError::Transport(failure.into())); }
             Ok(())
-        };
-        let mut guard = Self::with_cleanup(runtime, session, cleanup);
+        });
         guard.ssh = Some(connection);
         guard
     }
 
-    fn with_cleanup<F>(runtime: &tokio::runtime::Handle, session: X2GoStartedSession, cleanup: F) -> Self
-    where F: Future<Output = Result<(), ProtoError>> + Send + 'static {
+    fn with_actions<C, F>(runtime: &tokio::runtime::Handle, session: X2GoStartedSession, on_drop: AgentCleanup, cleanup: C) -> Self
+    where C: FnOnce(AgentCleanup) -> F + Send + 'static,
+          F: Future<Output = Result<(), ProtoError>> + Send + 'static {
         let (release, wait) = tokio::sync::oneshot::channel();
-        let task = runtime.spawn(async move {
-            // Either `send(true)` or dropping the sender runs termination;
-            // `send(false)` disarms termination so explicit suspend can run.
-            if matches!(wait.await, Ok(false)) {
-                return Ok(());
-            }
-            cleanup.await
-        });
-        Self { session, ssh: None, release: Some(release), cleanup: Some(task) }
+        let task = runtime.spawn(async move { cleanup(wait.await.unwrap_or(on_drop)).await });
+        Self { session, ssh: None, release: Some(release), cleanup: Some(task), on_drop }
     }
 
-    /// The graphics handshake needs the cookie, but it must never leave the
-    /// authenticated channel or be written to logs, IPC, or process arguments.
+    #[cfg(test)]
+    fn with_cleanup<F>(runtime: &tokio::runtime::Handle, session: X2GoStartedSession, cleanup: F) -> Self
+    where F: Future<Output = Result<(), ProtoError>> + Send + 'static {
+        Self::with_actions(runtime, session, AgentCleanup::Terminate, move |_| cleanup)
+    }
+
+    /// The graphics cookie must not be written to logs, IPC, or process arguments.
     pub fn session(&self) -> &X2GoStartedSession { &self.session }
-
     pub(crate) fn connection(&self) -> Option<&Arc<SshConnection>> { self.ssh.as_ref() }
+    /// A resumed desktop should be suspended, not terminated, on unexpected loss.
+    pub fn preserves_session_on_failure(&self) -> bool { self.on_drop == AgentCleanup::Suspend }
 
-    /// Trigger cleanup and wait for its result. If this future is cancelled the
-    /// detached cleanup task continues while the runtime is still running.
-    pub async fn close(mut self) -> Result<(), ProtoError> {
-        if let Some(release) = self.release.take() { let _ = release.send(true); }
+    async fn finish(mut self, action: AgentCleanup) -> Result<(), ProtoError> {
+        if let Some(release) = self.release.take() { let _ = release.send(action); }
         let Some(task) = self.cleanup.take() else {
             return Err(ProtoError::Transport("X2Go cleanup is unavailable.".into()));
         };
-        match task.await {
-            Ok(result) => result,
-            Err(_) => Err(ProtoError::Transport("X2Go cleanup task failed.".into())),
-        }
+        task.await.map_err(|_| ProtoError::Transport("X2Go cleanup task failed.".into()))?
     }
 
-    /// Disarm automatic termination and explicitly suspend the remote session
-    /// so it can be resumed later.
-    pub async fn suspend(mut self) -> Result<(), ProtoError> {
-        let ssh = self.ssh.take();
-        if let Some(release) = self.release.take() { let _ = release.send(false); }
-        if let Some(task) = self.cleanup.take() {
-            let _ = task.await;
-        }
-        let Some(ssh) = ssh else {
-            return Err(ProtoError::Transport("Missing X2Go SSH connection for suspend.".into()));
-        };
-        let command = self.session.suspend_command();
-        let output = ssh.exec_command_bounded(&command, Duration::from_secs(10), 8192).await?;
-        if output.exit_code != Some(0) {
-            return Err(ProtoError::Transport("Could not suspend the X2Go session.".into()));
-        }
-        Ok(())
+    /// Explicit termination continues in the background if the caller is cancelled.
+    pub async fn close(self) -> Result<(), ProtoError> { self.finish(AgentCleanup::Terminate).await }
+    /// Explicit suspension also continues if the caller is cancelled.
+    pub async fn suspend(self) -> Result<(), ProtoError> { self.finish(AgentCleanup::Suspend).await }
+    /// Release after a failed setup without destroying a resumed desktop.
+    pub async fn cleanup_after_failure(self) -> Result<(), ProtoError> {
+        let action = self.on_drop;
+        self.finish(action).await
     }
 }
 
@@ -256,7 +261,14 @@ pub async fn start_guarded_agent(
     ssh: Arc<SshConnection>, width: u16, height: u16, desktop: X2GoDesktop,
     link: X2GoLink, timeout: Duration,
 ) -> Result<X2GoAgentGuard, ProtoError> {
-    let command = start_command(width, height, desktop, link)
+    start_guarded_agent_with_clipboard(ssh, width, height, desktop, link, timeout, false).await
+}
+
+pub async fn start_guarded_agent_with_clipboard(
+    ssh: Arc<SshConnection>, width: u16, height: u16, desktop: X2GoDesktop,
+    link: X2GoLink, timeout: Duration, allow_clipboard: bool,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = start_command_with_clipboard(width, height, desktop, link, allow_clipboard)
         .map_err(|_| ProtoError::Transport("Invalid X2Go startup parameters.".into()))?;
     if timeout.is_zero() || timeout > Duration::from_secs(120) {
         return Err(ProtoError::Transport("Invalid X2Go startup timeout.".into()));
@@ -498,7 +510,14 @@ pub async fn resume_guarded_agent(
     link: X2GoLink,
     timeout: Duration,
 ) -> Result<X2GoAgentGuard, ProtoError> {
-    let command = resume_command(session_id, width, height, link)
+    resume_guarded_agent_with_clipboard(ssh, session_id, width, height, link, timeout, false).await
+}
+
+pub async fn resume_guarded_agent_with_clipboard(
+    ssh: Arc<SshConnection>, session_id: &str, width: u16, height: u16,
+    link: X2GoLink, timeout: Duration, allow_clipboard: bool,
+) -> Result<X2GoAgentGuard, ProtoError> {
+    let command = resume_command_with_clipboard(session_id, width, height, link, allow_clipboard)
         .map_err(|msg| ProtoError::Transport(msg.into()))?;
     let target_id = session_id.to_string();
     if timeout.is_zero() || timeout > Duration::from_secs(120) {
@@ -514,22 +533,33 @@ pub async fn resume_guarded_agent(
         let _list_stderr = Zeroizing::new(list_out.stderr);
         let entries = parse_listed_sessions_with_secrets(&list_stdout, list_out.exit_code)
             .map_err(|msg| ProtoError::Transport(msg.into()))?;
-        let Some((listed, mut session)) = entries.into_iter().find(|(l, _)| l.session_id == target_id) else {
+        let Some((listed, session)) = entries.into_iter().find(|(l, _)| l.session_id == target_id) else {
             return Err(ProtoError::Transport("The selected X2Go session no longer exists.".into()));
         };
         if listed.status != "S" {
             return Err(ProtoError::Transport("Only suspended X2Go sessions can be resumed.".into()));
         }
-        let resume_out = ssh.exec_command_bounded(&command, timeout, MAX_REPLY_BYTES).await
-            .map_err(|_| ProtoError::Transport("X2Go session resume failed.".into()))?;
-        let resume_stdout = Zeroizing::new(resume_out.stdout);
-        let _resume_stderr = Zeroizing::new(resume_out.stderr);
-        if resume_out.exit_code != Some(0) {
-            return Err(ProtoError::Transport("X2Go session resume did not succeed.".into()));
+        // Once resume is attempted, even a timeout or malformed reply may mean
+        // the server resumed the desktop. Hold a suspend-on-drop guard first.
+        let mut guard = X2GoAgentGuard::resumed(&task_runtime, ssh.clone(), session);
+        let outcome = async {
+            let output = ssh.exec_command_bounded(&command, timeout, MAX_REPLY_BYTES).await
+                .map_err(|_| "X2Go session resume failed.")?;
+            let stdout = Zeroizing::new(output.stdout);
+            let _stderr = Zeroizing::new(output.stderr);
+            if output.exit_code != Some(0) { return Err("X2Go session resume did not succeed."); }
+            apply_resume_port_overrides(&mut guard.session, &stdout)?;
+            Ok(())
+        }.await;
+        if let Err(error) = outcome {
+            let suffix = if guard.cleanup_after_failure().await.is_ok() {
+                "Suspension was requested; verify the session state on the server."
+            } else {
+                "Suspension could not be confirmed; verify the session state on the server."
+            };
+            return Err(ProtoError::Transport(format!("{error} {suffix}")));
         }
-        apply_resume_port_overrides(&mut session, &resume_stdout)
-            .map_err(|msg| ProtoError::Transport(msg.into()))?;
-        Ok(X2GoAgentGuard::new(&task_runtime, ssh, session))
+        Ok(guard)
     }).await
 }
 
@@ -625,6 +655,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resumed_guard_suspends_on_drop_and_setup_failure_but_close_terminates() {
+        for operation in 0..3 {
+            let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+            let (signal, observed) = tokio::sync::oneshot::channel();
+            let guard = X2GoAgentGuard::with_actions(&tokio::runtime::Handle::current(), session, AgentCleanup::Suspend, move |action| async move {
+                let _ = signal.send(action);
+                Ok(())
+            });
+            match operation {
+                0 => drop(guard),
+                1 => assert!(crate::x2go_transport::GuardedKDriveSession::attach(guard, 800, 600, Duration::from_secs(1)).await.is_err()),
+                _ => assert!(guard.close().await.is_ok()),
+            }
+            let action = tokio::time::timeout(Duration::from_secs(1), observed).await.unwrap().unwrap();
+            assert_eq!(action, if operation == 2 { AgentCleanup::Terminate } else { AgentCleanup::Suspend });
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_explicit_suspend_does_not_abort_cleanup() {
+        let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let guard = X2GoAgentGuard::with_actions(&tokio::runtime::Handle::current(), session, AgentCleanup::Terminate, move |action| async move {
+            let _ = started_tx.send(action);
+            let _ = finish_rx.await;
+            let _ = done_tx.send(());
+            Ok(())
+        });
+        let suspend = tokio::spawn(guard.suspend());
+        assert_eq!(started_rx.await.unwrap(), AgentCleanup::Suspend);
+        suspend.abort();
+        let _ = suspend.await;
+        finish_tx.send(()).unwrap();
+        assert!(tokio::time::timeout(Duration::from_secs(1), done_rx).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
     async fn failed_graphics_attachment_waits_for_agent_cleanup() {
         let session = parse_start_reply(reply("alice-50-test").as_bytes(), Some(0)).unwrap();
         let (signal, observed) = tokio::sync::oneshot::channel();
@@ -650,6 +719,9 @@ mod tests {
     fn startup_command_is_bounded_and_uses_only_known_arguments() {
         assert_eq!(start_command(1280, 720, X2GoDesktop::Mate, X2GoLink::Adsl).unwrap(),
             "x2gostartagent 1280x720 adsl 16m-jpeg-9 unix-kde-depth_24 us pc105/us 0 K MATE none");
+        assert!(start_command_with_clipboard(800, 600, X2GoDesktop::Xfce, X2GoLink::Lan, true).unwrap().ends_with(" XFCE both"));
+        assert!(resume_command_with_clipboard("alice-50-test", 800, 600, X2GoLink::Lan, true).unwrap().ends_with(" 0 both"));
+        assert!(resume_command_with_clipboard("alice-50-test", 800, 600, X2GoLink::Lan, false).unwrap().ends_with(" 0 none"));
         assert!(start_command(0, 10, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());
         assert!(start_command(8193, 1, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());
         assert!(start_command(8192, 8192, X2GoDesktop::Xfce, X2GoLink::Lan).is_err());

@@ -40,7 +40,34 @@ moves require confirmation, use an ETag-pinned download and exclusive upload,
 and are not transactional. Cross-server directory moves and S3-source moves
 are unsupported. Local moves require a new destination on the same filesystem.
 
+## Android granted-folder publication
+
+The provider bridge checks for an existing destination before writing, but the
+check and write are **not atomic**. A document created or replaced concurrently
+can be overwritten even when a no-overwrite operation was requested. Provider
+writes can also leave partial documents on interruption. Avoid concurrent
+writers and do not rely on no-clobber guarantees in granted folders. Remote
+session downloads and moves, S3 version downloads, local-pane copies and moves,
+desktop drops, synchronization runs and local-to-local keep-up-to-date jobs
+require explicit per-request acknowledgement when they can publish into a granted
+folder. Native path drops into a granted folder are refused; use byte drops or
+copy from a local pane instead. This does not make publication atomic, and other provider operations
+such as editor saves are not covered by this transfer confirmation. Verified
+resume remains refused until checkpointing and publication have an adequate
+provider-specific safety contract.
+
 ## Uploads and overwrite
+
+A local-to-remote file move uploads first, then checks the local source's
+metadata before deleting it. A detected change or replacement leaves the source
+in place and reports an incomplete move. This is best effort, not atomic:
+metadata can miss changes, and the pathname can change between the check and
+deletion. Use trusted directories and avoid concurrent local writers. Moves
+from Android granted folders to remote sessions are refused because the provider
+bridge does not offer conditional deletion; copy and verify before manually
+deleting the source. A remote-to-local move checks cancellation before attempting
+source deletion, but cancellation during an already-started delete cannot
+reverse it.
 
 - No-overwrite SFTP, WebDAV and S3 uploads use exclusive creation. S3 uploads
   using conditional publication are limited to 1 GiB. Queued WebDAV/S3
@@ -72,3 +99,6 @@ are unsupported. Local moves require a new destination on the same filesystem.
 Loopback fixture tests cover selected SFTP, WebDAV, FTP/FTPS and S3 operations;
 they do not certify all third-party servers. See the
 [final parity review](final-parity-review.md) for evidence and remaining gaps.
+
+Linux and Windows host regressions for changed-source detection, a stable move,
+and granted-folder move refusal passed in [CI run 46131197417](https://github.com/unsubstantiation/LinSCP/actions/runs/46131197417). They use a mock remote session and provider; they do not establish real-server or Android-device behavior.

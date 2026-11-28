@@ -6,9 +6,7 @@ starts a new agent or resumes an existing session, opens its graphics channel,
 renders frames and server cursors, supports live window resizing (`resize`),
 optional text clipboard sync (`Selection` / `DemandSelection` / `write_selection`),
 explicit session suspend (`x2gosuspend-session`) or termination (`x2goterminate-session`),
-and forwards keyboard/pointer input through a service bridge. Live-server validation
-across diverse KDrive deployments remains required before removing the experimental
-designation. NX3 and the former external NX launch path are not supported; a KDrive
+and forwards keyboard/pointer input through a service bridge. A disposable Ubuntu 24.04 KDrive server has exercised startup, main-frame parsing, keyboard input, suspend, resume and termination through SSH; diverse servers and end-to-end WebView rendering remain unverified before removing the experimental designation. NX3 and the former external NX launch path are not supported; a KDrive
 server backend is required. Sound and X2Go server-side folder sharing are not
 implemented.
 
@@ -57,16 +55,21 @@ clipboard (`write_selection`) packets, tracks live wire frame-cache IDs and
 evictions via `WireFrameTracker` + `FrameCache::apply_deleted_frames` (failing
 closed on unknown cached frame references), preserves output order, applies
 bounded backpressure, and supports explicit session suspend (`x2gosuspend-session`)
-or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. The service
+or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. A deliberately closed viewer terminates its remote session; use Suspend to preserve it. On unexpected failure, newly started agents are terminated and resumed sessions are suspended, to avoid discarding an existing desktop. The service
 can associate a bridge with the exact connected SSH tab and exposes nonblocking
 poll, input, and close routes. Closing or reconnecting a tab releases its bridge;
-an abandoned viewer lease expires after 60 seconds. The experimental X2Go
+an abandoned viewer lease expires after 60 seconds. Explicit suspend keeps the
+output receiver alive until the actor processes the suspend command, even when
+the output queue is full or the requesting API future is cancelled. It reports
+an error rather than claiming suspension when the bridge already terminated.
+A tab remains reserved while explicit shutdown runs, even if the API caller is cancelled, so a replacement viewer cannot race the old cleanup. After an abandoned bridge has finished its cleanup attempt, the next open reaps its stale registration. Startup also retains its reservation after API cancellation; if its successful reply cannot be delivered, the service attempts cleanup. A reply lost after delivery is still governed by the viewer lease. These measures only protect local lifecycle ordering; a broken SSH connection or
+server-side failure can still leave the remote session's state unknown. The experimental X2Go
 open route registers that bridge and the page polls it, forwards input, and
 requests close. Poll, input and close carry a service-issued generation so
 delayed requests from an earlier viewer cannot operate on a replacement bridge.
 This generation is not an authentication credential. The bridge sends protocol keepalives and closes on prolonged server silence
-while it is able to read. The corresponding modules passed isolated tests with stubbed SSH; the complete
-Rust workspace has not been built or tested here.
+while it is able to read. Linux and Windows CI run the service's X2Go-focused
+unit tests; they use synthetic graphics streams and do not establish live-server compatibility.
 
 Wire-layout facts were researched from the public GPL-3.0
 [Casement KDrive client](https://github.com/Inkbraid/casement-plugin-x2go)
@@ -135,8 +138,8 @@ bounds parsed incoming messages, enables input only after a main image, and
 closes on overflow, decode errors or disconnect. A supplied transport must write
 packets, request a new main image on reinitialization, and arrange remote agent
 cleanup; the reader delivers messages and uses a heuristic to identify barrier replies.
-Tests exercise this wiring with a simulated transport and WebView. The page
-uses `/api/x2go/open`, poll, input and close; it has not been tested against an
+The page connects the opted-in text clipboard callbacks to native clipboard APIs, falling back to WebView clipboard access where available; malformed or interleaved selection chunks are discarded, and selection-demand replies preserve the requested selection (0 or 1). Server start and resume commands request clipboard mode `both` only when this viewer opts in, otherwise `none`. Clipboard permissions, provider behavior and actual protocol interoperability remain platform-dependent. Tests exercise this wiring with a simulated transport and WebView. The page
+uses `/api/x2go/open`, poll, input and close; this page path has not been tested against an
 actual X2Go server. Generic desktop launch/ticket requests still reject X2Go.
 
 `DesktopInput` captures keyboard, mouse buttons, motion and wheel events on the
@@ -232,13 +235,11 @@ the reply and immediately creates a cleanup guard. A cancelled caller leaves
 startup running so the resulting guard can attempt cleanup. A guarded graphics
 session can also launch a fixed XFCE, MATE or LXDE command after negotiation;
 the background command's exit status does not prove the desktop started.
-The guard attempts bounded termination over the same SSH connection on close,
-setup failure, or drop. Cleanup on drop is best-effort: runtime shutdown,
+The guard attempts bounded termination over the same SSH connection on explicit close. For a resumed session it instead attempts suspension on setup failure, a lost viewer, or guard drop; a guard is created before issuing the resume command so even an ambiguous reply triggers an attempt. A newly started agent is terminated on failure. These operations continue when their caller is cancelled, but are not durable. Cleanup on drop is best-effort: runtime shutdown,
 process termination, a broken SSH connection, or an invalid/lost startup reply
 can still leave an agent behind. The cookie is redacted in debug output and
 zeroized when the parsed session is dropped. These primitives are wired into
-the service; their tests passed in an isolated harness with stubbed SSH and
-zeroization, but the complete Rust application has not been compiled here.
+the service and tested with synthetic responses, not live servers.
 Startup replies and command behavior still need verification against live X2Go
 servers.
 
@@ -248,18 +249,29 @@ connection. The caller must use the same destination connection that created
 the agent; it never falls back to direct TCP. The handshake and wire decoder
 are connected to the experimental viewer through the service bridge.
 Opening or dropping the stream does not start or terminate an agent. The SSH
-mock integration tests are included but have not been run in this environment;
-they use an echo server, not X2Go.
+mock integration tests use an echo server, not X2Go.
 
 ## Still required for a verified viewer
 
-- Compile and run Rust tests and verify startup, rendering, input, and cleanup
-  against actual KDrive servers on supported client platforms.
+- Extend live KDrive testing beyond the Ubuntu 24.04 loopback fixture to real remote deployments and supported client platforms, including end-to-end WebView rendering, input, cleanup and failure recovery.
 - Verify compatibility of server versions, frame and cursor semantics, keyboard
   barriers, and WebView image decoding. The one-pixel barrier has no request ID
   and can be confused with an unsolicited update.
 - Add robust recovery for failed startup replies, lifecycle failures and
   reconnects; cleanup remains best-effort after timeouts or lost SSH.
-- Support a resizable separate desktop window, resizing, cursor, clipboard,
-  optional sound, and session resume as distinct features. None is promised by
-  this experimental fixed-size in-page viewer.
+- Validate the implemented in-page resize, cursor, opt-in clipboard and session resume across real servers and platforms; add a separate desktop window and optional sound if required.
+
+## Live KDrive fixture
+
+The `X2Go KDrive integration` workflow installs Ubuntu 24.04's X2Go server and
+KDrive backend on a disposable runner, starts a loopback-only SSH server and a
+test account, and runs the opt-in `live_x2go` Rust integration test. Run it
+only on a disposable machine: it creates an account and starts services. The
+test starts XFCE, parses a main KDrive frame, sends A and Return to an X11
+terminal, checks the observed input, suspends, lists and resumes the same
+session, parses another main frame, and requests termination. Run
+[46139232341](https://github.com/unsubstantiation/LinSCP/actions/runs/46139232341)
+passed this fixture. It does not decode or display frame pixels, exercise the
+service/browser pipeline, validate clipboard, prove that XFCE remains healthy,
+or cover remote networks, other distributions, Windows clients or physical
+devices. Other existing session tests remain synthetic.

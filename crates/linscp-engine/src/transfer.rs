@@ -1599,8 +1599,9 @@ fn stage_saf_tree(
 }
 
 /// Publishes one staged download across the bridge: the staged length is
-/// judged against the document cap before its bytes are read, and a
-/// no-replace publish refuses a destination that appeared after preflight.
+/// judged against the document cap before its bytes are read. No-replace
+/// checks for an existing destination, but the provider bridge cannot make
+/// that check and publication atomic; a concurrent writer can still race it.
 pub fn publish_staged_file_to_saf(
     fs: &dyn LocalFs, staged: &Path, dest_uri: &str, no_replace: bool,
     cancel: &AtomicBool,
