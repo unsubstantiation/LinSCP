@@ -387,18 +387,18 @@ const expression = `
   }
   async function verifyAndroidRemoteEditingAndInterruptedDelete(tab) {
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-encoding'});
-    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'café\r\n', encoding: 'windows-1252', eol: 'crlf'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'café\\r\\n', encoding: 'windows-1252', eol: 'crlf'});
     let refused = false;
     try { await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt')); }
     catch (error) { refused = error.status === 400; }
     if (!refused) throw new Error('Non-UTF-8 remote file opened as UTF-8');
     const edit = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
-    if (edit.content !== 'café\r\n' || edit.info.encoding !== 'windows-1252') throw new Error('Remote legacy text decoded incorrectly');
+    if (edit.content !== 'café\\r\\n' || edit.info.encoding !== 'windows-1252') throw new Error('Remote legacy text decoded incorrectly');
     const search = await invoke('POST', '/api/remote/search', {tab, path: '/android-encoding', pattern: '*.txt', search_contents: true, content_query: 'café', encoding: 'windows-1252'});
     if (search.matches?.length !== 1 || search.matches[0].name !== 'legacy.txt') throw new Error('Remote legacy text search failed: ' + JSON.stringify(search));
-    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'naïve\n', encoding: 'windows-1252', eol: 'crlf', base_mtime: edit.info.mtime});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'naïve\\n', encoding: 'windows-1252', eol: 'crlf', base_mtime: edit.info.mtime});
     const saved = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
-    if (saved.content !== 'naïve\r\n') throw new Error('Remote legacy text save failed');
+    if (saved.content !== 'naïve\\r\\n') throw new Error('Remote legacy text save failed');
     await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-partial'});
     for (const name of ['a.txt', 'b.txt']) await invoke('POST', '/api/remote/save', {tab, path: '/android-partial/' + name, content: name});
     await invoke('POST', '/api/remote/save', {tab, path: '/android-other.txt', content: 'other'});
