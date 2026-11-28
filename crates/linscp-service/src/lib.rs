@@ -188,7 +188,7 @@ pub const MAX_DROP_STAGING_DEPTH: usize = 64;
 #[derive(Clone)]
 pub struct CommanderService {
     local_fs: Arc<dyn LocalFs>,
-    secret_vault: Arc<linscp_platform::password_vault::PasswordSecretVault>,
+    secret_vault: Arc<dyn linscp_platform::ServiceSecretVault>,
     legacy_secret_vault: Arc<dyn SecretVault>,
     state: Arc<Mutex<InnerState>>,
     event_tx: Arc<Mutex<Option<tokio::sync::broadcast::Sender<Value>>>>,
@@ -11193,7 +11193,7 @@ fn constant_time_bytes_eq(left: &[u8], right: &[u8]) -> bool {
 fn find_existing_vault_key_id(
     key_dir: &Path,
     plaintext_private: &[u8],
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn linscp_platform::ServiceSecretVault,
 ) -> Option<String> {
     if plaintext_private.is_empty() {
         return None;
@@ -11409,7 +11409,7 @@ fn normalize_exported_pinned_public_key(pin: &str) -> Result<String, String> {
 fn read_tls_blob_for_export(
     path_or_ref: &str,
     config_root: &Path,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
     label: &str,
 ) -> Result<Vec<u8>, String> {
     if let Some(id) = path_or_ref.strip_prefix(LOCAL_VAULT_TLS_PREFIX) {
@@ -11461,7 +11461,7 @@ fn read_tls_blob_for_export(
 fn read_ca_bundle_for_export(
     site: &StoredSite,
     config_root: &Path,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
 ) -> Result<Option<Vec<u8>>, String> {
     let mut combined = Vec::<u8>::new();
     if let Some(ca_file) = site
@@ -11539,7 +11539,7 @@ fn read_ca_bundle_for_export(
 fn offlineotp_entries_from_sessions(
     store: &SessionStore,
     config_root: &Path,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
     selection: Option<&std::collections::HashSet<String>>,
     include_vault_keys: bool,
 ) -> Result<Vec<CredentialEntry>, String> {
@@ -11847,7 +11847,7 @@ fn read_export_vault_key_label(dir: &Path, id: &str, public_key: &str) -> Result
 fn read_offlineotp_keypair(
     path: &str,
     config_root: &Path,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
 ) -> Result<(String, String), String> {
     const LIMIT: u64 = 32 * 1024;
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
@@ -12196,7 +12196,7 @@ fn import_offlineotp_entries(
     config_root: &Path,
     mut store: SessionStore,
     imported: offlineotp_vault::ImportedCredentialVault,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
     selection: Option<&std::collections::HashSet<String>>,
     replace_same_names: bool,
 ) -> Result<(usize, usize, usize), String> {
@@ -12489,7 +12489,7 @@ fn cleanup_stale_temporary_keys(config_root: &Path) {
 fn protect_stored_ssh_keys(
     site: &mut StoredSite,
     config_root: &Path,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn linscp_platform::ServiceSecretVault,
     created: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     site.extra_fields.retain(|key, _| {
@@ -12519,7 +12519,7 @@ fn protect_stored_ssh_keys(
 fn protect_one_ssh_key(
     path: &str,
     config_root: &Path,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn linscp_platform::ServiceSecretVault,
     created: &mut Vec<PathBuf>,
 ) -> Result<String, String> {
     if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
@@ -12632,7 +12632,7 @@ fn protect_one_ssh_key(
 fn find_existing_vault_tls_id(
     key_dir: &Path,
     plaintext: &[u8],
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn linscp_platform::ServiceSecretVault,
 ) -> Option<String> {
     let entries = std::fs::read_dir(key_dir).ok()?;
     for entry in entries.flatten() {
@@ -12658,7 +12658,7 @@ fn find_existing_vault_tls_id(
 fn stage_offlineotp_tls_blob(
     config_root: &Path,
     encoded: &str,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn linscp_platform::ServiceSecretVault,
     created: &mut Vec<PathBuf>,
     label: &str,
 ) -> Result<String, String> {
@@ -12845,7 +12845,7 @@ fn materialize_one_vault_key(
 fn stage_offlineotp_key(
     config_root: &Path,
     key: &SshKeyRecord,
-    secret_vault: &linscp_platform::password_vault::PasswordSecretVault,
+    secret_vault: &dyn linscp_platform::ServiceSecretVault,
     created: &mut Vec<PathBuf>,
 ) -> Result<(Option<String>, Option<String>), String> {
     let dir = config_root.join("keys");

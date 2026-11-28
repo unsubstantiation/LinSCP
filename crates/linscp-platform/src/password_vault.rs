@@ -163,6 +163,18 @@ impl SecretVault for PasswordSecretVault {
     }
 }
 
+impl crate::ServiceSecretVault for PasswordSecretVault {
+    fn status(&self, config_dir: &Path) -> Result<&'static str, PlatformError> {
+        PasswordSecretVault::status(self, config_dir)
+    }
+    fn unlock_or_setup(&self, config_dir: &Path, password: &str, legacy: &dyn SecretVault) -> Result<(), PlatformError> {
+        PasswordSecretVault::unlock_or_setup(self, config_dir, password, legacy)
+    }
+    fn lock(&self) -> Result<(), PlatformError> {
+        PasswordSecretVault::lock(self)
+    }
+}
+
 /// Encrypt a local-vault blob with an already unlocked master key.
 pub fn seal_blob_with_master_key(plaintext: &[u8], master: &[u8; 32]) -> Result<Vec<u8>, PlatformError> {
     let mut nonce = [0u8; NONCE_LEN];

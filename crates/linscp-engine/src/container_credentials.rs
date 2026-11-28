@@ -437,13 +437,25 @@ impl UnlockedCredentialContainer {
 /// until all those paths use the same container transaction boundary.
 pub struct ContainerSessionVault {
     root: std::path::PathBuf,
+    path: std::path::PathBuf,
     unlocked: std::sync::Mutex<Option<UnlockedCredentialContainer>>,
 }
 
 impl ContainerSessionVault {
     pub fn new(root: &std::path::Path, unlocked: UnlockedCredentialContainer) -> Result<Self, String> {
         let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
-        Ok(Self { root, unlocked: std::sync::Mutex::new(Some(unlocked)) })
+        let path = unlocked.file.path().to_path_buf();
+        Ok(Self { root, path, unlocked: std::sync::Mutex::new(Some(unlocked)) })
+    }
+
+    /// Prepare a locked backend at a specified location; it does not create or
+    /// overwrite a container until explicitly unlocked or set up.
+    pub fn new_locked(root: &std::path::Path, path: &std::path::Path) -> Result<Self, String> {
+        let root = std::fs::canonicalize(root).map_err(|e| e.to_string())?;
+        let name = path.file_name().ok_or("Container requires a filename")?;
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        let path = std::fs::canonicalize(parent).map_err(|e| e.to_string())?.join(name);
+        Ok(Self { root, path, unlocked: std::sync::Mutex::new(None) })
     }
 
     /// Atomically update sessions and newly imported key materials under the
@@ -649,11 +661,72 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
     }
 }
 
+impl linscp_platform::ServiceSecretVault for ContainerSessionVault {
+    fn status(&self, config_dir: &std::path::Path) -> Result<&'static str, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        if guard.is_some() { return Ok("unlocked"); }
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_file() => Ok("locked"),
+            Ok(_) => Err(Self::error("Container path is not an ordinary file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok("setup_required"),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    fn unlock_or_setup(&self, config_dir: &std::path::Path, password: &str, _legacy: &dyn linscp_platform::SecretVault) -> Result<(), linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        if let Some(session) = guard.as_ref() {
+            session.file.verify_password(password)?;
+            session.read().map_err(Self::error)?;
+            return Ok(());
+        }
+        // Acquire the stable lock before deciding whether setup is required.
+        let file = CredentialContainer::acquire(&self.path).map_err(Self::error)?;
+        match std::fs::symlink_metadata(&self.path) {
+            Ok(meta) if meta.file_type().is_file() => {},
+            Ok(_) => return Err(Self::error("Container path is not an ordinary file")),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => file.create(password).map_err(Self::error)?,
+            Err(e) => return Err(e.into()),
+        }
+        *guard = Some(file.unlock(password).map_err(Self::error)?);
+        Ok(())
+    }
+
+    fn lock(&self) -> Result<(), linscp_platform::PlatformError> {
+        ContainerSessionVault::lock(self).map_err(Self::error)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn lifecycle_setup_lock_unlock_and_wrong_password_preserve_data() {
+        use linscp_platform::ServiceSecretVault;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let bridge = ContainerSessionVault::new_locked(dir.path(), &path).unwrap();
+        let legacy = linscp_platform::password_vault::PasswordSecretVault::new();
+        assert_eq!(bridge.status(dir.path()).unwrap(), "setup_required");
+        bridge.unlock_or_setup(dir.path(), "test password", &legacy).unwrap();
+        assert_eq!(bridge.status(dir.path()).unwrap(), "unlocked");
+        let before = std::fs::read(&path).unwrap();
+        assert!(bridge.unlock_or_setup(dir.path(), "wrong password", &legacy).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        bridge.lock().unwrap();
+        assert_eq!(bridge.status(dir.path()).unwrap(), "locked");
+        assert!(bridge.unlock_or_setup(dir.path(), "wrong password", &legacy).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        bridge.unlock_or_setup(dir.path(), "test password", &legacy).unwrap();
+        assert_eq!(bridge.status(dir.path()).unwrap(), "unlocked");
+        let other = tempfile::tempdir().unwrap();
+        assert!(bridge.status(other.path()).is_err());
+    }
 
     #[test]
     fn vault_ssh_key_hooks_deduplicate_and_guard_references() {

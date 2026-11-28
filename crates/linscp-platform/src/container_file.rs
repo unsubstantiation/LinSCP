@@ -125,6 +125,16 @@ pub struct UnlockedContainer {
 }
 
 impl UnlockedContainer {
+    pub fn path(&self) -> &Path { &self.file.path }
+
+    /// Verify a password without replacing the active key or retaining it.
+    pub fn verify_password(&self, password: &str) -> Result<(), PlatformError> {
+        let envelope = self.file.read_envelope()?;
+        self.key.open(&envelope)?;
+        container_cipher::open(&envelope, password)?;
+        Ok(())
+    }
+
     pub fn open(&self) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
         self.key.open(&self.file.read_envelope()?)
     }

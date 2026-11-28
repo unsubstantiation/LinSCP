@@ -351,6 +351,20 @@ pub trait SecretVault: Send + Sync {
     }
 }
 
+/// Vault lifecycle used by the Commander service. Implementations may keep a
+/// derived key while unlocked but must never retain the supplied password.
+pub trait ServiceSecretVault: SecretVault {
+    fn status(&self, config_dir: &Path) -> Result<&'static str, PlatformError>;
+    fn unlock_or_setup(&self, config_dir: &Path, password: &str, legacy: &dyn SecretVault) -> Result<(), PlatformError>;
+    fn lock(&self) -> Result<(), PlatformError>;
+    fn seal_local_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        self.seal_session_store(plaintext)
+    }
+    fn open_local_blob(&self, encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        self.open_session_store(encrypted)
+    }
+}
+
 #[derive(Default)]
 pub struct NativeLocalFs {
     /// Android Storage Access Framework bridge. On every other platform this is
