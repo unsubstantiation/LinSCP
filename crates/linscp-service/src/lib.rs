@@ -21917,6 +21917,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn granted_folder_move_upload_api_refuses_before_queueing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("source.txt", b"source"));
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::with_saf(bridge.clone())));
+        let session = Arc::new(MockSession::new());
+        let tab = insert_remote_tab(&svc, session.clone(), SAF_GRANTED_DIR);
+        let response = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/move".into(),
+            body: json!({"tab": tab, "direction": "upload", "local_dir": SAF_GRANTED_DIR,
+                "remote_dir": "/", "names": ["source.txt"]}) }).await;
+        assert_eq!(response.status, 400, "{}", response.payload);
+        assert!(response.payload["error"].as_str().unwrap_or("").contains("granted folder"));
+        assert!(svc.queue.snapshot().0.is_empty());
+        assert_eq!(bridge.bytes_of("source.txt").unwrap(), b"source");
+        assert!(session.bytes_of("/source.txt").is_none());
+    }
+
+    #[tokio::test]
     async fn granted_folder_move_upload_refuses_before_remote_publication() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
@@ -21964,6 +21981,21 @@ mod tests {
         assert!(task["error"].as_str().unwrap_or("").contains("local source changed"), "{task}");
         assert_eq!(std::fs::read(&source).unwrap(), b"changed while uploading");
         assert_eq!(session.bytes_of("/source.txt").unwrap(), b"original");
+
+        // A stable source is still moved, rather than merely copied.
+        let stable = tmp.path().join("stable.txt");
+        std::fs::write(&stable, b"stable").unwrap();
+        svc.queue.enqueue(None, "upload", "stable move".into(),
+            stable.to_string_lossy().into_owned(), "/stable.txt".into(), 6, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: stable.clone(), remote_dest: "/stable.txt".into(),
+                allow_overwrite: false, delete_source: true, cleanup_path: None,
+                flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        let completed = wait_for_task(&svc, "Completed").await;
+        assert_eq!(completed["status"], "Completed");
+        assert!(!stable.exists());
+        assert_eq!(session.bytes_of("/stable.txt").unwrap(), b"stable");
     }
 
     #[tokio::test]
