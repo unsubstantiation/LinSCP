@@ -4363,9 +4363,8 @@
     };
   }
 
-  /* Native paths land in the panel the user dropped on. The event names one
-   * side; a drop with no side goes to the remote panel, which is what the
-   * desktop window has always meant by "drop to upload". */
+  /* Native paths land in the pane under the pointer; if no position is
+   * available, use the last focused pane. */
   async function handleNativeDrop(payload) {
     if (nativeDropBusy) return;
     if (!window.LinSCPCore || typeof window.LinSCPCore.dropPaths !== 'function') return;
@@ -4375,7 +4374,15 @@
     // under the cursor, the page can, so the focused pane is the destination
     // unless the event names one.
     const requested = payload && payload.side === 'local' ? 'local' : payload && payload.side === 'remote' ? 'remote' : null;
-    const side = requested || (state.focusPane === 'local' ? 'local' : 'remote');
+    // Native positions are physical window pixels; DOM hit testing uses CSS
+    // pixels. A drop outside both panes keeps the existing focused-pane fallback.
+    let hitSide = null;
+    if (!requested && payload && payload.position &&
+        Number.isFinite(payload.position.x) && Number.isFinite(payload.position.y)) {
+      const scale = Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+      hitSide = pointerPaneAt({ clientX: payload.position.x / scale, clientY: payload.position.y / scale });
+    }
+    const side = requested || hitSide || (state.focusPane === 'local' ? 'local' : 'remote');
     const tab = activeTab();
     if (side === 'remote' && (!tab || !tab.connected)) {
       toast(t("Not connected."), true);
@@ -4430,38 +4437,25 @@
     if (caps && !caps.nativeFileDrop) return;
     const internals = window.__TAURI_INTERNALS__;
     if (!internals || typeof internals.invoke !== 'function') return;
-    // A Tauri v2 window delivers events through the `plugin:event|listen`
-    // command and calls the handler by id; v1 passed the handler function
-    // itself. Both are tried, so a newer or older shell still works.
-    const call = (cmd, args) => internals.invoke(cmd, args || {});
-    const handler = event => handleNativeDrop(event && event.payload ? event.payload : event);
-    const deliver = payload => {
-      try {
-        handler(payload);
-      } catch (error) {
-        /* a drop that cannot be handled must not stop the next one */
-      }
-    };
-    window.__LSCP_DROP_HANDLER__ = deliver;
-    Promise.resolve()
-      .then(() => call('plugin:event|listen', {
+    // Tauri v2 requires the numeric callback ID registered by
+    // transformCallback, not the name of a global JavaScript function.
+    const deliver = event => Promise.resolve()
+      .then(() => handleNativeDrop(event && event.payload ? event.payload : event))
+      .catch(() => { /* A rejected drop must not stop later events. */ });
+    if (typeof internals.transformCallback === 'function') {
+      const handler = internals.transformCallback(deliver);
+      Promise.resolve(internals.invoke('plugin:event|listen', {
         event: NATIVE_DROP_EVENT,
         target: { kind: 'Any' },
-        handler: '__LSCP_DROP_HANDLER__'
-      }))
-      .catch(error => {
-        // A shell that takes a handler function instead (or an older one that
-        // has no event channel at all) falls back or stays silent.
-        void error;
-        try {
-          const manager = internals.event || internals;
-          if (manager && typeof manager.listen === 'function') {
-            Promise.resolve(manager.listen(NATIVE_DROP_EVENT, deliver)).catch(() => {});
-          }
-        } catch (error) {
-          /* the page's own HTML5 drop stays the only path */
-        }
-      });
+        handler,
+      })).catch(() => {});
+      return;
+    }
+    // Compatibility with a host that exposes a direct listen function.
+    const manager = internals.event || internals;
+    if (manager && typeof manager.listen === 'function') {
+      Promise.resolve(manager.listen(NATIVE_DROP_EVENT, deliver)).catch(() => {});
+    }
   }
 
   function focusPane(side) {

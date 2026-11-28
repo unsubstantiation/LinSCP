@@ -8416,14 +8416,13 @@ impl CommanderService {
         let mut paths = Vec::new();
         if let Some(list) = body.get("source_paths").and_then(Value::as_array) {
             paths.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-        if let Some(single) = body.get("source_path").and_then(Value::as_str) {
+        } else if let Some(single) = body.get("source_path").and_then(Value::as_str) {
             paths.push(single.to_string());
         }
         paths
             .into_iter()
-            .map(|path| path.trim().to_string())
-            .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+            // Spaces are valid filename bytes; trimming changes the source.
+            .filter(|path| !path.trim().is_empty() && !path.chars().any(char::is_control))
             .collect()
     }
 
@@ -18693,11 +18692,20 @@ mod tests {
         let both = drop_local(json!({
             "local_dir": local.to_string_lossy(),
             "name": "report.txt",
+            "source_path": dropped.to_string_lossy(),
             "source_paths": [dropped.to_string_lossy(), second.to_string_lossy()],
         }));
         assert_eq!(both.status, 409, "{}", both.payload);
         assert_eq!(both.payload["conflicts"], json!(["report.txt"]));
         assert_eq!(std::fs::read(local.join("notes.txt")).unwrap(), b"notes");
+        #[cfg(not(windows))]
+        {
+        let trailing = outside.join("trailing-space ");
+        std::fs::write(&trailing, b"preserve whitespace").unwrap();
+        let spaced = drop_local(json!({"local_dir": local.to_string_lossy(), "source_path": trailing.to_string_lossy(), "source_paths": [trailing.to_string_lossy()]}));
+        assert_eq!(spaced.status, 200, "{}", spaced.payload);
+        assert_eq!(std::fs::read(local.join("trailing-space ")).unwrap(), b"preserve whitespace");
+        }
 
         // The page's approval is what turns a conflict into a replacement, and
         // the retry is the same request plus that decision.

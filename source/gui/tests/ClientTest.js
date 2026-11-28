@@ -279,6 +279,8 @@ function vaultBackupBody(path, options) {
 }
 
 const calls = [];
+const nativeCallbacks = new Map();
+const nativeListeners = [];
 const errors = [];
 const confirmMessages = [];
 let confirmResult = true;
@@ -339,7 +341,17 @@ const dom = new JSDOM(html, {
      * cannot create one, so a stub keeps the download path testable. */
     window.URL.createObjectURL = () => 'blob:key-session-export';
     window.URL.revokeObjectURL = () => {};
-    window.__TAURI_INTERNALS__ = { invoke: async (_cmd, args) => invoke(args.envelope) };
+    window.__TAURI_INTERNALS__ = {
+      transformCallback(callback) { const id = nativeCallbacks.size + 1; nativeCallbacks.set(id, callback); return id; },
+      invoke: async (cmd, args) => {
+        if (cmd === 'plugin:event|listen') {
+          if (typeof args.handler !== 'number' || !nativeCallbacks.has(args.handler)) throw new Error('invalid Tauri callback ID');
+          nativeListeners.push(args);
+          return 1;
+        }
+        return invoke(args.envelope);
+      }
+    };
     const invoke = envelope => {
       const method = String(envelope.method || 'GET').toUpperCase();
       const options = { method: method };
@@ -4963,6 +4975,19 @@ function options(id) {
     responses['/api/remote/list'] = { path: '/tmp/otherlocal', entries: [] };
     await window.refreshStatus();
     await window.loadRemote('/tmp/otherlocal');
+    const listener = nativeListeners.find(item => item.event === 'native:file-drop');
+    check('native event listener registers a Tauri callback ID', !!listener && nativeCallbacks.has(listener.handler));
+    const originalHitTest = window.document.elementFromPoint;
+    const originalRatio = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+    let hitPoint;
+    window.document.elementFromPoint = (x, y) => { hitPoint = [x, y]; return window.document.getElementById('remotePane'); };
+    nativeCallbacks.get(listener.handler)({ payload: { paths: ['/tmp/desktop-note.txt'], position: { x: 40, y: 60 } } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    check('native event routes physical coordinates to the pane in CSS pixels',
+      hitPoint && hitPoint[0] === 20 && hitPoint[1] === 30 && capturedDropTarget && capturedDropTarget.directory === '/tmp/otherlocal');
+    window.document.elementFromPoint = originalHitTest;
+    if (originalRatio) Object.defineProperty(window, 'devicePixelRatio', originalRatio);
     await window.handleNativeDrop({ paths: ['/tmp/desktop-note.txt'], side: 'remote' });
     check('dual-local native drop onto right pane uses target=local and right-pane directory',
       capturedDropTarget &&

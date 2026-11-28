@@ -639,11 +639,12 @@ fn build_native_app_with_bridge(
     #[cfg(not(target_os = "android"))]
     let builder = builder.on_window_event(|window, event| {
         use tauri::{Emitter, WindowEvent};
-        if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-            // The side is the pane the page last focused; the shell cannot
-            // know which pane is under the cursor, and the page can.
+        if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+            // The webview converts the physical position to CSS pixels and
+            // identifies the pane under the cursor.
             let payload = serde_json::json!({
                 "paths": paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+                "position": { "x": position.x, "y": position.y },
             });
             let _ = window.emit("native:file-drop", payload);
         }

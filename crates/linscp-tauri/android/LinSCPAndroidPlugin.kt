@@ -881,43 +881,40 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     if (!shareDir.exists() && !shareDir.mkdirs()) throw IllegalStateException("cannot create private staging directory")
     shareDir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 3L * 24 * 60 * 60 * 1000 }?.forEach { it.deleteRecursively() }
     val staged = mutableListOf<String>()
+    val batches = mutableListOf<File>()
     var totalBytes = 0L
-    for (raw in uris) {
-      val uri = Uri.parse(raw)
-      if (uri.scheme != "content") continue
-      val candidate = queryDisplayName(uri)?.replace(Regex("[^A-Za-z0-9._ -]"), "_")?.take(100)?.trim()
-      val name = candidate?.takeUnless { it.isBlank() || it == "." || it == ".." } ?: "shared-file"
-      val batch = File(shareDir, UUID.randomUUID().toString())
-      if (!batch.mkdirs()) throw IllegalStateException("cannot create private staging directory")
-      val file = File(batch, name)
-      try {
+    try {
+      for (raw in uris) {
+        val uri = Uri.parse(raw)
+        if (uri.scheme != "content") continue
+        val candidate = queryDisplayName(uri)?.replace(Regex("[^A-Za-z0-9._ -]"), "_")?.take(100)?.trim()
+        val name = candidate?.takeUnless { it.isBlank() || it == "." || it == ".." } ?: "shared-file"
+        val batch = File(shareDir, UUID.randomUUID().toString())
+        if (!batch.mkdirs()) throw IllegalStateException("cannot create private staging directory")
+        batches.add(batch)
+        val file = File(batch, name)
         activity.contentResolver.openInputStream(uri)?.use { input ->
-          FileOutputStream(file).use { output ->
-            val buffer = ByteArray(64 * 1024)
-            while (true) {
-              val count = input.read(buffer)
-              if (count < 0) break
-              totalBytes += count
-              if (totalBytes > maxSharedBytes) throw IllegalStateException("shared files exceed the 512 MiB limit")
-              output.write(buffer, 0, count)
+            FileOutputStream(file).use { output ->
+              val buffer = ByteArray(64 * 1024)
+              while (true) {
+                val count = input.read(buffer)
+                if (count < 0) break
+                totalBytes += count
+                if (totalBytes > maxSharedBytes) throw IllegalStateException("shared files exceed the 512 MiB limit")
+                output.write(buffer, 0, count)
+              }
+              output.fd.sync()
             }
-            output.fd.sync()
-          }
-        } ?: throw IllegalStateException("cannot open $uri")
-      } catch (e: Exception) {
-        batch.deleteRecursively()
-        staged.forEach { path ->
-          val f = File(path)
-          f.delete()
-          f.parentFile?.takeIf { it.parentFile == shareDir }?.deleteRecursively()
-        }
-        throw e
+          } ?: throw IllegalStateException("cannot open $uri")
+        file.setReadable(false, false); file.setWritable(false, false)
+        file.setReadable(true, true); file.setWritable(true, true)
+        staged.add(file.absolutePath)
       }
-      file.setReadable(false, false); file.setWritable(false, false)
-      file.setReadable(true, true); file.setWritable(true, true)
-      staged.add(file.absolutePath)
+      staged
+    } catch (e: Exception) {
+      batches.forEach { it.deleteRecursively() }
+      throw e
     }
-    staged
   }
 
   private fun treeUri(uri: Uri): Uri {
