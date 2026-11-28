@@ -310,18 +310,29 @@ impl SshJumpTunnel {
         let bound_addr = listener.local_addr().map_err(|e| {
             ProtoError::Transport(format!("Failed to read local tunnel address: {e}"))
         })?;
+        // Reserve the client's source port before accepting. A different local
+        // process must not win the accept race and receive the SSH stream.
+        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| ProtoError::Transport(e.to_string()))?;
+        socket.bind("127.0.0.1:0".parse().expect("loopback address"))
+            .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let expected_peer = socket.local_addr().map_err(|e| ProtoError::Transport(e.to_string()))?;
         let ssh = Arc::clone(&self.ssh);
         let target_host = dest_host.to_string();
         tokio::spawn(async move {
-            if let Ok((mut accepted, _)) = listener.accept().await {
+            let accept_client = async {
+                loop {
+                    let (accepted, peer) = listener.accept().await?;
+                    if peer == expected_peer { return Ok::<_, std::io::Error>(accepted); }
+                }
+            };
+            if let Ok(Ok(mut accepted)) = tokio::time::timeout(std::time::Duration::from_secs(10), accept_client).await {
                 drop(listener);
-                if let Ok(mut remote) = ssh.open_direct_tcpip_stream(&target_host, dest_port).await
-                {
+                if let Ok(mut remote) = ssh.open_direct_tcpip_stream(&target_host, dest_port).await {
                     let _ = tokio::io::copy_bidirectional(&mut accepted, &mut remote).await;
                 }
             }
         });
-        let client_sock = TcpStream::connect(bound_addr).await.map_err(|e| {
+        let client_sock = socket.connect(bound_addr).await.map_err(|e| {
             ProtoError::Transport(format!("Failed to connect local jump port: {e}"))
         })?;
         let _ = client_sock.set_nodelay(true);

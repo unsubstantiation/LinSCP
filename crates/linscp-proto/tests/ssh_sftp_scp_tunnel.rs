@@ -1097,6 +1097,25 @@ async fn jump_socks_relay_requires_secret_and_supports_reqwest() {
     let text = client.get(format!("http://127.0.0.1:{http_port}/")).send().await.unwrap().text().await.unwrap();
     assert_eq!(text, "ok");
     http.await.unwrap();
+
+    // Explicit local-port mode still reaches only the intended destination.
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        stream.write_all(&byte).await.unwrap();
+    });
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut forwarded = jump.open_destination_stream("127.0.0.1", echo_port, local_port).await.unwrap();
+    forwarded.write_all(b"x").await.unwrap();
+    let mut echoed = [0; 1];
+    forwarded.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"x");
+    echo_task.await.unwrap();
     relay.stop().await;
     jump.close().await.unwrap();
 }
