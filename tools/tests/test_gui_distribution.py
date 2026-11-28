@@ -65,12 +65,10 @@ class GuiDistributionTests(unittest.TestCase):
         self.assertNotIn('x-scheme-handler/https;', handlers)
         windows = (ROOT / '.github/workflows/windows-build.yml').read_text()
         self.assertIn('target/release/linscp-gui.exe', windows)
-        # Releases are managed by hand, so the artifact is only how the built
-        # exe leaves the run - stored uncompressed in the envelope GitHub
-        # always zips (compression-level: 0).
+        # Publish the portable executable itself, without a ZIP envelope.
         upload = windows[windows.index('Upload the portable application'):]
         self.assertEqual(upload.count('.exe'), 1, 'the artifact must be one app')
-        self.assertIn('compression-level: 0', upload)
+        self.assertIn('archive: false', upload)
 
     @unittest.skipUnless(shutil.which('make') and shutil.which('install'), 'make and install required')
     def test_make_install_honors_prefix_and_destdir(self):

@@ -159,6 +159,27 @@ class WorkflowTriggerTests(unittest.TestCase):
                             "if: github.ref == 'refs/heads/master'", block,
                             f'{path.name} job {name} exposes a protected environment outside master')
 
+    def test_build_artifacts_are_uploaded_as_single_files(self):
+        expected = {
+            'windows-build.yml': 'target/release/linscp-gui.exe',
+            'debian-build.yml': 'linscp_*_*.deb',
+            'android-build.yml': 'android-artifacts/linscp-android-release.apk',
+        }
+        for filename, artifact in expected.items():
+            with self.subTest(workflow=filename):
+                text = (WORKFLOWS / filename).read_text(encoding='utf-8')
+                uploads = text.split('uses: actions/upload-artifact@v7')
+                self.assertEqual(len(uploads), 2, filename)
+                # Stop at the next step or job, not at unrelated settings.
+                block = uploads[1].split('\n      - ', 1)[0]
+                self.assertIn('path: ' + artifact, block)
+                self.assertIn('archive: false', block)
+                self.assertIn('if-no-files-found: error', block)
+                self.assertNotIn('compression-level:', block)
+                self.assertNotIn('name:', block)  # direct uploads use the file name
+        debian = (WORKFLOWS / 'debian-build.yml').read_text(encoding='utf-8')
+        self.assertIn('test "${#debs[@]}" -eq 1', debian)
+
     def test_android_signed_release_runs_on_master_commits_and_dispatch(self):
         jobs = job_blocks((WORKFLOWS / 'android-build.yml').read_text(encoding='utf-8'))
         self.assertIn("if: github.ref == 'refs/heads/master'", jobs['build'])
