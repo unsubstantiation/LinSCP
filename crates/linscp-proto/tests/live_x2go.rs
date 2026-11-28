@@ -37,12 +37,12 @@ async fn x2go_kdrive_start_frames_suspend_resume_and_terminate() {
     assert!(saw_main, "server disconnected before main frame");
     // An X client on the fixture display observes keyboard input sent through
     // the real KDrive channel, not through the control SSH connection.
-    let launch = format!("rm -f ~/x2go-input-result; DISPLAY=:{display} nohup xterm -title LinSCPInputFixture -e sh -c 'IFS= read -r line; printf %s \"$line\" > \"$HOME/x2go-input-result\"' </dev/null >/dev/null 2>&1 &");
+    let launch = format!("rm -f ~/x2go-input-result; DISPLAY=:{display} nohup xterm -title LinSCPInputFixture -e sh -c 'IFS= read -r line; printf %s \"$line\" > \"$HOME/x2go-input-result\"' </dev/null >~/x2go-xterm.log 2>&1 &");
     let launched = ssh.exec_command_bounded(&launch, Duration::from_secs(10), 8192).await.expect("launch input fixture");
     assert_eq!(launched.exit_code, Some(0));
-    let focus = format!("DISPLAY=:{display} xdotool search --sync --onlyvisible --name '^LinSCPInputFixture$' windowfocus --sync");
+    let focus = format!("export DISPLAY=:{display}; timeout 8s xdotool search --sync --onlyvisible --name '^LinSCPInputFixture$' windowfocus --sync || {{ cat ~/x2go-xterm.log >&2; xdotool search --name . >&2 || true; exit 1; }}");
     let focused = ssh.exec_command_bounded(&focus, Duration::from_secs(20), 8192).await.expect("focus input fixture");
-    assert_eq!(focused.exit_code, Some(0), "could not focus fixture window");
+    assert_eq!(focused.exit_code, Some(0), "could not focus fixture window: {}", String::from_utf8_lossy(&focused.stderr));
     for (kind, keycode) in [(2u32, 38u32), (3, 38), (2, 36), (3, 36)] {
         let mut event = [0u8; linscp_proto::kdrive_wire::CLIENT_EVENT_SIZE];
         event[..4].copy_from_slice(&kind.to_le_bytes());
