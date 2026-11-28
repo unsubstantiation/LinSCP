@@ -13541,6 +13541,47 @@ mod tests {
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
 
     #[test]
+    fn container_service_dispatch_lifecycle_and_key_session_roundtrip() {
+        use linscp_engine::container_credentials::ContainerSessionVault;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("application.dat");
+        // Injection is test-only: production continues using the existing vault.
+        let mut service = CommanderService::new(dir.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        service.secret_vault = Arc::new(ContainerSessionVault::new_locked(dir.path(), &path).unwrap());
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        assert_eq!(service.dispatch(request("GET", "/api/vault/status", json!({}))).payload["vault"], "setup_required");
+        assert_eq!(service.dispatch(request("POST", "/api/vault/unlock", json!({"password":"correct password"}))).status, 200);
+        let key = service.dispatch(request("POST", "/api/vault/keys/import", json!({"name":"fixture", "private_key":"private fixture"})));
+        assert_eq!(key.status, 200, "{}", key.payload);
+        let reference = key.payload["reference"].as_str().unwrap().to_string();
+        let saved = service.dispatch(request("POST", "/api/sessions/save", json!({"name":"site", "session":{
+            "protocol":"sftp", "host":"example.test", "username":"alice", "password":"hidden password", "keyfile":reference
+        }})));
+        assert_eq!(saved.status, 200, "{}", saved.payload);
+        let blocked = service.dispatch(request("POST", "/api/vault/keys/delete", json!({"reference":reference,"confirm":true})));
+        assert_eq!(blocked.status, 409, "{}", blocked.payload);
+        let exported = service.dispatch(request("POST", "/api/vault/export", json!({"password":"backup password"})));
+        assert_eq!(exported.status, 200, "{}", exported.payload);
+        assert!(!BASE64_STD.decode(exported.payload["data_base64"].as_str().unwrap()).unwrap().windows(b"private fixture".len()).any(|b| b == b"private fixture"));
+        let before = std::fs::read(&path).unwrap();
+        assert!(!before.windows(b"hidden password".len()).any(|b| b == b"hidden password"));
+        assert!(!dir.path().join("sessions.key").exists());
+        assert!(!dir.path().join("sessions.ini").exists());
+        assert!(!dir.path().join("keys").exists());
+        assert_eq!(service.dispatch(request("POST", "/api/vault/lock", json!({}))).status, 200);
+        assert_eq!(service.dispatch(request("GET", "/api/vault/status", json!({}))).payload["vault"], "locked");
+        assert_ne!(service.dispatch(request("GET", "/api/sessions", json!({}))).status, 200);
+        assert_ne!(service.dispatch(request("POST", "/api/vault/unlock", json!({"password":"wrong password"}))).status, 200);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(service.dispatch(request("POST", "/api/vault/unlock", json!({"password":"correct password"}))).status, 200);
+        let list = service.dispatch(request("GET", "/api/sessions", json!({})));
+        assert_eq!(list.status, 200, "{}", list.payload);
+        assert_eq!(list.payload["sessions"][0]["private_key"], reference);
+        let store = SessionStore::load_from_dir(dir.path(), service.secret_vault.as_ref()).unwrap();
+        assert_eq!(store.find("site").unwrap().password.as_deref(), Some("hidden password"));
+    }
+
+    #[test]
     fn container_offlineotp_import_is_atomic_for_sessions_and_materials() {
         use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer, NewSshKey, NewTlsMaterial};
         let source_dir = tempfile::tempdir().unwrap();
