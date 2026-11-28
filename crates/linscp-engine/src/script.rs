@@ -4103,8 +4103,14 @@ impl ScriptInterpreter {
             .as_deref()
             .or(session_passphrase.as_deref());
 
-        let raw_key = std::fs::read_to_string(&key_path)
-            .map_err(|e| self.wrong_args("copyid", &format!("Cannot read '{key_path}': {e}")))?;
+        let mut materialized = ParsedSiteSpec::default();
+        materialized.session.keyfile = Some(key_path.clone());
+        let default_vault = DefaultOsVault;
+        let vault: &dyn SecretVault = self.secret_vault.as_deref().unwrap_or(&default_vault);
+        let _temporary_keys = crate::vault_material::materialize_vault_key_paths(&mut materialized, &self.cfg.config_dir, vault)?;
+        let key_path = materialized.session.keyfile.as_deref().ok_or("No SSH key is configured")?;
+        let raw_key = zeroize::Zeroizing::new(std::fs::read_to_string(key_path)
+            .map_err(|e| self.wrong_args("copyid", &format!("Cannot read key: {e}")))?);
         let trimmed_key = raw_key.trim_start_matches('\u{feff}').trim_start();
         let pub_line = if !trimmed_key.starts_with("-----BEGIN ")
             && !trimmed_key.starts_with("PuTTY-User-Key-File-")
