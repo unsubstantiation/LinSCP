@@ -8610,6 +8610,9 @@ impl CommanderService {
         if is_saf_path(&destination_dir) && !body.get("accept_saf_publication_risk").and_then(Value::as_bool).unwrap_or(false) {
             return ApiReply { status: 409, payload: json!({"success": false, "error": "Granted-folder publication requires confirmation of overwrite and partial-file risks", "saf_publication_risk": true}) };
         }
+        if !paths.is_empty() && is_saf_path(&destination_dir) {
+            return api_error(400, "Native path drops into granted folders are not supported safely; use a byte drop or copy from a local pane.");
+        }
         if !paths.is_empty() {
             // A path drop is not a byte drop: the items keep their own names.
             // Whether they can be read is decided when they are copied, and a
@@ -9292,6 +9295,18 @@ impl CommanderService {
     /// The local path a drop lands on: the panel directory, the relative
     /// sub-path a folder drop carried, and the leaf name.
     fn drop_destination(&self, base: &str, name: &str, relative: &str) -> Result<PathBuf, String> {
+        if is_saf_path(base) {
+            let mut uri = base.to_string();
+            if !relative.is_empty() {
+                let path = ops::validate_relative_subpath(relative)?;
+                for component in path.components() {
+                    let leaf = component.as_os_str().to_str().ok_or("Invalid dropped path")?;
+                    uri = resolve_contained(&uri, leaf)?;
+                }
+            }
+            if !name.is_empty() { uri = resolve_contained(&uri, &ops::validate_leaf_name(name)?)?; }
+            return Ok(PathBuf::from(uri));
+        }
         let mut target = PathBuf::from(base);
         if !relative.is_empty() {
             target.push(ops::validate_relative_subpath(relative)?);

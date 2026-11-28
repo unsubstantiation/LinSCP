@@ -50,7 +50,8 @@ writers and do not rely on no-clobber guarantees in granted folders. Remote
 session downloads and moves, S3 version downloads, local-pane copies and moves,
 desktop drops, synchronization runs and local-to-local keep-up-to-date jobs
 require explicit per-request acknowledgement when they can publish into a granted
-folder. This does not make publication atomic, and other provider operations
+folder. Native path drops into a granted folder are refused; use byte drops or
+copy from a local pane instead. This does not make publication atomic, and other provider operations
 such as editor saves are not covered by this transfer confirmation. Verified
 resume remains refused until checkpointing and publication have an adequate
 provider-specific safety contract.
