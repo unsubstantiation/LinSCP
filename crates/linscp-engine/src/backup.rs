@@ -84,6 +84,21 @@ fn validate_portable_session_material(ini: &str) -> Result<(), String> {
                 return Err(format!("Cannot export full backup: session '{}' has an external {field}. Use key/session export or move the material into the vault first.", site.name));
             }
         }
+        if let Some(pins) = site.extra_fields.get("pinned_public_key") {
+            for pin in pins.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+                let body = pin.strip_prefix("sha256//").or_else(|| pin.strip_prefix("SHA256//"))
+                    .or_else(|| pin.strip_prefix("sha256:")).or_else(|| pin.strip_prefix("SHA256:"));
+                let is_hex = |s: &str| s.len() == 64 && s.bytes().all(|b| b.is_ascii_hexdigit());
+                let is_base64 = |s: &str| BASE64.decode(s).or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(s)).is_ok_and(|b| b.len() == 32);
+                let inline = match body {
+                    Some(body) => is_hex(body) || is_base64(body),
+                    None => !Path::new(&linscp_platform::terminal::expand_tilde(pin)).is_file() && (is_hex(pin) || is_base64(pin)),
+                };
+                if !inline {
+                    return Err(format!("Cannot export full backup: session '{}' has a file-based or invalid public-key pin. Use key/session export first.", site.name));
+                }
+            }
+        }
         if site.extra_fields.get("ca_certificate_dir").is_some_and(|v| !v.trim().is_empty()) {
             return Err(format!("Cannot export full backup: session '{}' has an external CA certificate directory. Use key/session export first.", site.name));
         }
@@ -1101,6 +1116,10 @@ mod tests {
         site.extra_fields.insert("tls_certificate_key_file".into(), "C:\\old\\key.pem".into());
         store.upsert(site.clone());
         assert!(validate_portable_session_material(&store.serialize_ini(None).unwrap()).unwrap_err().contains("external client key"));
+        site.extra_fields.clear();
+        site.extra_fields.insert("pinned_public_key".into(), "/old-machine/pin.pem".into());
+        store.upsert(site.clone());
+        assert!(validate_portable_session_material(&store.serialize_ini(None).unwrap()).unwrap_err().contains("file-based or invalid"));
         site.extra_fields.clear();
         site.extra_fields.insert("ca_certificate_dir".into(), "/old-ca".into());
         store.upsert(site);
