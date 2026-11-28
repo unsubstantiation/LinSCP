@@ -7167,9 +7167,10 @@
 
   let pendingEditorEncodingRetry = null;
   function cancelEditorEncodingRetry() {
+    const retry = pendingEditorEncodingRetry;
     pendingEditorEncodingRetry = null;
     closeModal('editorEncodingRetryModal');
-    if (state.editor) selectEncoding('editorEncoding', state.editor.initialEncoding);
+    if (state.editor && retry && retry.restoreEncoding) selectEncoding('editorEncoding', retry.restoreEncoding);
   }
   async function retryEditorEncoding() {
     const retry = pendingEditorEncodingRetry;
@@ -7188,7 +7189,11 @@
     if (!data || !data.success) {
       const error = String((data && data.error) || '');
       if (/invalid byte sequence|not valid utf-8|binary file containing nul/i.test(error)) {
-        pendingEditorEncodingRetry = {path, side, readOnly, initialLine};
+        const sameEditor = state.editor && state.editor.path === path && state.editor.side === side;
+        const restoreEncoding = pendingEditorEncodingRetry?.restoreEncoding || (state.editor
+          ? (sameEditor && !state.editor.dirty ? state.editor.initialEncoding : $('editorEncoding').value)
+          : null);
+        pendingEditorEncodingRetry = {path, side, readOnly, initialLine, restoreEncoding};
         $('editorEncodingRetryError').textContent = error;
         selectEncoding('editorRetryEncoding', requestedEncoding || 'utf-8');
         openModal('editorEncodingRetryModal');

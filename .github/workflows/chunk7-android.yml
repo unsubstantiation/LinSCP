@@ -67,7 +67,9 @@ jobs:
           key: android-check
 
       - name: Prepare UI dependencies
-        run: npm ci --prefix ui --no-audit --no-fund
+        run: |
+          npm ci --prefix ui --no-audit --no-fund
+          npm run build --prefix ui
 
       - name: Check the Android application ID and signing configuration
         run: |

@@ -3,7 +3,7 @@
 //! checksum, `copyid`, cleanup, and shell-upload manifest operations for `CommanderService`.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use linscp_crypto::digests::{crc32_hex, md5_hex, sha1_hex, sha256_hex};
@@ -929,10 +929,21 @@ fn search_local_walk(
                 stats.truncated = true;
                 return Ok(());
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            let Ok(file) = std::fs::File::open(&path) else {
                 stats.skipped += 1;
                 continue;
             };
+            let mut bytes = Vec::new();
+            if file.take(remaining + 1).read_to_end(&mut bytes).is_err() {
+                stats.skipped += 1;
+                continue;
+            }
+            if bytes.len() as u64 > remaining {
+                stats.skipped += 1;
+                if remaining < MAX_SEARCH_FILE_BYTES { stats.truncated = true; return Ok(()); }
+                continue;
+            }
             stats.scanned += 1;
             stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
@@ -1032,6 +1043,10 @@ fn search_saf_walk(
         if entry.name == "." || entry.name == ".." {
             continue;
         }
+        if !safe_search_entry_name(&entry.name) {
+            stats.skipped += 1;
+            continue;
+        }
         if stats.matches.len() >= limit {
             stats.truncated = true;
             return Ok(());
@@ -1111,6 +1126,10 @@ fn search_saf_walk(
             if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
                 stats.skipped += 1;
                 continue;
+            }
+            if stats.bytes_scanned.saturating_add(bytes.len() as u64) > MAX_SEARCH_TOTAL_BYTES {
+                stats.truncated = true;
+                return Ok(());
             }
             stats.scanned += 1;
             stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);

@@ -20118,6 +20118,12 @@ mod tests {
             "tab": id, "local_dir": tmp.path().to_string_lossy(), "remote_dir": "/", "mode": "local"}))).await;
         assert_eq!(preview.status, 400, "{}", preview.payload);
         assert!(preview.payload["error"].as_str().unwrap().contains("Invalid remote directory entry name"));
+        for name in ["../escape.filepart", "drive:stream"] {
+            *session.listing_injection.lock().unwrap() = Some(("/".into(), name.into()));
+            let preview = svc.dispatch_async(req("POST", "/api/sync/preview", json!({
+                "tab": id, "local_dir": tmp.path().to_string_lossy(), "remote_dir": "/", "mode": "local"}))).await;
+            assert_eq!(preview.status, 400, "{name}: {}", preview.payload);
+        }
         assert_eq!(session.bytes_of("/normal.txt"), Some(b"hello world".to_vec()));
     }
 

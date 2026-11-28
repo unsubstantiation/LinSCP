@@ -512,8 +512,12 @@ fn collect_local_tree(
         .map_err(|e| format!("Cannot read local directory '{}': {e}", root.display()))?;
     for item in rd {
         let de = item.map_err(|e| format!("Local directory read failed: {e}"))?;
-        let name = de.file_name().to_string_lossy().into_owned();
-        if name == "." || name == ".." || name.ends_with(".filepart") || name.contains(".filepart.v")
+        let name = de.file_name().into_string()
+            .map_err(|_| format!("Cannot synchronize a non-UTF-8 name in '{}'.", root.display()))?;
+        if !valid_sync_entry_name(&name) {
+            return Err(format!("Invalid local directory entry name in '{}'.", root.display()));
+        }
+        if name.ends_with(".filepart") || name.contains(".filepart.v")
         {
             continue;
         }
@@ -556,8 +560,22 @@ fn collect_local_tree(
 // Never let them escape the selected roots or be interpreted as separators on
 // another platform. Preserve ordinary whitespace in valid names.
 fn valid_sync_entry_name(name: &str) -> bool {
-    !name.is_empty() && name != "." && name != ".."
-        && !name.contains(['/', '\\']) && !name.chars().any(char::is_control)
+    if crate::transfer::safe_tree_name(name).is_err() { return false; }
+    // Windows silently aliases trailing dots/spaces and reserves device names;
+    // reject those before a remote path can alias an unrelated local file.
+    #[cfg(windows)]
+    {
+        if name.ends_with(['.', ' ']) || name.contains(['<', '>', '"', '|', '?', '*']) {
+            return false;
+        }
+        let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$")
+            || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT"))
+                && matches!(stem.as_bytes()[3], b'1'..=b'9')) {
+            return false;
+        }
+    }
+    true
 }
 
 async fn collect_remote_tree(
@@ -1702,6 +1720,30 @@ impl RemoteSession for LocalSyncSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_sync_entry_names_are_refused() {
+        for name in ["", ".", "..", "../x.filepart", "a/b", "a\\b", "x:y", "bad\nname"] {
+            assert!(!valid_sync_entry_name(name), "accepted {name:?}");
+        }
+        assert!(valid_sync_entry_name("normal file.txt"));
+        #[cfg(windows)]
+        for name in ["CON", "con.txt", "AUX.txt", "LPT1.txt", "COM9", "trailing.", "trailing ", "a?b"] {
+            assert!(!valid_sync_entry_name(name), "accepted {name:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_local_names_are_not_lossily_synchronized() {
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(std::ffi::OsString::from_vec(vec![0xff])), b"data").unwrap();
+        let mut entries = BTreeMap::new();
+        let mut retained = BTreeSet::new();
+        let error = collect_local_tree(tmp.path(), "", true, &FileMask::default(), &mut entries, &mut retained).unwrap_err();
+        assert!(error.contains("non-UTF-8"), "{error}");
+    }
 
     #[test]
     fn corrupt_sync_state_is_not_an_empty_baseline() {

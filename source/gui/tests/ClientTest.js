@@ -4775,6 +4775,16 @@ function options(id) {
       !doc.getElementById('editorEncodingRetryModal').classList.contains('open'));
     window.markDirty();
     check('unchanged lowercase encoding is not dirty', doc.getElementById('editorStatus').textContent === 'No changes');
+    doc.getElementById('editorEncoding').value = 'utf-16le';
+    window.markDirty();
+    responses['/api/remote/edit'] = { success: false, error: 'File is not valid UTF-8 binary/encoded text.' };
+    await window.openEditor('/tmp/slowremote/other.txt', 'remote', false);
+    window.cancelEditorEncodingRetry();
+    check('cancelling another file retry preserves the open editor format',
+      doc.getElementById('editorEncoding').value === 'utf-16le' &&
+      doc.getElementById('editorStatus').textContent === 'Modified - not saved');
+    doc.getElementById('editorEncoding').value = 'windows-1252';
+    window.markDirty();
     window.closeEditor();
     window.openSearch();
     check('search defaults to backend lowercase utf-8', doc.getElementById('searchEncoding').value === 'utf-8');
