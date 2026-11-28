@@ -10,7 +10,7 @@ cleanup() {
   rm -f "${oversize_download_fixture:-}" "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
   rm -rf -- "$ssh_root" "$ssh_key_dir"
 }
-LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
+LSCP_TEST_PORT=0 LSCP_TEST_DROP_DELETE=/android-partial/b.txt python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
 server=$!
 trap cleanup EXIT
 for _ in $(seq 1 60); do

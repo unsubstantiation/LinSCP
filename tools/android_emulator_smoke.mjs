@@ -379,10 +379,33 @@ const expression = `
     if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
+    await verifyAndroidRemoteEditingAndInterruptedDelete(tab);
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafDocumentCap(tree, root, tab);
+  }
+  async function verifyAndroidRemoteEditingAndInterruptedDelete(tab) {
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-encoding'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'café\r\n', encoding: 'windows-1252', eol: 'crlf'});
+    let refused = false;
+    try { await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt')); }
+    catch (error) { refused = error.status === 400; }
+    if (!refused) throw new Error('Non-UTF-8 remote file opened as UTF-8');
+    const edit = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
+    if (edit.content !== 'café\r\n' || edit.info.encoding !== 'windows-1252') throw new Error('Remote legacy text decoded incorrectly');
+    const search = await invoke('POST', '/api/remote/search', {tab, path: '/android-encoding', pattern: '*.txt', search_contents: true, content_query: 'café', encoding: 'windows-1252'});
+    if (search.matches?.length !== 1 || search.matches[0].name !== 'legacy.txt') throw new Error('Remote legacy text search failed: ' + JSON.stringify(search));
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'naïve\n', encoding: 'windows-1252', eol: 'crlf', base_mtime: edit.info.mtime});
+    const saved = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
+    if (saved.content !== 'naïve\r\n') throw new Error('Remote legacy text save failed');
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-partial'});
+    for (const name of ['a.txt', 'b.txt']) await invoke('POST', '/api/remote/save', {tab, path: '/android-partial/' + name, content: name});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-other.txt', content: 'other'});
+    const result = await invoke('POST', '/api/remote/delete', {tab, names: ['android-other.txt', 'android-partial']});
+    if (result.deleted?.join(',') !== 'android-other.txt' || result.failed?.[0]?.name !== 'android-partial' || !/partially deleted/.test(result.failed[0].error)) throw new Error('Interrupted remote delete was not reported: ' + JSON.stringify(result));
+    const remaining = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/android-partial'));
+    if (remaining.entries?.some(entry => entry.name === 'a.txt') || !remaining.entries?.some(entry => entry.name === 'b.txt')) throw new Error('Interrupted delete did not leave expected partial tree');
   }
   async function verifyAndroidGrantedSafDocumentCap(tree, root, tab) {
     const dir = tree + '/document/cap-fixture';
