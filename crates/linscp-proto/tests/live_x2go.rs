@@ -77,5 +77,7 @@ async fn x2go_kdrive_start_frames_suspend_resume_and_terminate() {
     }).await.expect("timed out waiting for resumed KDrive frame");
     assert!(saw_resumed_main, "resumed server disconnected before main frame");
     channel.close().await.expect("terminate desktop");
+    let sessions = list_sessions(&ssh, Duration::from_secs(15)).await.expect("list after termination");
+    assert!(!sessions.iter().any(|item| item.session_id == id), "terminated session is still listed as running or suspended");
     ssh.disconnect().await.expect("disconnect SSH");
 }
