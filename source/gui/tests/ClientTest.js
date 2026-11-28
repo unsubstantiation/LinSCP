@@ -4402,11 +4402,12 @@ function options(id) {
     }} };
     await new Promise(resolve => setTimeout(resolve, 160));
     check('X2Go opted-in server selection reaches the local clipboard', remoteClipboardWrites.includes('hello'));
-    responses['/api/x2go/poll'] = { success: true, message: {type: 'demand-selection', selection: 0} };
+    responses['/api/x2go/poll'] = { success: true, message: {type: 'demand-selection', selection: 1} };
     await new Promise(resolve => setTimeout(resolve, 160));
     const clipboardCall = calls.filter(call => call.path === '/api/x2go/clipboard').pop();
     check('X2Go selection demand sends local clipboard text',
-      !!clipboardCall && JSON.parse(clipboardCall.options.body).text === 'local clipboard');
+      !!clipboardCall && JSON.parse(clipboardCall.options.body).text === 'local clipboard' &&
+      JSON.parse(clipboardCall.options.body).selection === 1);
     responses['/api/x2go/poll'] = { success: true, message: null };
     await window.suspendX2GoViewer();
     const suspendCall = calls.filter(call => call.path === '/api/x2go/suspend').pop();

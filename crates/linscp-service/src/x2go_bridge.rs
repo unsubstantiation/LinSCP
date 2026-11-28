@@ -76,7 +76,7 @@ pub(crate) enum ExitMode {
 
 enum Command {
     Write([u8; CLIENT_EVENT_SIZE], oneshot::Sender<Result<(), &'static str>>),
-    WriteClipboard(Vec<u8>, oneshot::Sender<Result<(), &'static str>>),
+    WriteClipboard(u32, Vec<u8>, oneshot::Sender<Result<(), &'static str>>),
     Touch,
     Close,
     Suspend,
@@ -98,15 +98,16 @@ impl X2GoInput {
         answer.await.map_err(|_| "KDrive bridge is closed.")?
     }
 
-    pub async fn write_clipboard(&self, text: &str) -> Result<(), &'static str> {
+    pub async fn write_clipboard(&self, selection: u32, text: &str) -> Result<(), &'static str> {
         if !self.allow_clipboard {
             return Err("X2Go clipboard sharing is disabled for this session.");
         }
+        if selection > 1 { return Err("Invalid X2Go clipboard selection."); }
         if text.len() > MAX_CLIPBOARD_BYTES {
             return Err("X2Go clipboard text exceeds the 64 KiB limit.");
         }
         let (reply, answer) = oneshot::channel();
-        self.commands.send(Command::WriteClipboard(text.as_bytes().to_vec(), reply)).await.map_err(|_| "KDrive bridge is closed.")?;
+        self.commands.send(Command::WriteClipboard(selection, text.as_bytes().to_vec(), reply)).await.map_err(|_| "KDrive bridge is closed.")?;
         answer.await.map_err(|_| "KDrive bridge is closed.")?
     }
 }
@@ -224,6 +225,15 @@ pub(crate) fn test_bridge(client: tokio::io::DuplexStream, cleanup_signal: onesh
     X2GoBridge::spawn(reader, writer, async move { let _ = cleanup_signal.send(()); Ok(()) })
 }
 
+#[cfg(test)]
+pub(crate) fn test_blocked_bridge(client: tokio::io::DuplexStream, started: oneshot::Sender<()>, release: oneshot::Receiver<()>) -> X2GoBridge {
+    let channel = linscp_proto::x2go_transport::KDriveChannel {
+        stream: Box::new(client), decoder: linscp_proto::kdrive_wire::Decoder::new(), server_version: 8,
+    };
+    let (reader, writer) = channel.into_halves();
+    X2GoBridge::spawn(reader, writer, async move { let _ = started.send(()); let _ = release.await; Ok(()) })
+}
+
 async fn run<C, F>(mut reader: KDriveReader, mut writer: KDriveWriter,
                    mut commands: mpsc::Receiver<Command>, output: mpsc::Sender<Value>,
                    allow_clipboard: bool, on_failure: ExitMode, cleanup: C, server_silence: Duration) -> Result<ExitMode, &'static str>
@@ -249,9 +259,9 @@ where
                     let _ = reply.send(sent);
                     if failed { result = Err("KDrive input write failed."); break; }
                 }
-                Some(Command::WriteClipboard(bytes, reply)) => {
+                Some(Command::WriteClipboard(selection, bytes, reply)) => {
                     lease = tokio::time::Instant::now() + VIEWER_LEASE;
-                    let sent = writer.write_selection(0, &bytes, WRITE_TIMEOUT).await.map_err(|_| "KDrive clipboard write failed.");
+                    let sent = writer.write_selection(selection, &bytes, WRITE_TIMEOUT).await.map_err(|_| "KDrive clipboard write failed.");
                     let failed = sent.is_err();
                     let _ = reply.send(sent);
                     if failed { result = Err("KDrive clipboard write failed."); break; }
@@ -464,6 +474,31 @@ mod tests {
         assert_eq!(bridge.next_message().await.unwrap()["type"], "disconnect");
         assert_eq!(observed.await.unwrap(), ExitMode::Terminate);
         assert!(bridge.suspend().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn clipboard_is_opt_in_bounded_and_preserves_selection() {
+        let (client, mut server) = tokio::io::duplex(1024);
+        let channel = KDriveChannel { stream: Box::new(client), decoder: Decoder::new(), server_version: 8 };
+        let (reader, writer) = channel.into_halves();
+        let bridge = X2GoBridge::spawn_with_mode(reader, writer, true, ExitMode::Terminate, |_| async { Ok(()) });
+        assert!(bridge.input().write_clipboard(2, "no").await.is_err());
+        assert!(bridge.input().write_clipboard(0, &"x".repeat(MAX_CLIPBOARD_BYTES + 1)).await.is_err());
+        assert!(bridge.input().write_clipboard(1, "hello").await.is_ok());
+        let mut packet = [0u8; CLIENT_EVENT_SIZE];
+        server.read_exact(&mut packet).await.unwrap();
+        assert_eq!(u32_at(&packet, 0), 9);
+        assert_eq!(u32_at(&packet, 4), 1);
+        assert_eq!(u32_at(&packet, 12), 5);
+        let mut text = [0u8; 5];
+        server.read_exact(&mut text).await.unwrap();
+        assert_eq!(&text, b"hello");
+        assert!(bridge.close().await.is_ok());
+        let (client, _server) = tokio::io::duplex(1024);
+        let (signal, _observed) = oneshot::channel();
+        let bridge = test_bridge(client, signal);
+        assert!(bridge.input().write_clipboard(0, "private").await.is_err());
+        assert!(bridge.close().await.is_ok());
     }
 
     #[tokio::test]

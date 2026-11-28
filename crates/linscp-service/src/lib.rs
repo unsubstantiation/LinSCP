@@ -111,6 +111,7 @@ struct InnerState {
     x2go: HashMap<u64, X2GoRegistered>,
     x2go_next_generation: u64,
     x2go_pending: std::collections::HashSet<u64>,
+    x2go_stopping: std::collections::HashSet<u64>,
     desktop_tunnels: HashMap<u64, (Option<u64>, linscp_proto::tunnel::LocalForwardRelay)>,
     next_desktop_tunnel_id: u64,
     monitors: monitor::Monitors,
@@ -155,11 +156,28 @@ impl Drop for InnerState {
 // them. It is not an authentication credential; normal API access controls apply.
 struct X2GoRegistered { generation: String, bridge: x2go_bridge::X2GoBridge }
 
+fn x2go_clipboard_opt_in(body: &Value) -> bool {
+    // The current field is authoritative even if malformed; never turn on
+    // sharing via the legacy alias when an explicit current field is present.
+    match body.get("allow_clipboard") {
+        Some(value) => value.as_bool().unwrap_or(false),
+        None => body.get("clipboard").and_then(Value::as_bool).unwrap_or(false),
+    }
+}
+
 /// Clears a tab's in-progress reservation even if an open request is cancelled.
 struct X2GoOpenReservation { state: Arc<Mutex<InnerState>>, tab: u64 }
 impl Drop for X2GoOpenReservation {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() { state.x2go_pending.remove(&self.tab); }
+    }
+}
+
+// Kept by the detached shutdown task, including when its API caller cancels.
+struct X2GoStopReservation { state: Arc<Mutex<InnerState>>, tab: u64 }
+impl Drop for X2GoStopReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() { state.x2go_stopping.remove(&self.tab); }
     }
 }
 
@@ -265,6 +283,7 @@ impl CommanderService {
                 terminals: terminal_bridge::TerminalRegistry::default(),
                 x2go: HashMap::new(),
                 x2go_pending: std::collections::HashSet::new(),
+                x2go_stopping: std::collections::HashSet::new(),
                 x2go_next_generation: 0,
                 desktop_tunnels: HashMap::new(),
                 next_desktop_tunnel_id: 0,
@@ -3448,13 +3467,35 @@ impl CommanderService {
     /// Starts only on an existing authenticated tab; no host or credentials
     /// from the request can redirect the graphics connection to another host.
     async fn x2go_open(&self, body: Value) -> ApiReply {
+        // Keep the tab reservation through the entire startup, even if the
+        // requesting transport disappears. If nobody can receive a successful
+        // open, release the registered bridge using its generation.
+        let service = self.clone();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let reply = service.x2go_open_inner(body).await;
+            if let Err(reply) = sender.send(reply) {
+                if reply.payload.get("success").and_then(Value::as_bool) == Some(true) {
+                    let cleanup = json!({"tab": reply.payload["tab"], "generation": reply.payload["generation"]});
+                    let resumed = reply.payload.get("resumed").and_then(Value::as_bool).unwrap_or(false);
+                    let _ = service.x2go_finish(cleanup, resumed).await;
+                }
+            }
+        });
+        match receiver.await {
+            Ok(reply) => reply,
+            Err(_) => api_error(500, "X2Go startup task failed; remote state is unknown."),
+        }
+    }
+
+    async fn x2go_open_inner(&self, body: Value) -> ApiReply {
         use linscp_proto::x2go_control::{
             resume_command, resume_guarded_agent, start_command, start_guarded_agent, X2GoDesktop, X2GoLink,
         };
         use linscp_proto::x2go_transport::GuardedKDriveSession;
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
         let resume_session_id = body.get("resume_session_id").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
-        let allow_clipboard = body.get("clipboard").and_then(Value::as_bool).unwrap_or(false);
+        let allow_clipboard = x2go_clipboard_opt_in(&body);
         let desktop = match body.get("desktop").and_then(Value::as_str) {
             Some("XFCE") => Some(X2GoDesktop::Xfce),
             Some("MATE") => Some(X2GoDesktop::Mate),
@@ -3473,7 +3514,7 @@ impl CommanderService {
         }
         let (session, ssh) = {
             let mut state = self.state.lock().expect("state mutex");
-            if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) { return api_error(409, "An X2Go viewer is already open or starting for this tab."); }
+            if state.x2go.contains_key(&id) || state.x2go_pending.contains(&id) || state.x2go_stopping.contains(&id) { return api_error(409, "An X2Go viewer is already open, starting, or stopping for this tab."); }
             let Some(tab) = state.tabs.get(&id).filter(|tab| tab.connected && !tab.is_local) else { return api_error(400, "Not connected"); };
             let Some(session) = tab.remote.as_ref().cloned() else { return api_error(400, "Not connected"); };
             let Some(ssh) = session.ssh_connection().cloned() else { return api_error(400, "This session has no SSH connection."); };
@@ -3643,6 +3684,10 @@ impl CommanderService {
         let Some(text) = body.get("text").and_then(Value::as_str) else {
             return api_error(400, "Clipboard text is required.");
         };
+        let selection = match body.get("selection") {
+            None => 0,
+            Some(value) => match value.as_u64() { Some(value @ 0..=1) => value as u32, _ => return api_error(400, "Invalid X2Go clipboard selection.") },
+        };
         let input = {
             let state = self.state.lock().expect("state mutex");
             match state.x2go.get(&id).filter(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
@@ -3650,43 +3695,46 @@ impl CommanderService {
                 None => return api_error(400, "X2Go viewer is not open."),
             }
         };
-        match input.write_clipboard(text).await {
+        match input.write_clipboard(selection, text).await {
             Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
             Err(error) => api_error(400, error),
         }
     }
 
     async fn x2go_suspend(&self, body: Value) -> ApiReply {
-        let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
-        let bridge = {
-            let mut state = self.state.lock().expect("state mutex");
-            if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
-                state.x2go.remove(&id).map(|entry| entry.bridge)
-            } else {
-                None
-            }
-        };
-        let Some(bridge) = bridge else {
-            return api_error(400, "X2Go viewer is not open.");
-        };
-        match bridge.suspend().await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true, "suspended": true}) },
-            Err(error) => api_error(400, error),
-        }
+        self.x2go_finish(body, true).await
     }
 
     async fn x2go_close(&self, body: Value) -> ApiReply {
+        self.x2go_finish(body, false).await
+    }
+
+    async fn x2go_finish(&self, body: Value, suspend: bool) -> ApiReply {
         let Some(id) = tabs::parse_tab_id_value(body.get("tab")) else { return api_error(400, "No active tab"); };
         let bridge = {
             let mut state = self.state.lock().expect("state mutex");
             if state.x2go.get(&id).is_some_and(|entry| body.get("generation").and_then(Value::as_str) == Some(entry.generation.as_str())) {
-                state.x2go.remove(&id).map(|entry| entry.bridge)
+                let bridge = state.x2go.remove(&id).map(|entry| entry.bridge);
+                if bridge.is_some() { state.x2go_stopping.insert(id); }
+                bridge
             } else { None }
         };
-        let Some(bridge) = bridge else { return ApiReply { status: 200, payload: json!({"success": true}) }; };
-        match bridge.close().await {
-            Ok(()) => ApiReply { status: 200, payload: json!({"success": true}) },
-            Err(error) => api_error(400, error),
+        let Some(bridge) = bridge else {
+            return if suspend { api_error(400, "X2Go viewer is not open.") }
+                else { ApiReply { status: 200, payload: json!({"success": true}) } };
+        };
+        // Serialize a replacement viewer behind remote shutdown. The detached
+        // task owns the reservation so cancellation of the API request cannot
+        // let an old suspend/terminate race a new session on the same tab.
+        let reservation = X2GoStopReservation { state: self.state.clone(), tab: id };
+        let task = tokio::spawn(async move {
+            let _reservation = reservation;
+            if suspend { bridge.suspend().await } else { bridge.close().await }
+        });
+        match task.await {
+            Ok(Ok(())) => ApiReply { status: 200, payload: json!({"success": true, "suspended": suspend}) },
+            Ok(Err(error)) => api_error(400, error),
+            Err(_) => api_error(400, "X2Go shutdown task failed; remote state is unknown."),
         }
     }
 
@@ -13390,6 +13438,15 @@ mod tests {
         assert!(saved_sudo_credentials(&tab, &store).is_none());
     }
 
+    #[test]
+    fn x2go_clipboard_opt_in_uses_the_gui_field_and_defaults_off() {
+        assert!(!x2go_clipboard_opt_in(&json!({})));
+        assert!(x2go_clipboard_opt_in(&json!({"allow_clipboard": true})));
+        assert!(!x2go_clipboard_opt_in(&json!({"allow_clipboard": false, "clipboard": true})));
+        assert!(!x2go_clipboard_opt_in(&json!({"allow_clipboard": "true", "clipboard": true})));
+        assert!(x2go_clipboard_opt_in(&json!({"clipboard": true})));
+    }
+
     #[tokio::test]
     async fn x2go_open_rejects_invalid_requests_without_starting_an_agent() {
         let tmp = tempfile::tempdir().unwrap();
@@ -13453,6 +13510,36 @@ mod tests {
         assert_eq!(closed.status, 200);
         assert!(cleanup.await.is_ok());
         assert_eq!(svc.dispatch(request("GET", "/api/x2go/poll?tab=7&generation=1", json!({}))).status, 400);
+    }
+
+    #[tokio::test]
+    async fn x2go_reopen_waits_for_cancelled_suspend_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let (client, _server) = tokio::io::duplex(1024);
+        let (started, observed) = tokio::sync::oneshot::channel();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        svc.state.lock().unwrap().x2go.insert(7, X2GoRegistered {
+            generation: "1".into(), bridge: x2go_bridge::test_blocked_bridge(client, started, wait),
+        });
+        let other = svc.clone();
+        let request = tokio::spawn(async move {
+            other.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/x2go/suspend".into(), body: json!({"tab":7,"generation":"1"}) }).await
+        });
+        observed.await.unwrap();
+        request.abort();
+        let _ = request.await;
+        let open = || ApiEnvelope { method: "POST".into(), path: "/api/x2go/open".into(), body: json!({"tab":7,"desktop":"XFCE","width":800,"height":600}) };
+        assert_eq!(svc.dispatch_async(open()).await.status, 409);
+        assert!(svc.state.lock().unwrap().x2go_stopping.contains(&7));
+        release.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if !svc.state.lock().unwrap().x2go_stopping.contains(&7) { break; }
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert_eq!(svc.dispatch_async(open()).await.status, 400); // no connected tab, not stuck stopping
     }
 
     #[tokio::test]

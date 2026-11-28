@@ -10374,7 +10374,8 @@
     } catch (_) { /* Clipboard permissions can be unavailable in a WebView. */ }
   }
 
-  async function sendX2GoClipboard() {
+  async function sendX2GoClipboard(selection = 0) {
+    if (selection !== 0 && selection !== 1) return;
     const run = x2goViewerRun;
     if (!run || !run.opened || !run.allowClipboard) return;
     let text = null;
@@ -10397,7 +10398,7 @@
         return;
       }
     }
-    const res = await apiPost('/api/x2go/clipboard', { tab: run.tab, generation: run.generation, text: text || '' });
+    const res = await apiPost('/api/x2go/clipboard', { tab: run.tab, generation: run.generation, selection, text: text || '' });
     if (!res || !res.success) {
       toast(errorMessage(res && res.error, t('Cannot send clipboard to X2Go.')), true);
     } else {
@@ -10458,7 +10459,7 @@
       }, {
         capsLock: false, numLock: false, rightAltIsAltGr: false,
         onSelection: allowClipboard ? text => { void receiveX2GoClipboard(text); } : undefined,
-        onSelectionDemand: allowClipboard ? () => { void sendX2GoClipboard(); } : undefined,
+        onSelectionDemand: allowClipboard ? selection => { void sendX2GoClipboard(selection); } : undefined,
         onError: () => { if (!run.cancelled) { toast(t('The X2Go viewer session ended.'), true); closeX2GoViewer(true); } }
       });
       const openPayload = {tab: tabId, desktop: previous.data.desktop, width, height, allow_clipboard: allowClipboard};
