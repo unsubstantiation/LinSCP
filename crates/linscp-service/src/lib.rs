@@ -9958,6 +9958,9 @@ impl CommanderService {
     }
 
     fn handle_desktop_launch(&self, body: Value) -> ApiReply {
+        if body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false) {
+            return api_error(400, "SSH desktop tunneling requires async launch with a connected SSH session.");
+        }
         let tab_id = tabs::parse_tab_id_value(body.get("tab"))
             .or_else(|| body.get("tabId").and_then(|v| v.as_u64()))
             .or_else(|| body.get("tab_id").and_then(|v| v.as_u64()));

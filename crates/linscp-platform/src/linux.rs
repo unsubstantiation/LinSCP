@@ -19,22 +19,36 @@ pub enum DesktopSessionKind {
 
 /// Detects the active Linux display session without hardcoding X11 assumptions.
 pub fn detect_desktop_session() -> DesktopSessionKind {
-    if std::env::var_os("WAYLAND_DISPLAY")
-        .filter(|v| !v.is_empty())
-        .is_some()
-        || std::env::var("XDG_SESSION_TYPE")
-            .map(|v| v.eq_ignore_ascii_case("wayland"))
-            .unwrap_or(false)
-    {
+    classify_desktop_session(
+        std::env::var_os("WAYLAND_DISPLAY").as_deref(),
+        std::env::var_os("XDG_SESSION_TYPE").as_deref(),
+        std::env::var_os("DISPLAY").as_deref(),
+    )
+}
+
+fn classify_desktop_session(wayland: Option<&std::ffi::OsStr>, session: Option<&std::ffi::OsStr>, display: Option<&std::ffi::OsStr>) -> DesktopSessionKind {
+    if wayland.is_some_and(|v| !v.is_empty())
+        || session.and_then(|v| v.to_str()).is_some_and(|v| v.eq_ignore_ascii_case("wayland")) {
         return DesktopSessionKind::Wayland;
     }
-    if std::env::var_os("DISPLAY")
-        .filter(|v| !v.is_empty())
-        .is_some()
-    {
-        return DesktopSessionKind::X11;
-    }
+    if display.is_some_and(|v| !v.is_empty()) { return DesktopSessionKind::X11; }
     DesktopSessionKind::Headless
+}
+
+#[cfg(test)]
+mod desktop_session_tests {
+    use super::*;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn session_environment_classification() {
+        let val = |s: &'static str| Some(OsStr::new(s));
+        assert_eq!(classify_desktop_session(None, None, None), DesktopSessionKind::Headless);
+        assert_eq!(classify_desktop_session(val(""), None, val("")), DesktopSessionKind::Headless);
+        assert_eq!(classify_desktop_session(None, None, val(":0")), DesktopSessionKind::X11);
+        assert_eq!(classify_desktop_session(val("wayland-0"), None, val(":0")), DesktopSessionKind::Wayland);
+        assert_eq!(classify_desktop_session(None, val("WaYlAnD"), None), DesktopSessionKind::Wayland);
+    }
 }
 
 pub fn default_config_dir() -> PathBuf {
