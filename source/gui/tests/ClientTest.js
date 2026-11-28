@@ -4437,6 +4437,12 @@ function options(id) {
     window.remoteDesktopKindChanged();
     await window.refreshX2GoSessions();
     doc.getElementById('x2goSessionSelect').value = 'alice-50-1700000000_stDXFCE_dp24';
+    const termBefore = calls.filter(call => call.path === '/api/x2go/terminate').length;
+    confirmResult = false;
+    await window.terminateSelectedX2GoSession();
+    check('Cancelling X2Go termination preserves the selected session',
+      calls.filter(call => call.path === '/api/x2go/terminate').length === termBefore);
+    confirmResult = true;
     await window.terminateSelectedX2GoSession();
     const termCall = calls.filter(call => call.path === '/api/x2go/terminate').pop();
     check('Terminating a listed X2Go session posts session_id to /api/x2go/terminate',

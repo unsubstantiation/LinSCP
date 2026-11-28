@@ -1417,6 +1417,7 @@
   "Terminal Help": "Ayuda de la terminal",
   "Terminal:": "Terminal:",
   "Terminate session": "Terminar sesión",
+  "Terminate X2Go session {session}? Unsaved work may be lost.": "¿Finalizar la sesión X2Go {session}? Se puede perder el trabajo sin guardar.",
   "Terminated X2Go session {session}.": "Sesión X2Go {session} terminada.",
   "Test beep": "Probar pitido",
   "Text": "Texto",

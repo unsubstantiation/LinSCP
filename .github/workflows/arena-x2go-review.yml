@@ -44,3 +44,35 @@ jobs:
             candidate=$(apt-cache policy "$package" | sed -n 's/^  Candidate: //p')
             echo "::notice::$package candidate ${candidate:-unavailable}"
           done
+
+  live-kdrive:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: transfer-move-review
+      - name: Install isolated KDrive and SSH fixture
+        run: |
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq x2goserver x2goserver-xsession x2goserver-x2gokdrive xserver-x2gokdrive xfce4 dbus-x11 openssh-server
+          sudo useradd -m -s /bin/bash x2gotest
+          echo 'x2gotest:fixture-password' | sudo chpasswd
+          if getent group x2gouser >/dev/null; then sudo usermod -a -G x2gouser x2gotest; fi
+          sudo mkdir -p /run/sshd
+          sudo ssh-keygen -A
+          sudo /usr/sbin/sshd -p 22222 -o PasswordAuthentication=yes -o KbdInteractiveAuthentication=no -o UsePAM=yes
+      - name: Exercise real KDrive startup and recovery
+        env:
+          LSCP_LIVE_X2GO: '1'
+        run: |
+          set +e
+          cargo test -p linscp-proto --test live_x2go -- --nocapture > live-x2go.log 2>&1
+          status=$?
+          tail -100 live-x2go.log
+          if [ "$status" != 0 ]; then
+            python -c 'import pathlib; s=pathlib.Path("live-x2go.log").read_text(errors="replace"); s=s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error::" + s[-16000:])'
+          fi
+          exit "$status"

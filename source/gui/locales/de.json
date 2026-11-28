@@ -1417,6 +1417,7 @@
   "Terminal Help": "Terminal-Hilfe",
   "Terminal:": "Terminal:",
   "Terminate session": "Sitzung beenden",
+  "Terminate X2Go session {session}? Unsaved work may be lost.": "X2Go-Sitzung {session} beenden? Nicht gespeicherte Arbeit kann verloren gehen.",
   "Terminated X2Go session {session}.": "X2Go-Sitzung {session} beendet.",
   "Test beep": "Signalton testen",
   "Text": "Text",

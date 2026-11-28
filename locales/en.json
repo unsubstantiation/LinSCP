@@ -1878,6 +1878,7 @@
     "Terminal": "Terminal",
     "Terminal Help": "Terminal Help",
     "Terminal:": "Terminal:",
+    "Terminate X2Go session {session}? Unsaved work may be lost.": "Terminate X2Go session {session}? Unsaved work may be lost.",
     "Terminate session": "Terminate session",
     "Terminated X2Go session {session}.": "Terminated X2Go session {session}.",
     "Test beep": "Test beep",
