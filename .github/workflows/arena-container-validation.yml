@@ -11,4 +11,4 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo test -p linscp-platform container_
+      - run: cargo test -p linscp-platform

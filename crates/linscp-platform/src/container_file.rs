@@ -166,10 +166,32 @@ mod tests {
         }
         let ready = dir.join("ready").exists();
         let excluded = ready && ContainerFile::try_acquire(&dir.join("vault.dat")).is_err();
-        std::fs::write(dir.join("release"), b"release").unwrap();
+        // An abrupt termination must release the OS lock without unlinking it.
+        if ready { child.kill().unwrap(); }
         let status = child.wait().unwrap();
-        assert!(ready && excluded && status.success(), "child lock was not exclusive");
+        assert!(ready && excluded && !status.success(), "child lock was not exclusive");
         drop(ContainerFile::try_acquire(&dir.join("vault.dat")).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn container_refuses_hardlinked_vault() {
+        let dir = std::env::temp_dir().join(format!("linscp-container-links-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("vault.dat");
+        let container = ContainerFile::try_acquire(&path).unwrap();
+        container.create("test password", b"original").unwrap();
+        let before = std::fs::read(&path).unwrap();
+        match std::fs::hard_link(&path, dir.join("alias")) {
+            Ok(()) => {
+                assert!(container.open("test password").is_err());
+                assert!(container.save("test password", b"modified").is_err());
+                assert_eq!(std::fs::read(&path).unwrap(), before);
+            }
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::Unsupported | std::io::ErrorKind::PermissionDenied) => {},
+            Err(e) => panic!("hard link creation failed: {e}"),
+        }
+        drop(container);
         std::fs::remove_dir_all(dir).unwrap();
     }
 
