@@ -12700,7 +12700,7 @@ impl Drop for TemporaryVaultKeys {
 fn materialize_vault_key_paths(
     spec: &mut linscp_engine::url_and_raw::ParsedSiteSpec,
     config_root: &Path,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn SecretVault,
 ) -> Result<TemporaryVaultKeys, String> {
     let mut temporary = TemporaryVaultKeys(Vec::new());
     materialize_one_vault_key(&mut spec.session.keyfile, config_root, vault, &mut temporary.0)?;
@@ -12717,7 +12717,7 @@ fn materialize_one_vault_tls_blob(
     field: &str,
     raw_fields: &mut BTreeMap<String, String>,
     config_root: &Path,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn SecretVault,
     created: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let Some(reference) = raw_fields.get(field).cloned() else { return Ok(()); };
@@ -12725,15 +12725,24 @@ fn materialize_one_vault_tls_blob(
     if !valid_vault_key_id(id) {
         return Err(format!("Saved vault TLS reference in '{field}' is invalid."));
     }
-    let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
-    let metadata = std::fs::metadata(&encrypted_path)
-        .map_err(|error| format!("Cannot read saved TLS material: {error}"))?;
-    if metadata.len() > TLS_VAULT_BLOB_LIMIT + 64 {
-        return Err("Encrypted TLS material file is unexpectedly large.".to_string());
+    let plaintext = match vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::Tls, id).map_err(|e| e.to_string())? {
+        linscp_platform::VaultMaterialRead::Plaintext(bytes) => bytes,
+        linscp_platform::VaultMaterialRead::Missing => return Err("Saved TLS material is no longer in the vault.".into()),
+        linscp_platform::VaultMaterialRead::Unhandled => {
+            let encrypted_path = config_root.join("keys").join(format!("{id}.tls.vault"));
+            let metadata = std::fs::metadata(&encrypted_path)
+                .map_err(|error| format!("Cannot read saved TLS material: {error}"))?;
+            if metadata.len() > TLS_VAULT_BLOB_LIMIT + 64 {
+                return Err("Encrypted TLS material file is unexpectedly large.".to_string());
+            }
+            let encrypted = std::fs::read(&encrypted_path)
+                .map_err(|error| format!("Cannot read saved TLS material: {error}"))?;
+            vault.open_session_store(&encrypted).map_err(|error| error.to_string())?
+        }
+    };
+    if plaintext.is_empty() || plaintext.len() as u64 > TLS_VAULT_BLOB_LIMIT {
+        return Err("Invalid saved TLS material size.".into());
     }
-    let encrypted = std::fs::read(&encrypted_path)
-        .map_err(|error| format!("Cannot read saved TLS material: {error}"))?;
-    let plaintext = vault.open_local_blob(&encrypted).map_err(|error| error.to_string())?;
     let temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
     linscp_platform::create_private_dir(&temp_dir).map_err(|error| error.to_string())?;
     for _ in 0..8 {
@@ -12760,7 +12769,7 @@ fn materialize_one_vault_tls_blob(
 fn materialize_one_vault_key(
     keyfile: &mut Option<String>,
     config_root: &Path,
-    vault: &linscp_platform::password_vault::PasswordSecretVault,
+    vault: &dyn SecretVault,
     created: &mut Vec<PathBuf>,
 ) -> Result<(), String> {
     let Some(reference) = keyfile.as_deref() else { return Ok(()); };
@@ -12768,15 +12777,33 @@ fn materialize_one_vault_key(
     if !valid_vault_key_id(id) {
         return Err("Saved encrypted SSH key reference is invalid.".to_string());
     }
-    let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
-    let metadata = std::fs::metadata(&encrypted_path)
-        .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-    if metadata.len() > 1024 * 1024 {
-        return Err("Encrypted SSH key file is unexpectedly large.".to_string());
-    }
-    let encrypted = std::fs::read(&encrypted_path)
-        .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
-    let plaintext = vault.open_local_blob(&encrypted).map_err(|error| error.to_string())?;
+    let plaintext = match vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::SshPrivate, id).map_err(|e| e.to_string())? {
+        linscp_platform::VaultMaterialRead::Plaintext(bytes) => bytes,
+        linscp_platform::VaultMaterialRead::Missing => return Err("Saved encrypted SSH key is no longer in the vault.".into()),
+        linscp_platform::VaultMaterialRead::Unhandled => {
+            let encrypted_path = config_root.join("keys").join(format!("{id}.key.vault"));
+            let metadata = std::fs::metadata(&encrypted_path)
+                .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+            if metadata.len() > 1024 * 1024 {
+                return Err("Encrypted SSH key file is unexpectedly large.".to_string());
+            }
+            let encrypted = std::fs::read(&encrypted_path)
+                .map_err(|error| format!("Cannot read encrypted SSH key: {error}"))?;
+            vault.open_session_store(&encrypted).map_err(|error| error.to_string())?
+        }
+    };
+    if plaintext.is_empty() || plaintext.len() > 1024 * 1024 { return Err("Invalid saved SSH key size.".into()); }
+    let public = match vault.read_vault_material(config_root, linscp_platform::VaultMaterialKind::SshPublic, id).map_err(|e| e.to_string())? {
+        linscp_platform::VaultMaterialRead::Plaintext(bytes) => {
+            if bytes.len() > 32 * 1024 { return Err("Saved SSH public key is unexpectedly large.".into()); }
+            std::str::from_utf8(&bytes).map_err(|_| "Saved SSH public key is not UTF-8")?.to_owned()
+        }
+        linscp_platform::VaultMaterialRead::Missing => String::new(),
+        linscp_platform::VaultMaterialRead::Unhandled => {
+            let source = config_root.join("keys").join(format!("{id}.pub"));
+            read_bounded_key_optional(&source, 32 * 1024)?
+        }
+    };
     let temp_dir = config_root.join("tmp").join("unlocked-keys").join(std::process::id().to_string());
     linscp_platform::create_private_dir(&temp_dir).map_err(|error| error.to_string())?;
     for _ in 0..8 {
@@ -12792,11 +12819,6 @@ fn materialize_one_vault_key(
                 return Err(error.to_string());
             }
         }
-        let source_public = config_root.join("keys").join(format!("{id}.pub"));
-        let public = match read_bounded_key_optional(&source_public, 32 * 1024) {
-            Ok(public) => public,
-            Err(error) => return Err(error),
-        };
         if !public.is_empty() {
             let public_path = PathBuf::from(format!("{}.pub", path.display()));
             match write_exclusive_private_file(&public_path, public.as_bytes()) {
@@ -13303,6 +13325,42 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    #[test]
+    fn container_key_materialization_uses_container_and_cleans_stages() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer, NewSshKey, NewTlsMaterial};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let unlocked = vault.unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        let ssh_id = "11111111111111111111111111111111";
+        let tls_id = "22222222222222222222222222222222";
+        let key = NewSshKey { id: ssh_id, private: b"private SSH material", label: "key", public_key: "ssh-ed25519 public" };
+        let tls = NewTlsMaterial { id: tls_id, data: b"private TLS material" };
+        bridge.save_sessions_with_materials(&SessionStore::new(), &[key], &[tls], &[]).unwrap();
+        let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+        spec.session.keyfile = Some(format!("vaultkey://{ssh_id}"));
+        spec.raw_fields.insert("tls_certificate_key_file".into(), format!("vaulttls://{tls_id}"));
+        let staged = materialize_vault_key_paths(&mut spec, dir.path(), &bridge).unwrap();
+        let ssh_path = PathBuf::from(spec.session.keyfile.as_ref().unwrap());
+        let pub_path = PathBuf::from(format!("{}.pub", ssh_path.display()));
+        let tls_path = PathBuf::from(spec.raw_fields.get("tls_certificate_key_file").unwrap());
+        assert_eq!(std::fs::read(&ssh_path).unwrap(), b"private SSH material");
+        assert_eq!(std::fs::read(&pub_path).unwrap(), b"ssh-ed25519 public");
+        assert_eq!(std::fs::read(&tls_path).unwrap(), b"private TLS material");
+        assert!(!dir.path().join("keys").exists());
+        drop(staged);
+        assert!(!ssh_path.exists() && !pub_path.exists() && !tls_path.exists());
+        let mut missing = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+        missing.session.keyfile = Some("vaultkey://ffffffffffffffffffffffffffffffff".into());
+        assert!(materialize_vault_key_paths(&mut missing, dir.path(), &bridge).is_err());
+        bridge.lock().unwrap();
+        let mut locked = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+        locked.session.keyfile = Some(format!("vaultkey://{ssh_id}"));
+        assert!(materialize_vault_key_paths(&mut locked, dir.path(), &bridge).is_err());
+    }
 
     /// The native dispatcher is single-user, even if a legacy accounts file
     /// exists. These compatibility endpoints must not imply authentication

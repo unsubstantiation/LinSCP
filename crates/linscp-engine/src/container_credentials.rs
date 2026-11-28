@@ -528,6 +528,30 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
         linscp_platform::password_vault::open_blob_with_master_key(encrypted, &master)
     }
 
+    fn read_vault_material(&self, config_dir: &std::path::Path, kind: linscp_platform::VaultMaterialKind, id: &str) -> Result<linscp_platform::VaultMaterialRead, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        if !vault_keys::valid_id(id) { return Err(Self::error("Invalid vault material ID")); }
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        let result = match kind {
+            linscp_platform::VaultMaterialKind::SshPrivate => document.keys.iter()
+                .find(|key| key.id.eq_ignore_ascii_case(id))
+                .map(|key| BASE64.decode(&key.private_b64).map_err(Self::error)).transpose()?,
+            linscp_platform::VaultMaterialKind::Tls => document.tls.iter()
+                .find(|blob| blob.id.eq_ignore_ascii_case(id))
+                .map(|blob| BASE64.decode(&blob.data_b64).map_err(Self::error)).transpose()?,
+            linscp_platform::VaultMaterialKind::SshPublic => document.keys.iter()
+                .find(|key| key.id.eq_ignore_ascii_case(id) && !key.public_key.is_empty())
+                .map(|key| key.public_key.as_bytes().to_vec())
+                .or_else(|| document.public_keys.iter().find(|key| key.id.eq_ignore_ascii_case(id)).map(|key| key.public_key.as_bytes().to_vec())),
+        };
+        Ok(match result {
+            Some(bytes) => linscp_platform::VaultMaterialRead::Plaintext(Zeroizing::new(bytes)),
+            None => linscp_platform::VaultMaterialRead::Missing,
+        })
+    }
+
     fn read_protected_file(&self, path: &std::path::Path, domain: &str) -> Result<linscp_platform::ProtectedFileRead, linscp_platform::PlatformError> {
         self.check_protected_path(path, domain)?;
         let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;

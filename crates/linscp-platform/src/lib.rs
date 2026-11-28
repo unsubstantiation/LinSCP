@@ -287,6 +287,16 @@ pub enum ProtectedFileRead {
     Plaintext(Zeroizing<Vec<u8>>),
 }
 
+/// Material referenced by a saved session and resolved by its vault backend.
+#[derive(Clone, Copy)]
+pub enum VaultMaterialKind { SshPrivate, SshPublic, Tls }
+
+pub enum VaultMaterialRead {
+    Unhandled,
+    Missing,
+    Plaintext(Zeroizing<Vec<u8>>),
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
@@ -308,6 +318,11 @@ pub trait SecretVault: Send + Sync {
     }
     fn write_protected_file(&self, _path: &Path, _domain: &str, _value: &[u8]) -> Result<bool, PlatformError> {
         Ok(false)
+    }
+    /// Optional virtual key-material lookup; handled backends must not fall
+    /// back to unrelated filesystem material for missing or locked entries.
+    fn read_vault_material(&self, _config_dir: &Path, _kind: VaultMaterialKind, _id: &str) -> Result<VaultMaterialRead, PlatformError> {
+        Ok(VaultMaterialRead::Unhandled)
     }
     /// The local password vault protects the entire session store, not just secrets.
     fn protects_session_store(&self) -> bool { false }
