@@ -62,3 +62,5 @@ Historical CLI-dependent suites and generic all-platform criteria in the generat
 - These classifications are planning aids. New tests may uncover implementation defects, and a user/product decision may change optional scope.
 
 See [remaining parity priorities](remaining-parity-priorities.md) for the localization, XML and recursive SCP assessment.
+
+See the [final parity review](final-parity-review.md) for the cross-platform test runs and outstanding limitations.
