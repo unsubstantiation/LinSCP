@@ -236,6 +236,38 @@ pub fn ensure_private_dir(dir: &Path) -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Create a new owner-only file in an existing directory without altering its DACL.
+/// The protected DACL is supplied at creation, before any data can be written.
+pub(crate) fn create_container_private_file(path: &Path) -> Result<File, PlatformError> {
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;
+    use windows_sys::Win32::Storage::FileSystem::{CreateFileW, CREATE_NEW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE};
+
+    let name = to_wide_null(&to_extended_length_path(path));
+    let sddl = str_to_wide_null("D:P(A;;FA;;;OW)");
+    // SAFETY: all pointers passed to Windows are valid for the duration of the
+    // calls; the security descriptor is released exactly once after CreateFileW.
+    unsafe {
+        let mut descriptor: *mut std::ffi::c_void = std::ptr::null_mut();
+        if ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), SDDL_REVISION_1, &mut descriptor, std::ptr::null_mut()) == 0 {
+            return Err(PlatformError::Io(std::io::Error::last_os_error()));
+        }
+        let attributes = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: descriptor,
+            bInheritHandle: 0,
+        };
+        let handle = CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, &attributes, CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, std::ptr::null_mut());
+        let create_error = if handle == INVALID_HANDLE_VALUE { Some(std::io::Error::last_os_error()) } else { None };
+        LocalFree(descriptor as HLOCAL);
+        if let Some(err) = create_error { return Err(PlatformError::Io(err)); }
+        Ok(File::from_raw_handle(handle))
+    }
+}
+
 pub fn open_private_temp_file(path: &Path) -> Result<File, PlatformError> {
     let file = OpenOptions::new()
         .write(true)
@@ -936,6 +968,28 @@ mod tests {
         let deep = format!(r"C:\{}", "segment\\".repeat(35));
         let converted = to_extended_length_path(Path::new(&deep));
         assert!(converted.to_string_lossy().starts_with(r"\\?\C:\"));
+    }
+
+    #[test]
+    fn container_file_has_private_dacl_without_changing_parent() {
+        let dir = std::env::temp_dir().join(format!("linscp-container-acl-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let parent_before = dacl_summary(&dir).unwrap();
+        let path = dir.join("vault.dat");
+        let container = crate::container_file::ContainerFile::try_acquire(&path).unwrap();
+        container.create("test password", b"first").unwrap();
+        for expected in [b"first".as_slice(), b"second".as_slice()] {
+            if expected == b"second" { container.save("test password", expected).unwrap(); }
+            assert_eq!(container.open("test password").unwrap().as_slice(), expected);
+            let (count, kind, flags, mask) = dacl_summary(&path).unwrap();
+            assert_eq!(count, 1, "no inherited or additional ACEs");
+            assert_eq!(kind, ACCESS_ALLOWED_ACE_TYPE);
+            assert_eq!(flags, 0, "file ACE is not inherited");
+            assert_eq!(mask, FILE_ALL_ACCESS);
+            assert_eq!(dacl_summary(&dir).unwrap(), parent_before, "parent DACL must not change");
+        }
+        drop(container);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

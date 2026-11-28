@@ -21,6 +21,7 @@ pub mod url_registration;
 pub mod desktop;
 pub mod password_vault;
 pub mod container_cipher;
+pub mod container_file;
 pub mod gssapi_sys;
 pub mod gui_os;
 pub mod terminal;
