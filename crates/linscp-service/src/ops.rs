@@ -2166,11 +2166,11 @@ mod tests {
                 let root = root.path();
                 let id = &id;
                 let barrier = &barrier;
-                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id).is_ok() }));
+                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id) }));
             }
-            threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count()
+            threads.into_iter().map(|thread| thread.join().unwrap()).collect::<Vec<_>>()
         });
-        assert_eq!(results, 1);
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1, "claim results: {results:?}");
     }
 
     #[test]
