@@ -59,6 +59,10 @@ pub struct MultipartCheckpoint {
     pub part_size: u64,
     /// `part_number (1..=10000) -> ETag`
     pub completed_parts: BTreeMap<u32, String>,
+    /// SHA-256 of the source bytes for each confirmed part. Older sidecars
+    /// have no hashes and their parts must be sent again, not trusted.
+    #[serde(default)]
+    pub completed_part_sha256: BTreeMap<u32, String>,
 }
 
 /// Thread-safe store of active multipart checkpoints (in-memory and optionally
@@ -67,6 +71,9 @@ pub struct MultipartCheckpoint {
 pub struct MultipartResumeStore {
     entries: Mutex<HashMap<String, MultipartCheckpoint>>,
     sidecar_path: Option<PathBuf>,
+    // Serialize attempts sharing this store. This is process-local only;
+    // separately constructed stores and other processes are not coordinated.
+    upload_lock: Mutex<()>,
 }
 
 impl MultipartResumeStore {
@@ -82,6 +89,7 @@ impl MultipartResumeStore {
         Arc::new(Self {
             entries: Mutex::new(initial),
             sidecar_path: Some(path),
+            upload_lock: Mutex::new(()),
         })
     }
 
@@ -1168,10 +1176,14 @@ impl S3Session {
             _ => min_part,
         };
 
-        let store_id = format!("{bucket}/{key}");
+        // The old bucket/key-only namespace could mix checkpoints from
+        // different endpoints or accounts. Never adopt those legacy records.
+        let _attempt = self.cfg.resume_store.upload_lock.lock().await;
+        let store_id = format!("{}:{bucket}/{key}", self.cleanup_endpoint_id());
         let mut checkpoint = match self.cfg.resume_store.get(&store_id).await {
             Some(existing)
-                if total_size.is_none_or(|sz| existing.total_size == sz)
+                if existing.bucket == bucket && existing.key == key
+                    && total_size.is_some_and(|sz| existing.total_size == sz)
                     && existing.part_size == part_size =>
             {
                 existing
@@ -1216,8 +1228,12 @@ impl S3Session {
                 }
 
                 let chunk_len = part_buf.len();
-                if checkpoint.completed_parts.contains_key(&part_number) {
-                    // Already verified & uploaded on an earlier attempt!
+                let digest = compute_digest_hex(DigestAlgorithm::Sha256, &part_buf);
+                if checkpoint.completed_parts.contains_key(&part_number)
+                    && checkpoint.completed_part_sha256.get(&part_number) == Some(&digest)
+                {
+                    // Only reuse a confirmed part when this retry supplies
+                    // the same bytes; completion still relies on S3 ETags.
                     transferred += chunk_len as u64;
                     if let Some(cb) = progress {
                         cb(transferred, reported_total);
@@ -1248,6 +1264,7 @@ impl S3Session {
                         )));
                     }
                     checkpoint.completed_parts.insert(part_number, etag);
+                    checkpoint.completed_part_sha256.insert(part_number, digest);
                     self.cfg
                         .resume_store
                         .upsert(store_id.clone(), checkpoint.clone())
@@ -1390,6 +1407,7 @@ impl S3Session {
             total_size,
             part_size,
             completed_parts: BTreeMap::new(),
+            completed_part_sha256: BTreeMap::new(),
         })
     }
 
