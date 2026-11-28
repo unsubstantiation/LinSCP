@@ -86,7 +86,7 @@ Subsystem sftp internal-sftp
 LogLevel DEBUG3
 CONF
 sudo mkdir -p /run/sshd
-sudo env KRB5_CONFIG="$KRB5_CONFIG" KRB5_KTNAME="FILE:$root/host.keytab" /usr/sbin/sshd -D -e -f "$root/sshd_config" >"$root/sshd.log" 2>&1 & sshd_pid=$!
+sudo env -u KRB5CCNAME KRB5_CONFIG="$KRB5_CONFIG" KRB5_KTNAME="FILE:$root/host.keytab" /usr/sbin/sshd -D -e -f "$root/sshd_config" >"$root/sshd.log" 2>&1 & sshd_pid=$!
 export LINSCP_KRB_PORT="$sshport" LINSCP_KRB_USER="$fixture_user" LINSCP_KRB_CACHE="$KRB5CCNAME"
 export LINSCP_KRB_HOSTKEY="$(ssh-keygen -lf "$root/ssh_host_key.pub" | awk '{print $2}')"
 # A single readiness check retries the TCP connection; failure is a test failure.
