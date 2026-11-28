@@ -970,11 +970,35 @@ mod tests {
         assert!(converted.to_string_lossy().starts_with(r"\\?\C:\"));
     }
 
+    fn container_acl_details(path: &Path) -> (Vec<u8>, bool, bool) {
+        use windows_sys::Win32::Security::{GetSecurityDescriptorControl, IsWellKnownSid, WinCreatorOwnerRightsSid};
+        let wide = to_wide_null(path);
+        unsafe {
+            let mut dacl: *mut ACL = std::ptr::null_mut();
+            let mut descriptor: *mut c_void = std::ptr::null_mut();
+            let result = GetNamedSecurityInfoW(wide.as_ptr(), SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(), std::ptr::null_mut(), &mut dacl, std::ptr::null_mut(), &mut descriptor);
+            assert_eq!(result, 0);
+            assert!(!dacl.is_null());
+            let data = std::slice::from_raw_parts(dacl as *const u8, (*dacl).AclSize as usize).to_vec();
+            let mut control = 0u16;
+            let mut revision = 0u32;
+            assert_ne!(GetSecurityDescriptorControl(descriptor, &mut control, &mut revision), 0);
+            let mut ace: *mut c_void = std::ptr::null_mut();
+            let owner_rights = if (*dacl).AceCount == 1 && GetAce(dacl, 0, &mut ace) != 0 && !ace.is_null() {
+                let allowed = &*(ace as *const ACCESS_ALLOWED_ACE);
+                IsWellKnownSid(&allowed.SidStart as *const u32 as *mut c_void, WinCreatorOwnerRightsSid) != 0
+            } else { false };
+            LocalFree(descriptor as HLOCAL);
+            (data, control & 0x1000 != 0, owner_rights) // SE_DACL_PROTECTED
+        }
+    }
+
     #[test]
     fn container_file_has_private_dacl_without_changing_parent() {
         let dir = std::env::temp_dir().join(format!("linscp-container-acl-{}-{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir(&dir).unwrap();
-        let parent_before = dacl_summary(&dir).unwrap();
+        let parent_before = container_acl_details(&dir).0;
         let path = dir.join("vault.dat");
         let container = crate::container_file::ContainerFile::try_acquire(&path).unwrap();
         container.create("test password", b"first").unwrap();
@@ -986,7 +1010,10 @@ mod tests {
             assert_eq!(kind, ACCESS_ALLOWED_ACE_TYPE);
             assert_eq!(flags, 0, "file ACE is not inherited");
             assert_eq!(mask, FILE_ALL_ACCESS);
-            assert_eq!(dacl_summary(&dir).unwrap(), parent_before, "parent DACL must not change");
+            let (_, protected, owner_rights) = container_acl_details(&path);
+            assert!(protected, "file DACL must not inherit parent ACEs");
+            assert!(owner_rights, "the sole ACE must be the owner-rights SID");
+            assert_eq!(container_acl_details(&dir).0, parent_before, "parent DACL must not change");
         }
         drop(container);
         std::fs::remove_dir_all(dir).unwrap();

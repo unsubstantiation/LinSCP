@@ -25,8 +25,8 @@ fn error(message: &str) -> PlatformError {
 }
 
 fn derive_key(password: &str, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
-    if password.is_empty() || password.len() > 4096 {
-        return Err(error("Invalid application vault password"));
+    if !(6..=1024).contains(&password.encode_utf16().count()) {
+        return Err(error("Application vault password must be 6 to 1024 UTF-16 units"));
     }
     let params = Params::new(64 * 1024, 3, 1, Some(32))
         .map_err(|_| error("Invalid application vault KDF"))?;

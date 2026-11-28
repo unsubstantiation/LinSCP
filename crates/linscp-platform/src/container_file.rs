@@ -140,6 +140,59 @@ mod tests {
     }
 
     #[test]
+    fn container_lock_excludes_another_process() {
+        use std::time::{Duration, Instant};
+        const CHILD: &str = "LINSCP_CONTAINER_LOCK_TEST_CHILD";
+        if let Some(root) = std::env::var_os(CHILD) {
+            let dir = PathBuf::from(root);
+            let _guard = ContainerFile::try_acquire(&dir.join("vault.dat")).unwrap();
+            std::fs::write(dir.join("ready"), b"ready").unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !dir.join("release").exists() {
+                assert!(Instant::now() < deadline, "parent did not release child");
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("linscp-container-process-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact").arg("container_file::tests::container_lock_excludes_another_process")
+            .env(CHILD, &dir).spawn().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        while !dir.join("ready").exists() && Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() { break; }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let ready = dir.join("ready").exists();
+        let excluded = ready && ContainerFile::try_acquire(&dir.join("vault.dat")).is_err();
+        std::fs::write(dir.join("release"), b"release").unwrap();
+        let status = child.wait().unwrap();
+        assert!(ready && excluded && status.success(), "child lock was not exclusive");
+        drop(ContainerFile::try_acquire(&dir.join("vault.dat")).unwrap());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn abandoned_encrypted_stage_does_not_replace_existing_container() {
+        let dir = std::env::temp_dir().join(format!("linscp-container-stage-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("vault.dat");
+        let container = ContainerFile::try_acquire(&path).unwrap();
+        container.create("test password", b"original").unwrap();
+        let stage = dir.join(".interrupted.tmp");
+        let mut file = create_owner_file(&stage).unwrap();
+        file.write_all(&container_cipher::seal(b"new content", "test password").unwrap()).unwrap();
+        file.sync_all().unwrap();
+        drop(file); // Simulate termination before atomic publication.
+        drop(container);
+        let reopened = ContainerFile::try_acquire(&path).unwrap();
+        assert_eq!(reopened.open("test password").unwrap().as_slice(), b"original");
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn damaged_file_is_not_overwritten() {
         let dir = std::env::temp_dir().join(format!("linscp-container-damage-{}-{}", std::process::id(), rand::random::<u64>()));
         std::fs::create_dir(&dir).unwrap();
