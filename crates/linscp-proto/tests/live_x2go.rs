@@ -35,6 +35,12 @@ async fn x2go_kdrive_start_frames_suspend_resume_and_terminate() {
         }
     }).await.expect("timed out waiting for KDrive main frame");
     assert!(saw_main, "server disconnected before main frame");
+    // Drain updates while exercising input: KDrive can block the X server if
+    // the graphics channel is not read as windows are created and repainted.
+    let (mut reader, mut writer, agent) = channel.into_parts();
+    let drain = tokio::spawn(async move {
+        while reader.next_message().await.is_ok() {}
+    });
     // An X client on the fixture display observes keyboard input sent through
     // the real KDrive channel, not through the control SSH connection.
     let launch = format!("rm -f ~/x2go-input-result; DISPLAY=:{display} nohup xterm -title LinSCPInputFixture -e sh -c 'IFS= read -r line; printf %s \"$line\" > \"$HOME/x2go-input-result\"' </dev/null >~/x2go-xterm.log 2>&1 &");
@@ -47,12 +53,15 @@ async fn x2go_kdrive_start_frames_suspend_resume_and_terminate() {
         let mut event = [0u8; linscp_proto::kdrive_wire::CLIENT_EVENT_SIZE];
         event[..4].copy_from_slice(&kind.to_le_bytes());
         event[8..12].copy_from_slice(&keycode.to_le_bytes());
-        channel.writer.write_event(&event, Duration::from_secs(5)).await.expect("send KDrive keyboard input");
+        writer.write_event(&event, Duration::from_secs(5)).await.expect("send KDrive keyboard input");
     }
     let check = ssh.exec_command_bounded("for i in $(seq 1 50); do test -f ~/x2go-input-result && break; sleep 0.1; done; cat ~/x2go-input-result", Duration::from_secs(10), 8192).await.expect("read input result");
     assert_eq!(check.exit_code, Some(0), "input fixture did not receive Return");
     assert_eq!(check.stdout, b"a", "input fixture did not receive the expected key");
-    channel.suspend().await.expect("suspend desktop");
+    drain.abort();
+    let _ = drain.await;
+    drop(writer);
+    agent.suspend().await.expect("suspend desktop");
     let sessions = list_sessions(&ssh, Duration::from_secs(15)).await.expect("list sessions");
     assert!(sessions.iter().any(|item| item.session_id == id && item.status == "S"), "suspended session not listed");
     let agent = resume_guarded_agent(ssh.clone(), &id, 800, 600, X2GoLink::Lan, Duration::from_secs(60)).await.expect("resume desktop");
