@@ -517,7 +517,7 @@ impl FtpSession {
         if let Some(tcfg) = tunnel_cfg {
             let jump = Arc::new(SshJumpTunnel::connect(tcfg.clone()).await?);
             let relay = jump.start_socks5_relay(tunnel_local_port).await?;
-            cfg.proxy = Some(ProxyConfig::socks5_loopback(relay.local_port()));
+            cfg.proxy = Some(relay.proxy_config());
             jump_tunnel = Some(jump);
             socks_relay = Some(relay);
         }
