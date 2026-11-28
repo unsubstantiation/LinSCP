@@ -44,7 +44,7 @@ class InventoryTests(unittest.TestCase):
         desktop = rows['desktop.remote']
         self.assertEqual(desktop['status'], 'partial')
         self.assertIn('existing experimental X2Go', ' '.join(desktop['acceptance']))
-        self.assertIn('no implementation was found', desktop['gap'])
+        self.assertIn('no longer advertises an unimplemented embedded RDP fallback', desktop['gap'])
         drop = rows['gui.native-path-drop']
         self.assertIn('tools/prepare_android_project.py', drop['source'])
         self.assertIn('existing generated Android', ' '.join(drop['acceptance']))

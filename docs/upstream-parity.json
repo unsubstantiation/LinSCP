@@ -5110,7 +5110,8 @@
           "live_webdav_sync_encoding_and_interrupted_delete",
           "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads",
           "remote_search_charges_failed_oversized_reads_to_total_budget",
-          "saf_search_and_sync_reject_provider_path_components"
+          "saf_search_and_sync_reject_provider_path_components",
+          "saf_search_charges_underreported_oversized_documents"
         ],
         "gui": [
           "undecodable file offers encoding retry without opening the editor",

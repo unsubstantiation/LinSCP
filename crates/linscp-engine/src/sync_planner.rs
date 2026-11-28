@@ -561,25 +561,9 @@ fn collect_local_tree(
 // another platform. Preserve ordinary whitespace in valid names.
 fn valid_sync_entry_name(name: &str) -> bool {
     if crate::transfer::safe_tree_name(name).is_err() { return false; }
-    // Windows silently aliases trailing dots/spaces and reserves device names;
-    // reject those before a remote path can alias an unrelated local file.
-    #[cfg(windows)]
-    {
-        if name.ends_with(['.', ' ']) || name.contains(['<', '>', '"', '|', '?', '*']) {
-            return false;
-        }
-        let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
-        if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
-            | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³")
-            || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT"))
-                && matches!(stem.as_bytes()[3], b'1'..=b'9')) {
-            return false;
-        }
-    }
-    true
+    linscp_platform::is_sync_filename_supported(name)
 }
 
-#[cfg(any(windows, test))]
 fn reject_case_aliases<'a>(paths: impl Iterator<Item = &'a String>) -> Result<(), String> {
     let mut seen = BTreeMap::<String, &str>::new();
     for path in paths {
@@ -740,8 +724,9 @@ pub async fn plan_synchronization(
     // Windows paths are normally case-insensitive. Do not turn two distinct
     // remote spellings (or differing local/remote spellings) into destructive
     // independent actions against the same local file.
-    #[cfg(windows)]
-    reject_case_aliases(local_map.keys().chain(remote_map.keys()))?;
+    if linscp_platform::sync_paths_case_insensitive() {
+        reject_case_aliases(local_map.keys().chain(remote_map.keys()))?;
+    }
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(local_map.keys().cloned());
