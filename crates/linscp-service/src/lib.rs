@@ -19696,10 +19696,27 @@ mod tests {
         let done = wait_for_task(&svc, "Completed").await;
         assert_eq!(done["bytes_total"], json!(13), "{}", done);
         assert_eq!(std::fs::read(right.join("note.txt")).unwrap(), b"granted bytes".to_vec());
+        // Drop requests cannot create provider documents without per-request consent.
+        for (path, mut body) in [
+            ("/api/local/drop", json!({"local_dir": SAF_GRANTED_DIR, "name": "dropped.txt", "data_base64": "ZHJvcA=="})),
+            ("/api/local/drop-dir", json!({"local_dir": SAF_GRANTED_DIR, "relative_path": "empty"})),
+        ] {
+            let request = |body| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+            let denied = svc.dispatch(request(body.clone()));
+            assert_eq!(denied.status, 409, "{}", denied.payload);
+            assert_eq!(denied.payload["saf_publication_risk"], true);
+            body["accept_saf_publication_risk"] = json!(true);
+            let accepted = svc.dispatch(request(body));
+            assert_eq!(accepted.status, 200, "{}", accepted.payload);
+        }
+        assert_eq!(bridge.bytes_of("dropped.txt").as_deref(), Some(b"drop".as_slice()));
         // Plain pane to granted pane.
         let open_plain = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/tabs/open".into(), body: json!({"session": {"protocol": "local", "local_dir": left, "other_local_dir": SAF_GRANTED_DIR}}) }).await;
         assert_eq!(open_plain.status, 200, "{}", open_plain.payload);
         let plain_id = open_plain.payload["tab"]["id"].as_u64().unwrap();
+        let watch = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/keepuptodate".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "count": 1}) }).await;
+        assert_eq!(watch.status, 409, "{}", watch.payload);
+        assert_eq!(watch.payload["saf_publication_risk"], true);
         let denied = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab": plain_id, "local_dir": left, "remote_dir": SAF_GRANTED_DIR, "names": ["plain.txt"]}) }).await;
         assert_eq!(denied.status, 409, "{}", denied.payload);
         assert_eq!(denied.payload["saf_publication_risk"], true);
