@@ -5111,6 +5111,9 @@ impl CommanderService {
             if !parsed_mask.is_empty() && !parsed_mask.accepts(name, is_dir, size, src_mtime.max(0) as u64, name) {
                 continue;
             }
+            if move_item && upload && !tab.is_local && is_saf_path(&local.to_string_lossy()) {
+                return api_error(400, "Moving from an Android granted folder to a remote session is unsupported; copy the file and delete it manually after verifying it.");
+            }
             if (resume || append) && is_dir { return api_error(400, "Resume and append are supported only for individual files."); }
             if (resume || append) && is_saf_path(&local.to_string_lossy()) { return api_error(400, "Verified resume is not supported for granted folders; append is also unsupported."); }
             if move_item && !tab.is_local && is_dir { return api_error(400, "Remote directory moves are not supported."); }
@@ -19787,6 +19790,7 @@ mod tests {
         lost: Mutex<bool>,
         scheme_override: Mutex<Option<ProtocolScheme>>,
         copy_unsupported: Mutex<bool>,
+        mutate_local_after_upload: Mutex<Option<PathBuf>>,
         fail_remove: Mutex<Option<String>>,
         listing_injection: Mutex<Option<(String, String)>>,
         reported_sizes: Mutex<HashMap<String, u64>>,
@@ -19808,6 +19812,7 @@ mod tests {
                 lost: Mutex::new(false),
                 scheme_override: Mutex::new(None),
                 copy_unsupported: Mutex::new(false),
+                mutate_local_after_upload: Mutex::new(None),
                 fail_remove: Mutex::new(None),
                 listing_injection: Mutex::new(None),
                 reported_sizes: Mutex::new(HashMap::new()),
@@ -19901,6 +19906,9 @@ mod tests {
                 self.modes.lock().expect("m").insert(path.to_string(), mode);
             }
             self.docs.lock().expect("m").insert(path.to_string(), MockRemoteDoc { bytes, is_dir: false, mtime });
+            if let Some(local) = self.mutate_local_after_upload.lock().expect("m").take() {
+                std::fs::write(local, b"changed while uploading").expect("mutate local fixture");
+            }
             if let Some(report) = progress { report(sent, sent); }
             Ok(sent)
         }
@@ -21906,6 +21914,56 @@ mod tests {
         assert!(saved_path.is_file());
         let export_dir_mode_after = gui_os::stat_extended(&export_dir).unwrap().mode & 0o777;
         assert_eq!(export_dir_mode_after, export_dir_mode_before);
+    }
+
+    #[tokio::test]
+    async fn granted_folder_move_upload_refuses_before_remote_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = svc.queue.enqueue(None, "upload", "move".into(),
+            "content://fixture/tree/file".into(), "/file".into(), 1, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: PathBuf::from("content://fixture/tree/file"),
+                remote_dest: "/file".into(), allow_overwrite: false, delete_source: true,
+                cleanup_path: None, flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        for _ in 0..100 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (tasks, _) = svc.queue.snapshot();
+        let task = tasks.iter().find(|task| task["id"].as_u64() == Some(id)).unwrap();
+        assert_eq!(task["status"], "Failed", "{task}");
+        assert!(task["error"].as_str().unwrap_or("").contains("granted folder"), "{task}");
+        assert!(session.bytes_of("/file").is_none());
+    }
+
+    #[tokio::test]
+    async fn move_upload_keeps_a_source_changed_during_publication() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source.txt");
+        std::fs::write(&source, b"original").unwrap();
+        let svc = CommanderService::new(tmp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        *session.mutate_local_after_upload.lock().unwrap() = Some(source.clone());
+        let id = svc.queue.enqueue(None, "upload", "move".into(),
+            source.to_string_lossy().into_owned(), "/source.txt".into(), 8, false,
+            queue::QueueJob::RemoteUpload {
+                session: session.clone(), local_src: source.clone(), remote_dest: "/source.txt".into(),
+                allow_overwrite: false, delete_source: true, cleanup_path: None,
+                flags: linscp_engine::transfer::TransferFlags::default(),
+            });
+        for _ in 0..100 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let (tasks, _) = svc.queue.snapshot();
+        let task = tasks.iter().find(|task| task["id"].as_u64() == Some(id)).unwrap();
+        assert_eq!(task["status"], "Failed", "{task}");
+        assert!(task["error"].as_str().unwrap_or("").contains("local source changed"), "{task}");
+        assert_eq!(std::fs::read(&source).unwrap(), b"changed while uploading");
+        assert_eq!(session.bytes_of("/source.txt").unwrap(), b"original");
     }
 
     #[tokio::test]

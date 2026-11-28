@@ -11,6 +11,27 @@ use crate::terminal::local_ymdhms;
 use crate::write_private_file_atomic;
 use crate::{sys, PlatformError};
 
+/// Best-effort file change detection for an upload followed by deletion.
+/// This is not an atomic compare-and-delete or a defense against a writer
+/// able to manipulate metadata, the pathname, or the parent directory.
+pub fn same_file_snapshot(before: &std::fs::Metadata, after: &std::fs::Metadata) -> std::io::Result<bool> {
+    let mut same = before.is_file() && !before.file_type().is_symlink()
+        && after.is_file() && !after.file_type().is_symlink()
+        && before.len() == after.len() && before.modified()? == after.modified()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        same &= before.dev() == after.dev() && before.ino() == after.ino()
+            && before.ctime() == after.ctime() && before.ctime_nsec() == after.ctime_nsec();
+    }
+    #[cfg(windows)]
+    {
+        // Creation time is an additional replacement signal, not a file ID.
+        same &= before.created()? == after.created()?;
+    }
+    Ok(same)
+}
+
 /// Rich local metadata snapshot used by the Commander GUI properties dialog
 /// and atomic local text editor (`mtime_ns` conflict guard).
 #[derive(Debug, Clone)]

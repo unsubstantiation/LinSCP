@@ -130,6 +130,19 @@ pub enum QueueJob {
     },
 }
 
+// This is a best-effort change detector, not an atomic compare-and-unlink.
+// Destination directories and local writers must still be trusted.
+fn ensure_move_source_unchanged(path: &Path, before: &std::fs::Metadata) -> Result<(), String> {
+    let after = std::fs::symlink_metadata(path)
+        .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be verified before deletion: {e}"))?;
+    let same = linscp_platform::gui_os::same_file_snapshot(before, &after)
+        .map_err(|e| format!("Move incomplete: cannot verify local source metadata: {e}"))?;
+    if !same {
+        return Err("Move incomplete: destination was uploaded, but the local source changed or was replaced and was not deleted. Inspect both copies before retrying.".to_string());
+    }
+    Ok(())
+}
+
 // Preserve both the operation error and any baseline-save error. A partial
 // sync changes files before failing; an unsaved baseline can affect later plans.
 fn sync_apply_failure(error: &str, save_result: Result<(), String>) -> String {
@@ -1243,6 +1256,9 @@ impl QueueManager {
                         download_single_file(session.as_ref(), remote_path, Some(&entry), local_dest, &f, &mut logger, Some(&*progress)).await?
                     };
                     if *delete_source && transferred {
+                        if task.cancel_flag.load(Ordering::SeqCst) {
+                            return Err("Move incomplete: local file was published, but cancellation left the remote source intact.".to_string());
+                        }
                         let supports_if_match = matches!(
                             session.scheme(),
                             ProtocolScheme::S3
@@ -1276,6 +1292,12 @@ impl QueueManager {
             } => {
                 let orig_local_src = local_src.clone();
                 let saf_source = crate::is_saf_path(&orig_local_src.to_string_lossy());
+                // A provider URI has no stable conditional-delete primitive.
+                // Refuse before staging or publishing rather than delete a
+                // document that may have changed during upload.
+                if saf_source && *delete_source {
+                    return Err("Moving from an Android granted folder to a remote session is unsupported; copy the file and delete it manually after verifying it.".to_string());
+                }
                 let upload_stage = if saf_source {
                     let fs = self.local_fs.clone();
                     let uri = orig_local_src.to_string_lossy().into_owned();
@@ -1333,13 +1355,9 @@ impl QueueManager {
                         if task.cancel_flag.load(Ordering::SeqCst) {
                             return Err("Move incomplete: destination was uploaded, but cancellation left the local source intact.".to_string());
                         }
-                        if saf_source {
-                            self.local_fs.remove_file(&orig_local_src.to_string_lossy())
-                                .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be removed: {e}"))?;
-                        } else {
-                            std::fs::remove_file(&orig_local_src)
-                                .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be removed: {e}"))?;
-                        }
+                        ensure_move_source_unchanged(&orig_local_src, &meta)?;
+                        std::fs::remove_file(&orig_local_src)
+                            .map_err(|e| format!("Move incomplete: destination was uploaded, but local source could not be removed: {e}"))?;
                     }
                 }
                 Ok(())
@@ -2387,6 +2405,25 @@ async fn delete_remote_tree(
 #[cfg(test)]
 mod transfer_safety_tests {
     use super::*;
+
+    #[test]
+    fn move_source_change_detection_rejects_modified_and_replaced_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"original").unwrap();
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        assert!(ensure_move_source_unchanged(&path, &before).is_ok());
+        std::fs::write(&path, b"changed contents").unwrap();
+        assert!(ensure_move_source_unchanged(&path, &before).is_err());
+        let before = std::fs::symlink_metadata(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        assert!(ensure_move_source_unchanged(&path, &before).is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("other", &path).unwrap();
+            assert!(ensure_move_source_unchanged(&path, &before).is_err());
+        }
+    }
 
     #[test]
     fn sync_failure_reports_partial_work_and_baseline_save_errors() {
