@@ -8,7 +8,8 @@ and rewrap vault material using the destination vault. They refuse export when
 saved sessions refer to external SSH keys, public keys, certificate files or CA
 directories, or file-based/invalid public-key pins, instead of claiming those
 files are portable. The key/session exporter can embed supported external key
-and TLS files and convert file-based pins to hashes; it explicitly refuses
+and TLS files, including PEM files with OpenSSL hashed CA-directory names,
+and convert file-based pins to hashes; it explicitly refuses
 unsupported or unreadable fields and size-limit violations. Local working
 folders, commands, and other device-specific settings are not guaranteed to exist
 or behave identically on another device. An old full backup created before this
