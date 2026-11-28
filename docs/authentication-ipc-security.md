@@ -14,7 +14,9 @@
   negotiation; a proxy that selects no-auth is refused. No configured proxy is
   silently retried as a direct connection after a failed proxy handshake.
   Explicit localhost bypass and user-specified proxy exclusion rules still
-  intentionally permit direct connections. Local-command proxy templates execute
+  intentionally permit direct connections; rules are evaluated for the actual
+  network hop (the jump host when present), and loopback IPs are parsed rather
+  than inferred from a hostname prefix. Local-command proxy templates execute
   a shell by design; the destination substituted into them rejects shell syntax.
 - Linux GSSAPI and Windows SSPI request mutual authentication; the negotiated
   context must confirm it before a MIC is generated. Delegation is off unless

@@ -168,9 +168,9 @@ Upstream proxy setting names are applied by open and stored with a site; both SO
 
 **Area:** Security/authentication · **Status:** partial
 
-The current Rust proxy tests reject a no-auth downgrade when SOCKS credentials are configured and confirm a refused HTTP CONNECT is not retried directly. A loopback mock SSH bastion test checks independently pinned jump authentication, rejects unauthenticated and wrong-password local SOCKS clients, and uses reqwest successfully through the authenticated relay. Linux and Windows passed GitHub Actions run 46108057009. User-configured localhost and exclusion bypasses are intentional. Historical live-sftp and live-dav tests below require a retired binary and do not supply current evidence.
+The current Rust proxy tests reject a no-auth downgrade when SOCKS credentials are configured and confirm a refused HTTP CONNECT is not retried directly. A loopback mock SSH bastion test checks independently pinned jump authentication, rejects unauthenticated and wrong-password local SOCKS clients, and uses reqwest successfully through the authenticated relay. Linux and Windows passed GitHub Actions run 46108545284; proxy bypass is evaluated on the actual network hop and loopback detection requires a real loopback IP. User-configured localhost and exclusion bypasses are intentional. Historical live-sftp and live-dav tests below require a retired binary and do not supply current evidence.
 
-**Next:** The live half is still unevidenced: live-dav and live-sftp need a `linscp` binary this repo does not build. Runnable residue: engine-script, which refuses a proxy method the protocol cannot run and a proxy without a host.
+**Next:** Mock SSH jump, authenticated SOCKS relay, failed HTTP CONNECT and bypass regressions now run on Linux and Windows. Broader live protocol and Android proxy coverage is still needed; the historical live-dav and live-sftp suites require a retired binary.
 
 **Acceptance criteria:**
 
@@ -196,7 +196,7 @@ Static configuration tests verify that packaged capabilities do not grant remote
 
 SSH jump-host support is tracked separately under security.ssh-jump-hosts. The current Rust SSH transport uses russh's gssapi-with-mic bridge and a system Kerberos context provider: Linux dynamically loads libgssapi_krb5 and Windows loads SSPI from System32. Android has no system provider here. GSSAPI authentication can be attempted when a provider is available; delegation is opt-in. GSSAPI key exchange is not implemented and explicit requests fail closed. The historical isolated MIT KDC and cross-realm cases in LiveSftpTest.py require the retired linscp CLI and are not runnable against the shipped GUI-only distribution. Windows SSPI loader/context construction has a platform unit test, but that does not establish successful Kerberos authentication. GUI and service-tabs tests cover settings and capability/refusal policy, not a live KDC exchange.
 
-**Next:** An isolated Linux MIT KDC and OpenSSH fixture now tests the current russh path with a missing cache, wrong service principal, successful mutually authenticated login, default-off and opt-in delegated credentials, in GitHub Actions run 46108057009. Expired tickets, cross-realm trust, production KDC behavior and Windows SSPI end-to-end authentication remain unverified. Android has no provider; GSSAPI key exchange and jump-host GSSAPI are unsupported; independent delegation security review remains open.
+**Next:** An isolated Linux MIT KDC and OpenSSH fixture now tests the current russh path with a missing cache, wrong service principal, successful mutually authenticated login, default-off and opt-in delegated credentials, in GitHub Actions run 46108545284. Expired tickets, cross-realm trust, production KDC behavior and Windows SSPI end-to-end authentication remain unverified. Android has no provider; GSSAPI key exchange and jump-host GSSAPI are unsupported; independent delegation security review remains open.
 
 **Acceptance criteria:**
 
