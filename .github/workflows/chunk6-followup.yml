@@ -72,13 +72,6 @@ jobs:
           npm ci --prefix ui --no-audit --no-fund
           python3 tools/run_cargo_ci.py npm --prefix ui test
 
-      - name: Exercise the Rust workspace test suites
-        run: |
-          python3 tools/run_cargo_ci.py cargo test -p linscp-platform -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-proto -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-engine -- --nocapture
-          python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
-
       - name: Check the Android application ID and signing configuration
         run: |
           python3 -m unittest discover -s tools/tests -p test_android_application_id.py

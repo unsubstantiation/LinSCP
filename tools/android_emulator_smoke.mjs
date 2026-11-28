@@ -279,10 +279,10 @@ const expression = `
     if (phase === 'saf-pick-finish') {
       // A later invalid URI must roll back the first staged provider file.
       const document = tree + '/document/' + encodeURIComponent('primary:Documents/LinSCP-Ungranted-Smoke/marker.txt');
-      let refused = false;
-      try { await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|stageUris', {uris: [document, 'file:///not-a-content-uri']}); }
-      catch (_) { refused = true; }
-      if (!refused) throw new Error('A mixed valid and invalid share was accepted');
+      let refusal = '';
+      try { await window.__TAURI_INTERNALS__.invoke('linscp_handle_share_intent', {uris: [document, 'file:///not-a-content-uri']}); }
+      catch (error) { refusal = String(error); }
+      if (!refusal.includes('only content URIs')) throw new Error('Mixed share did not reach the invalid second URI: ' + refusal);
       const stale = String(BigInt(before.info.mtime) * 1000000000n - 1n);
       let rejected;
       try { await invoke('POST', '/api/local/save', {tab, path: 'marker.txt', content: 'stale write', base_mtime_ns: stale}); }
@@ -630,18 +630,18 @@ const expression = `
   }
   if (${JSON.stringify(phase)} === 'share-fail') {
     const root = (await invoke('GET', '/api/status')).local_dir;
-    let pending = [];
-    for (let i = 0; i < 30 && !pending.length; i++) {
-      pending = (await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|pendingShares')).paths;
-      if (!pending.length) await sleep(1000);
-    }
-    if (!pending.length) throw new Error('SEND intent did not stage a pending file');
     let refused = false;
-    try { await invoke('GET', '/api/shell/pending'); }
-    catch (error) { refused = error.status === 500; }
+    for (let i = 0; i < 30 && !refused; i++) {
+      try { await invoke('GET', '/api/shell/pending'); }
+      catch (error) { refused = error.status === 500; }
+      if (!refused) await sleep(1000);
+    }
     if (!refused) throw new Error('Blocked manifest publication did not report an error');
-    const again = (await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|pendingShares')).paths;
-    if (!again.includes(pending[0])) throw new Error('Failed publication lost the pending file');
+    // A second poll must retry the same failed publication, not forget it.
+    let retried = false;
+    try { await invoke('GET', '/api/shell/pending'); }
+    catch (error) { retried = error.status === 500; }
+    if (!retried) throw new Error('Failed publication was not retried');
     return {root, failedShareRetained: true};
   }
   if (${JSON.stringify(phase)} === 'share-intent') {

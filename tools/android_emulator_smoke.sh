@@ -284,6 +284,7 @@ if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -
 fi
 # A mixed valid/invalid URI was rejected after the first file opened. No
 # partial incoming staging file may survive that failure.
+adb shell run-as "$application" test -d cache/incoming-shares
 if adb shell run-as "$application" find cache/incoming-shares -type f | tr -d '\r' | grep -q .; then
   echo "Rejected share left a staged file" >&2; exit 1
 fi
