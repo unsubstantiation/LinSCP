@@ -21,3 +21,10 @@ jobs:
           export LINSCP_XML_SERVICE_OUTPUT="$RUNNER_TEMP/gui-actions.xml"
           cargo test -p linscp-service queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log
           python3 -m unittest discover -s tools/tests -p test_xml_schema.py
+      - name: Validate live WebDAV GUI XML
+        if: runner.os == 'Linux'
+        run: |
+          export LSCP_LIVE_WEBDAV=1 RUST_MIN_STACK=16777216
+          export LINSCP_XML_LIVE_OUTPUT="$RUNNER_TEMP/live-actions.xml"
+          cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture --test-threads=1
+          python3 -m unittest discover -s tools/tests -p test_xml_schema.py
