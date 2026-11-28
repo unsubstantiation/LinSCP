@@ -331,6 +331,8 @@ pub trait SecretVault: Send + Sync {
     fn write_session_ini(&self, _config_dir: &Path, _text: &str) -> Result<bool, PlatformError> {
         Ok(false)
     }
+    /// True only if session/material updates can be published as one transaction.
+    fn supports_session_material_transactions(&self) -> bool { false }
     /// Atomically publish sessions and new referenced material, or return false
     /// without side effects when unsupported. Errors must not trigger fallback.
     fn write_session_ini_with_materials(&self, _config_dir: &Path, _text: &str, _materials: &[VaultMaterialImport<'_>]) -> Result<bool, PlatformError> {

@@ -6027,12 +6027,25 @@ impl CommanderService {
             }
         }
         let mut protected_key_files = Vec::new();
-        if let Err(error) = protect_stored_ssh_keys(&mut stored, &cfg_root, self.secret_vault.as_ref(), &mut protected_key_files) {
+        let transactional = self.secret_vault.supports_session_material_transactions();
+        let mut staged_keys = Vec::new();
+        let protection = if transactional {
+            stage_session_ssh_keys(&mut stored, &mut staged_keys)
+        } else {
+            protect_stored_ssh_keys(&mut stored, &cfg_root, self.secret_vault.as_ref(), &mut protected_key_files)
+        };
+        if let Err(error) = protection {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
             return api_error(400, error);
         }
         store.upsert(stored);
-        if let Err(e) = store.save_to_dir(&cfg_root, self.secret_vault.as_ref()) {
+        let saved = if transactional {
+            let materials: Vec<_> = staged_keys.iter().map(StagedSessionKey::as_import).collect();
+            store.save_with_materials(&cfg_root, self.secret_vault.as_ref(), &materials)
+        } else {
+            store.save_to_dir(&cfg_root, self.secret_vault.as_ref())
+        };
+        if let Err(e) = saved {
             for path in protected_key_files { let _ = std::fs::remove_file(path); }
             return ApiReply{ status: 500, payload: json!({"success": false, "error": e})};
         }
@@ -6371,6 +6384,8 @@ impl CommanderService {
         let mut skipped = Vec::new();
         let mut omitted_keys = Vec::new();
         let mut created = Vec::new();
+        let mut staged_keys = Vec::new();
+        let transactional = self.secret_vault.supports_session_material_transactions();
         let result: Result<(), String> = (|| {
             for mut candidate in report.imported.into_iter().filter(|site| selection.contains(&site.name)) {
                 if !unique.insert(candidate.name.to_ascii_lowercase()) {
@@ -6406,13 +6421,19 @@ impl CommanderService {
                     site.proxy_command = pc;
                 }
                 validate_imported_site(&site)?;
-                protect_stored_ssh_keys(&mut site, &cfg, self.secret_vault.as_ref(), &mut created)?;
+                if transactional { stage_session_ssh_keys(&mut site, &mut staged_keys)?; }
+                else { protect_stored_ssh_keys(&mut site, &cfg, self.secret_vault.as_ref(), &mut created)?; }
                 if let Some(existing) = existing { store.remove(&existing); }
                 imported.push(site.name.clone());
                 store.upsert(site);
             }
             if found != selection { return Err("Some selected sessions are no longer in the import source.".to_string()); }
-            if !imported.is_empty() { store.save_to_dir(&cfg, self.secret_vault.as_ref())?; }
+            if !imported.is_empty() {
+                if transactional {
+                    let materials: Vec<_> = staged_keys.iter().map(StagedSessionKey::as_import).collect();
+                    store.save_with_materials(&cfg, self.secret_vault.as_ref(), &materials)?;
+                } else { store.save_to_dir(&cfg, self.secret_vault.as_ref())?; }
+            }
             Ok(())
         })();
         if let Err(error) = result {
@@ -12486,6 +12507,62 @@ fn cleanup_stale_temporary_keys(config_root: &Path) {
     }
 }
 
+struct StagedSessionKey {
+    id: String,
+    private: zeroize::Zeroizing<Vec<u8>>,
+    label: String,
+    public: String,
+}
+
+impl StagedSessionKey {
+    fn as_import(&self) -> linscp_platform::VaultMaterialImport<'_> {
+        linscp_platform::VaultMaterialImport::Ssh { id: &self.id, private: &self.private, label: &self.label, public_key: &self.public }
+    }
+}
+
+// Stage plaintext in zeroizing memory; the backend validates all existing
+// references and commits the new keys and session store in one replacement.
+fn stage_session_ssh_keys(site: &mut StoredSite, staged: &mut Vec<StagedSessionKey>) -> Result<(), String> {
+    site.extra_fields.retain(|key, _| {
+        let key = key.to_ascii_lowercase();
+        !key.contains("keyfile") && !key.ends_with("private_key_file")
+    });
+    for reference in [&mut site.private_key, &mut site.tunnel.keyfile] {
+        let Some(path) = reference.as_deref() else { continue };
+        if let Some(id) = path.strip_prefix(LOCAL_VAULT_KEY_PREFIX) {
+            if !valid_vault_key_id(id) { return Err("Saved encrypted SSH key reference is invalid.".into()); }
+            continue;
+        }
+        let source = PathBuf::from(linscp_platform::terminal::expand_tilde(path));
+        if source.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("pub")) { continue; }
+        let metadata = std::fs::metadata(&source).map_err(|e| format!("Cannot read private SSH key '{}': {e}", source.display()))?;
+        if !metadata.is_file() || metadata.len() > 1024 * 1024 { return Err(format!("Private SSH key '{}' is not a regular file under 1 MiB.", source.display())); }
+        use std::io::Read as _;
+        let file = std::fs::File::open(&source).map_err(|e| format!("Cannot read private SSH key '{}': {e}", source.display()))?;
+        let mut private = zeroize::Zeroizing::new(Vec::new());
+        file.take(1024 * 1024 + 1).read_to_end(&mut private).map_err(|e| e.to_string())?;
+        if private.is_empty() || private.len() > 1024 * 1024 { return Err("Invalid private SSH key size.".into()); }
+        if let Some(existing) = staged.iter().find(|key| constant_time_bytes_eq(&key.private, &private)) {
+            *reference = Some(format!("{LOCAL_VAULT_KEY_PREFIX}{}", existing.id));
+            continue;
+        }
+        let mut public_path = source.as_os_str().to_os_string();
+        public_path.push(".pub");
+        let mut public = read_bounded_key_optional(&PathBuf::from(public_path), 32 * 1024)?;
+        if public.is_empty() {
+            if let Ok(text) = std::str::from_utf8(&private) { public = derive_public_ssh_key_optional(text).unwrap_or_default(); }
+        }
+        let mut random = [0u8; 16];
+        rand::thread_rng().fill_bytes(&mut random);
+        let id = random.iter().map(|b| format!("{b:02x}")).collect::<String>();
+        let name = source.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        let label = derive_vault_key_label(name, &public, &id);
+        *reference = Some(format!("{LOCAL_VAULT_KEY_PREFIX}{id}"));
+        staged.push(StagedSessionKey { id, private, label, public });
+    }
+    Ok(())
+}
+
 fn protect_stored_ssh_keys(
     site: &mut StoredSite,
     config_root: &Path,
@@ -13325,6 +13402,40 @@ mod tests {
     use super::*;
     use linscp_platform::PlatformError;
     use linscp_types::{FileEntry, LocalRootEntry, ProtocolScheme};
+
+    #[test]
+    fn container_session_staging_commits_atomically() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let key_path = dir.path().join("id_key");
+        std::fs::write(&key_path, b"private ssh material").unwrap();
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let mut site = StoredSite::new("site", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(key_path.to_string_lossy().into_owned());
+        site.tunnel.keyfile = site.private_key.clone();
+        let mut staged = Vec::new();
+        stage_session_ssh_keys(&mut site, &mut staged).unwrap();
+        assert_eq!(staged.len(), 1);
+        assert_eq!(site.private_key, site.tunnel.keyfile);
+        let id = staged[0].id.clone();
+        let mut store = SessionStore::new();
+        site.extra_fields.insert("tls_certificate_key_file".into(), "vaulttls://22222222222222222222222222222222".into());
+        store.upsert(site.clone());
+        let materials: Vec<_> = staged.iter().map(StagedSessionKey::as_import).collect();
+        let before = std::fs::read(&path).unwrap();
+        assert!(store.save_with_materials(dir.path(), &bridge, &materials).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        site.extra_fields.clear();
+        store.upsert(site);
+        store.save_with_materials(dir.path(), &bridge, &materials).unwrap();
+        assert_eq!(bridge.read_ssh_key(&id).unwrap().as_slice(), b"private ssh material");
+        assert!(SessionStore::load_from_dir(dir.path(), &bridge).unwrap().find("site").is_some());
+        assert!(!dir.path().join("keys").exists());
+        assert!(!dir.path().join("sessions.ini").exists());
+    }
 
     #[test]
     fn container_key_materialization_uses_container_and_cleans_stages() {
