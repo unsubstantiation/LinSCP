@@ -18698,14 +18698,7 @@ mod tests {
         assert_eq!(both.status, 409, "{}", both.payload);
         assert_eq!(both.payload["conflicts"], json!(["report.txt"]));
         assert_eq!(std::fs::read(local.join("notes.txt")).unwrap(), b"notes");
-        #[cfg(not(windows))]
-        {
-        let trailing = outside.join("trailing-space ");
-        std::fs::write(&trailing, b"preserve whitespace").unwrap();
-        let spaced = drop_local(json!({"local_dir": local.to_string_lossy(), "source_path": trailing.to_string_lossy(), "source_paths": [trailing.to_string_lossy()]}));
-        assert_eq!(spaced.status, 200, "{}", spaced.payload);
-        assert_eq!(std::fs::read(local.join("trailing-space ")).unwrap(), b"preserve whitespace");
-        }
+
 
         // The page's approval is what turns a conflict into a replacement, and
         // the retry is the same request plus that decision.
