@@ -309,6 +309,14 @@ pub struct VaultSshKeyImport {
     pub deduplicated: bool,
 }
 
+/// Borrowed material staged for one atomic session-store update. Callers retain
+/// ownership of sensitive bytes and should zeroize them after use.
+pub enum VaultMaterialImport<'a> {
+    Ssh { id: &'a str, private: &'a [u8], label: &'a str, public_key: &'a str },
+    Tls { id: &'a str, data: &'a [u8] },
+    PublicKey { id: &'a str, public_key: &'a str },
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
@@ -321,6 +329,11 @@ pub trait SecretVault: Send + Sync {
         Ok(SessionIniRead::Unhandled)
     }
     fn write_session_ini(&self, _config_dir: &Path, _text: &str) -> Result<bool, PlatformError> {
+        Ok(false)
+    }
+    /// Atomically publish sessions and new referenced material, or return false
+    /// without side effects when unsupported. Errors must not trigger fallback.
+    fn write_session_ini_with_materials(&self, _config_dir: &Path, _text: &str, _materials: &[VaultMaterialImport<'_>]) -> Result<bool, PlatformError> {
         Ok(false)
     }
     /// A handled backend must authenticate data, preserve domain separation,

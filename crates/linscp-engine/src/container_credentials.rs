@@ -518,6 +518,26 @@ impl ContainerSessionVault {
 impl linscp_platform::SecretVault for ContainerSessionVault {
     fn protects_session_store(&self) -> bool { true }
 
+    fn write_session_ini_with_materials(&self, config_dir: &std::path::Path, text: &str, materials: &[linscp_platform::VaultMaterialImport<'_>]) -> Result<bool, linscp_platform::PlatformError> {
+        self.check_root(config_dir)?;
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        let sessions = SessionStore::parse_ini(text, Some(&document.session_key().map_err(Self::error)?)).map_err(Self::error)?;
+        let mut keys = Vec::new();
+        let mut tls = Vec::new();
+        let mut public = Vec::new();
+        for material in materials {
+            match material {
+                linscp_platform::VaultMaterialImport::Ssh { id, private, label, public_key } => keys.push(NewSshKey { id, private, label, public_key }),
+                linscp_platform::VaultMaterialImport::Tls { id, data } => tls.push(NewTlsMaterial { id, data }),
+                linscp_platform::VaultMaterialImport::PublicKey { id, public_key } => public.push(NewPublicKey { id, public_key }),
+            }
+        }
+        session.save_sessions_with_materials(&sessions, &keys, &tls, &public).map_err(Self::error)?;
+        Ok(true)
+    }
+
     fn load_master_key(&self, config_dir: &std::path::Path) -> Result<Option<Zeroizing<[u8; 32]>>, linscp_platform::PlatformError> {
         self.check_root(config_dir)?;
         let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
@@ -704,6 +724,43 @@ mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn service_transaction_publishes_materials_and_sessions_together() {
+        use linscp_platform::{SecretVault, VaultMaterialImport};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let file = CredentialContainer::acquire(&path).unwrap();
+        file.create("test password").unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
+        let vault: &dyn SecretVault = &bridge;
+        let key_id = "11111111111111111111111111111111";
+        let tls_id = "22222222222222222222222222222222";
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("saved", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(format!("vaultkey://{key_id}"));
+        site.extra_fields.insert("tls_certificate_key_file".into(), format!("vaulttls://{tls_id}"));
+        sessions.upsert(site);
+        let materials = [
+            VaultMaterialImport::Ssh { id: key_id, private: b"private", label: "test", public_key: "public" },
+            VaultMaterialImport::Tls { id: tls_id, data: b"tls private" },
+        ];
+        let before = std::fs::read(&path).unwrap();
+        assert!(sessions.save_with_materials(dir.path(), vault, &materials[..1]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        sessions.save_with_materials(dir.path(), vault, &materials).unwrap();
+        assert_eq!(SessionStore::load_from_dir(dir.path(), vault).unwrap().find("saved").unwrap().private_key.as_deref(), Some(format!("vaultkey://{key_id}").as_str()));
+        assert_eq!(bridge.read_ssh_key(key_id).unwrap().as_slice(), b"private");
+        assert_eq!(bridge.read_tls_material(tls_id).unwrap().as_slice(), b"tls private");
+        let committed = std::fs::read(&path).unwrap();
+        assert!(sessions.save_with_materials(dir.path(), vault, &materials).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        bridge.lock().unwrap();
+        assert!(sessions.save_with_materials(dir.path(), vault, &[]).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), committed);
+        assert!(!dir.path().join("sessions.ini").exists());
+        assert!(!dir.path().join("keys").exists());
+    }
 
     #[test]
     fn lifecycle_setup_lock_unlock_and_wrong_password_preserve_data() {

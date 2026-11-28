@@ -815,6 +815,19 @@ impl SessionStore {
         Self::parse_ini(&text, master.as_ref())
     }
 
+    /// Commit sessions and new material together. Unsupported backends fail
+    /// without writing either; callers must not retry piecemeal on an error.
+    pub fn save_with_materials(&self, config_dir: &Path, vault: &dyn SecretVault, materials: &[linscp_platform::VaultMaterialImport<'_>]) -> Result<(), String> {
+        let master = vault.load_or_create_master_key(config_dir).map_err(|e| e.to_string())?;
+        let key = SessionMasterKey::from_array(*master);
+        let rendered = Zeroizing::new(self.serialize_ini(Some(&key))?);
+        if vault.write_session_ini_with_materials(config_dir, &rendered, materials).map_err(|e| e.to_string())? {
+            Ok(())
+        } else {
+            Err("Vault does not support atomic session material updates".into())
+        }
+    }
+
     pub fn save_to_dir(&self, config_dir: &Path, vault: &dyn SecretVault) -> Result<(), String> {
         let needs_key = self.sites.iter().any(StoredSite::needs_encryption_key);
         let master = if needs_key {
