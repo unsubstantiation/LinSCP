@@ -60,14 +60,25 @@ impl ContainerFile {
         Ok(Self { path, parent, _lock: lock })
     }
 
-    /// Read and authenticate an existing file, with a hard limit before decryption.
-    pub fn open(&self, password: &str) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+    fn read_envelope(&self) -> Result<Vec<u8>, PlatformError> {
         let file = crate::open_private_file_no_follow(&self.path)?;
         let max = container_cipher::MAX_PLAINTEXT + 8 + 16 + 12 + 16;
         let mut bytes = Vec::new();
         file.take(max as u64 + 1).read_to_end(&mut bytes)?;
         if bytes.len() > max { return Err(invalid("Application vault exceeds size limit")); }
-        container_cipher::open(&bytes, password)
+        Ok(bytes)
+    }
+
+    /// Read and authenticate an existing file, with a hard limit before decryption.
+    pub fn open(&self, password: &str) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        container_cipher::open(&self.read_envelope()?, password)
+    }
+
+    /// Authenticate once, retaining only the derived key and file lock.
+    /// Consuming the guard on error releases the lock; no password is retained.
+    pub fn unlock(self, password: &str) -> Result<(UnlockedContainer, Zeroizing<Vec<u8>>), PlatformError> {
+        let (key, plaintext) = container_cipher::unlock(&self.read_envelope()?, password)?;
+        Ok((UnlockedContainer { file: self, key }, plaintext))
     }
 
     /// Create a new container without replacing an existing file.
@@ -106,9 +117,66 @@ impl ContainerFile {
     }
 }
 
+/// An authenticated, exclusively locked container session. Drop to erase its
+/// key and release the file lock. The key is never exposed to callers.
+pub struct UnlockedContainer {
+    file: ContainerFile,
+    key: container_cipher::UnlockedKey,
+}
+
+impl UnlockedContainer {
+    pub fn open(&self) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        self.key.open(&self.file.read_envelope()?)
+    }
+
+    /// Authenticate the old envelope before atomic replacement. The original
+    /// salt stays fixed for this session; each replacement gets a fresh nonce.
+    pub fn save(&mut self, value: &[u8]) -> Result<(), PlatformError> {
+        let _old = self.open()?;
+        let encrypted = self.key.seal(value)?;
+        self.file.publish(&encrypted, true)
+    }
+
+    /// Erase the key but retain the stable file lock for a later unlock.
+    pub fn lock(self) -> ContainerFile {
+        self.file
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unlocked_session_saves_without_retaining_password_and_rejects_swapped_file() {
+        let dir = std::env::temp_dir().join(format!("linscp-container-session-{}-{}", std::process::id(), rand::random::<u64>()));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("vault.dat");
+        let file = ContainerFile::try_acquire(&path).unwrap();
+        file.create("test password", b"first").unwrap();
+        let (mut session, first) = file.unlock("test password").ok().unwrap();
+        assert_eq!(first.as_slice(), b"first");
+        assert!(ContainerFile::try_acquire(&path).is_err());
+        session.save(b"second").unwrap();
+        let second = std::fs::read(&path).unwrap();
+        session.save(b"second").unwrap();
+        let third = std::fs::read(&path).unwrap();
+        assert_ne!(second, third, "each save has a new nonce");
+        assert_eq!(session.open().unwrap().as_slice(), b"second");
+        // A replacement from a different password derivation cannot be overwritten.
+        let swapped = container_cipher::seal(b"foreign", "test password").unwrap();
+        std::fs::write(&path, &swapped).unwrap();
+        assert!(session.open().is_err());
+        assert!(session.save(b"must not replace").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), swapped);
+        let locked = session.lock();
+        assert!(locked.open("wrong password").is_err());
+        drop(locked);
+        let (reopened, value) = ContainerFile::try_acquire(&path).unwrap().unlock("test password").ok().unwrap();
+        assert_eq!(value.as_slice(), b"foreign");
+        drop(reopened);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn create_save_lock_and_failure_preserve_data() {

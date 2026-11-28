@@ -7,7 +7,7 @@ use std::collections::BTreeSet;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use linscp_crypto::SessionMasterKey;
-use linscp_platform::container_file::ContainerFile;
+use linscp_platform::container_file::{ContainerFile, UnlockedContainer};
 use rand::RngCore;
 use serde::{Deserialize, Serialize};
 use zeroize::{Zeroize, Zeroizing};
@@ -54,6 +54,17 @@ impl Document {
         let mut key = Zeroizing::new([0u8; 32]);
         rand::thread_rng().fill_bytes(&mut *key);
         Self { version: 1, session_key_b64: BASE64.encode(&*key), sessions_ini: String::new(), keys: Vec::new() }
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self, String> {
+        let document: Self = serde_json::from_slice(bytes).map_err(|e| format!("Invalid credential container: {e}"))?;
+        document.validate()?;
+        Ok(document)
+    }
+
+    fn encoded(&self) -> Result<Zeroizing<Vec<u8>>, String> {
+        self.validate()?;
+        Ok(Zeroizing::new(serde_json::to_vec(self).map_err(|e| e.to_string())?))
     }
 
     fn session_key(&self) -> Result<SessionMasterKey, String> {
@@ -132,15 +143,19 @@ impl CredentialContainer {
 
     fn read(&self, password: &str) -> Result<Document, String> {
         let bytes = self.file.open(password).map_err(|e| e.to_string())?;
-        let document: Document = serde_json::from_slice(&bytes).map_err(|e| format!("Invalid credential container: {e}"))?;
-        document.validate()?;
-        Ok(document)
+        Document::decode(&bytes)
     }
 
     fn write(&self, password: &str, document: &Document) -> Result<(), String> {
-        document.validate()?;
-        let bytes = Zeroizing::new(serde_json::to_vec(document).map_err(|e| e.to_string())?);
+        let bytes = document.encoded()?;
         self.file.save(password, &bytes).map_err(|e| e.to_string())
+    }
+
+    /// Validate both encryption and document before retaining an unlocked session.
+    pub fn unlock(self, password: &str) -> Result<UnlockedCredentialContainer, String> {
+        let (file, plaintext) = self.file.unlock(password).map_err(|e| e.to_string())?;
+        Document::decode(&plaintext)?;
+        Ok(UnlockedCredentialContainer { file })
     }
 
     pub fn load_sessions(&self, password: &str) -> Result<SessionStore, String> {
@@ -211,11 +226,104 @@ impl CredentialContainer {
     }
 }
 
+/// Unlocked credential session; dropping it zeroizes the container encryption
+/// key and releases its process lock. No password is retained in this object.
+pub struct UnlockedCredentialContainer {
+    file: UnlockedContainer,
+}
+
+impl UnlockedCredentialContainer {
+    fn read(&self) -> Result<Document, String> {
+        let bytes = self.file.open().map_err(|e| e.to_string())?;
+        Document::decode(&bytes)
+    }
+
+    fn write(&mut self, document: &Document) -> Result<(), String> {
+        let bytes = document.encoded()?;
+        self.file.save(&bytes).map_err(|e| e.to_string())
+    }
+
+    pub fn load_sessions(&self) -> Result<SessionStore, String> {
+        let document = self.read()?;
+        SessionStore::parse_ini(&document.sessions_ini, Some(&document.session_key()?))
+    }
+
+    /// All session and key modifications are committed in a single replacement.
+    pub fn save_sessions_with_keys(&mut self, sessions: &SessionStore, keys: &[NewSshKey<'_>]) -> Result<(), String> {
+        let mut document = self.read()?;
+        for key in keys {
+            if !vault_keys::valid_id(key.id) || document.keys.iter().any(|existing| existing.id.eq_ignore_ascii_case(key.id)) {
+                return Err("Invalid or duplicate container key ID".into());
+            }
+            if key.private.is_empty() || key.private.len() > MAX_KEY_BYTES {
+                return Err("Invalid container key size".into());
+            }
+            document.keys.push(KeyRecord { id: key.id.to_ascii_lowercase(), private_b64: BASE64.encode(key.private), label: key.label.to_owned(), public_key: key.public_key.to_owned() });
+        }
+        let updated = sessions.serialize_ini(Some(&document.session_key()?))?;
+        document.sessions_ini.zeroize();
+        document.sessions_ini = updated;
+        self.write(&document)
+    }
+
+    pub fn list_ssh_keys(&self) -> Result<Vec<SshKeyInfo>, String> {
+        let document = self.read()?;
+        Ok(document.keys.iter().map(|key| SshKeyInfo {
+            id: key.id.clone(), label: key.label.clone(), public_key: key.public_key.clone(),
+        }).collect())
+    }
+
+    pub fn read_ssh_key(&self, id: &str) -> Result<Zeroizing<Vec<u8>>, String> {
+        let document = self.read()?;
+        let record = document.keys.iter().find(|key| key.id.eq_ignore_ascii_case(id)).ok_or("Container key not found")?;
+        Ok(Zeroizing::new(BASE64.decode(&record.private_b64).map_err(|_| "Invalid container key encoding")?))
+    }
+
+    pub fn remove_ssh_key(&mut self, id: &str) -> Result<(), String> {
+        let mut document = self.read()?;
+        let index = document.keys.iter().position(|key| key.id.eq_ignore_ascii_case(id)).ok_or("Container key not found")?;
+        document.keys.remove(index);
+        self.write(&document)
+    }
+
+    /// Erase the unlocked key while retaining the process lock.
+    pub fn lock(self) -> CredentialContainer {
+        CredentialContainer { file: self.file.lock() }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::session_store::StoredSite;
     use linscp_types::ProtocolScheme;
+
+    #[test]
+    fn unlocked_session_keeps_lock_and_commits_without_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let mut unlocked = vault.unlock("test password").ok().unwrap();
+        assert!(CredentialContainer::acquire(&path).is_err());
+        let id = "0123456789abcdef0123456789abcdef";
+        let mut sessions = SessionStore::new();
+        let mut site = StoredSite::new("sample", ProtocolScheme::Sftp, "example.test");
+        site.private_key = Some(format!("vaultkey://{id}"));
+        site.password = Some("secret".into());
+        sessions.upsert(site);
+        let key = NewSshKey { id, private: b"private", label: "key", public_key: "public" };
+        unlocked.save_sessions_with_keys(&sessions, &[key]).unwrap();
+        assert_eq!(unlocked.load_sessions().unwrap().find("sample").unwrap().password.as_deref(), Some("secret"));
+        assert_eq!(unlocked.read_ssh_key(id).unwrap().as_slice(), b"private");
+        assert!(unlocked.remove_ssh_key(id).is_err());
+        let locked = unlocked.lock();
+        assert!(CredentialContainer::acquire(&path).is_err());
+        drop(locked);
+        assert!(CredentialContainer::acquire(&path).unwrap().unlock("wrong password").is_err());
+        let reopened = CredentialContainer::acquire(&path).unwrap().unlock("test password").ok().unwrap();
+        assert_eq!(reopened.list_ssh_keys().unwrap().len(), 1);
+    }
 
     #[test]
     fn transaction_import_and_key_deletion_are_fail_closed() {

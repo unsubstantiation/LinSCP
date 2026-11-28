@@ -56,18 +56,61 @@ pub fn seal(plaintext: &[u8], password: &str) -> Result<Vec<u8>, PlatformError> 
     Ok(output)
 }
 
-/// Open an authenticated envelope. Corrupt or unsupported data is never treated as empty.
-pub fn open(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+fn check_envelope(bytes: &[u8]) -> Result<(), PlatformError> {
     if bytes.len() < HEADER_LEN + TAG_LEN || bytes.len() > HEADER_LEN + MAX_PLAINTEXT + TAG_LEN || !bytes.starts_with(MAGIC) {
         return Err(error("Invalid application vault format or size"));
     }
-    let header = &bytes[..HEADER_LEN];
-    let key = derive_key(password, &header[MAGIC.len()..MAGIC.len() + SALT_LEN])?;
-    let cipher = Aes256Gcm::new_from_slice(&key[..]).map_err(|_| error("Invalid application vault key"))?;
-    let nonce = Nonce::from_slice(&header[HEADER_LEN - NONCE_LEN..]);
-    let plaintext = cipher.decrypt(nonce, Payload { msg: &bytes[HEADER_LEN..], aad: header })
-        .map_err(|_| error("Incorrect application vault password or damaged vault"))?;
-    Ok(Zeroizing::new(plaintext))
+    Ok(())
+}
+
+/// Key material retained only while the container is unlocked. The password is
+/// never stored. Each save uses a new random nonce under this derived key.
+pub(crate) struct UnlockedKey {
+    salt: [u8; SALT_LEN],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl UnlockedKey {
+    pub(crate) fn open(&self, bytes: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+        check_envelope(bytes)?;
+        let header = &bytes[..HEADER_LEN];
+        if header[MAGIC.len()..MAGIC.len() + SALT_LEN] != self.salt {
+            return Err(error("Application vault changed while unlocked"));
+        }
+        let cipher = Aes256Gcm::new_from_slice(&self.key[..]).map_err(|_| error("Invalid application vault key"))?;
+        let nonce = Nonce::from_slice(&header[HEADER_LEN - NONCE_LEN..]);
+        let plaintext = cipher.decrypt(nonce, Payload { msg: &bytes[HEADER_LEN..], aad: header })
+            .map_err(|_| error("Incorrect application vault password or damaged vault"))?;
+        Ok(Zeroizing::new(plaintext))
+    }
+
+    pub(crate) fn seal(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
+        if plaintext.len() > MAX_PLAINTEXT { return Err(error("Application vault exceeds size limit")); }
+        let mut header = [0u8; HEADER_LEN];
+        header[..MAGIC.len()].copy_from_slice(MAGIC);
+        header[MAGIC.len()..MAGIC.len() + SALT_LEN].copy_from_slice(&self.salt);
+        rand::thread_rng().fill_bytes(&mut header[HEADER_LEN - NONCE_LEN..]);
+        let cipher = Aes256Gcm::new_from_slice(&self.key[..]).map_err(|_| error("Invalid application vault key"))?;
+        let ciphertext = cipher.encrypt(Nonce::from_slice(&header[HEADER_LEN - NONCE_LEN..]), Payload { msg: plaintext, aad: &header })
+            .map_err(|_| error("Could not encrypt application vault"))?;
+        let mut output = Vec::with_capacity(HEADER_LEN + ciphertext.len());
+        output.extend_from_slice(&header);
+        output.extend_from_slice(&ciphertext);
+        Ok(output)
+    }
+}
+
+pub(crate) fn unlock(bytes: &[u8], password: &str) -> Result<(UnlockedKey, Zeroizing<Vec<u8>>), PlatformError> {
+    check_envelope(bytes)?;
+    let salt: [u8; SALT_LEN] = bytes[MAGIC.len()..MAGIC.len() + SALT_LEN].try_into().expect("checked header length");
+    let key = UnlockedKey { key: derive_key(password, &salt)?, salt };
+    let plaintext = key.open(bytes)?;
+    Ok((key, plaintext))
+}
+
+/// Open an authenticated envelope. Corrupt or unsupported data is never treated as empty.
+pub fn open(bytes: &[u8], password: &str) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
+    unlock(bytes, password).map(|(_, plaintext)| plaintext)
 }
 
 #[cfg(test)]
