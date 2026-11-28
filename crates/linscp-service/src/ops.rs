@@ -2055,7 +2055,10 @@ pub fn take_shell_manifest(config_root: &Path, id: &str) -> Result<Value, String
         .join(format!("{safe_id}.json"));
     let val = read_shell_manifest_file(&path)
         .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
-    let _ = std::fs::remove_file(&path);
+    // Two consumers can both open the same manifest. Only the one that
+    // successfully unlinks it owns the hand-off and may queue its items.
+    std::fs::remove_file(&path)
+        .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
     Ok(val)
 }
 
@@ -2076,6 +2079,27 @@ mod tests {
     use linscp_engine::script::{ScriptInterpreter, ScriptRunConfig};
     use linscp_engine::xml_log::SessionLogger;
     use serde_json::json;
+
+    #[test]
+    fn shell_manifest_has_at_most_one_successful_consumer() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, b"test").unwrap();
+        let doc = record_shell_upload_manifest(root.path(), &[file]).unwrap();
+        let id = doc["id"].as_str().unwrap().to_string();
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                let root = root.path();
+                let id = &id;
+                let barrier = &barrier;
+                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id).is_ok() }));
+            }
+            threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count()
+        });
+        assert_eq!(results, 1);
+    }
 
     #[test]
     fn android_share_manifest_is_idempotent_and_rejects_collision() {

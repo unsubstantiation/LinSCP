@@ -151,6 +151,7 @@ jobs:
       - run: npm ci --prefix ui --no-audit --no-fund
       - run: npm run build --prefix ui
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service android_share_manifest_is_idempotent_and_rejects_collision -- --nocapture
+      - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service shell_manifest_has_at_most_one_successful_consumer -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-service a_native_window_drop_names_paths_and_the_backend_reads_them -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo test -p linscp-tauri shared_paths_are_acknowledged_only_after_publication -- --nocapture
       - run: python3 tools/run_cargo_ci.py cargo build -p linscp-tauri --features native-shell
