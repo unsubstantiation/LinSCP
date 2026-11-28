@@ -1948,6 +1948,29 @@ pub fn record_shell_upload_manifest(
     config_root: &Path,
     paths: &[PathBuf],
 ) -> Result<Value, String> {
+    let mut rnd = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut rnd);
+    let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    record_shell_upload_manifest_with_id(config_root, paths, &id)
+}
+
+/// Idempotent publication for one Android staged file. Its random staging path
+/// identifies the hand-off across a retry or process restart.
+pub fn record_android_share_manifest(config_root: &Path, path: &Path) -> Result<Value, String> {
+    let id = format!("android-{}", sha256_hex(path.to_string_lossy().as_bytes()));
+    let manifest = config_root.join("shell-manifests").join(format!("{id}.json"));
+    if manifest.exists() {
+        let existing = read_shell_manifest_file(&manifest)?;
+        let matches = existing.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && existing.get("items").and_then(Value::as_array).is_some_and(|items| {
+                items.len() == 1 && items[0].get("path").and_then(Value::as_str) == path.to_str()
+            });
+        return if matches { Ok(existing) } else { Err("Conflicting Android share manifest".into()) };
+    }
+    record_shell_upload_manifest_with_id(config_root, &[path.to_path_buf()], &id)
+}
+
+fn record_shell_upload_manifest_with_id(config_root: &Path, paths: &[PathBuf], id: &str) -> Result<Value, String> {
     if paths.is_empty() {
         return Err("Provide at least one local file or folder to stage for upload.".to_string());
     }
@@ -1978,9 +2001,6 @@ pub fn record_shell_upload_manifest(
 
     let manifests_dir = config_root.join("shell-manifests");
     create_private_dir(&manifests_dir).map_err(|e| e.to_string())?;
-    let mut rnd = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut rnd);
-    let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2056,6 +2076,23 @@ mod tests {
     use linscp_engine::script::{ScriptInterpreter, ScriptRunConfig};
     use linscp_engine::xml_log::SessionLogger;
     use serde_json::json;
+
+    #[test]
+    fn android_share_manifest_is_idempotent_and_rejects_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged.txt");
+        std::fs::write(&staged, b"shared").unwrap();
+        let first = record_android_share_manifest(root.path(), &staged).unwrap();
+        let second = record_android_share_manifest(root.path(), &staged).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(list_shell_manifests(root.path()).len(), 1);
+        let id = first["id"].as_str().unwrap();
+        let manifest = root.path().join("shell-manifests").join(format!("{id}.json"));
+        let mut altered = first.clone();
+        altered["items"][0]["path"] = json!("different");
+        std::fs::write(&manifest, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(record_android_share_manifest(root.path(), &staged).is_err());
+    }
 
     fn tab(is_local: bool) -> TabRuntime {
         TabRuntime {

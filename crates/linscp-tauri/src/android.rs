@@ -134,6 +134,13 @@ mod imp {
                 None => Ok(Vec::new()),
             }
         }
+        pub fn acknowledge_share_paths(&self, paths: &[PathBuf]) -> Result<(), PlatformError> {
+            match self.share.lock().unwrap().as_deref() {
+                Some(bridge) => bridge.acknowledge_share_paths(paths),
+                None if paths.is_empty() => Ok(()),
+                None => Err(PlatformError::Unsupported("Android share integration is not available".into())),
+            }
+        }
         pub fn export_bridge(&self) -> Result<Arc<dyn ShareBridge>, PlatformError> {
             self.share.lock().unwrap().clone().ok_or_else(|| PlatformError::Unsupported("Android share integration is not available".to_string()))
         }
@@ -325,6 +332,7 @@ mod imp {
             Err(PlatformError::UnsupportedUri("SAF only on Android".to_string()))
         }
         pub fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> { Ok(Vec::new()) }
+        pub fn acknowledge_share_paths(&self, _paths: &[PathBuf]) -> Result<(), PlatformError> { Ok(()) }
         pub fn stage_share_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError> {
             if uris.is_empty() {
                 return Err(PlatformError::SecretVault("No files shared".to_string()));
@@ -470,7 +478,12 @@ mod mobile_plugin {
         }
     }
     impl ShareBridge for MobileBridge {
-        fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> { Ok(self.call::<PathList, _>("takePendingShares", ())?.paths) }
+        fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError> { Ok(self.call::<PathList, _>("pendingShares", ())?.paths) }
+        fn acknowledge_share_paths(&self, paths: &[PathBuf]) -> Result<(), PlatformError> {
+            #[derive(Serialize)] struct Args<'a> { paths: &'a [PathBuf] }
+            let _: serde_json::Value = self.call("acknowledgeShares", Args { paths })?;
+            Ok(())
+        }
         fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError> {
             #[derive(Serialize)] struct Args<'a> { uris: &'a [String] }
             Ok(self.call::<PathList, _>("stageUris", Args { uris })?.paths)

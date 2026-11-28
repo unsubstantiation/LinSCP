@@ -78,7 +78,9 @@ pub trait SafBridge: Send + Sync {
 /// Bridge for staging incoming Android Share Sheet intents (`ACTION_SEND` /
 /// `ACTION_SEND_MULTIPLE`).
 pub trait ShareBridge: Send + Sync {
+    /// Peek without consuming; paths are acknowledged only after manifest publication.
     fn staged_share_paths(&self) -> Result<Vec<PathBuf>, PlatformError>;
+    fn acknowledge_share_paths(&self, paths: &[PathBuf]) -> Result<(), PlatformError>;
     fn stage_uris(&self, uris: &[String]) -> Result<Vec<PathBuf>, PlatformError>;
     /// Allocate, populate and hand out one private outgoing-share batch.
     fn prepare_export(&self) -> Result<PathBuf, PlatformError>;

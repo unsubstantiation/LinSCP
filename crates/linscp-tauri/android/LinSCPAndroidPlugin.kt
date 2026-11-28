@@ -65,6 +65,8 @@ internal class TreeArgs { lateinit var uri: String }
 @InvokeArg
 internal class UriArgs { lateinit var uris: ArrayList<String> }
 @InvokeArg
+internal class SharePathsArgs { lateinit var paths: ArrayList<String> }
+@InvokeArg
 internal class SingleUriArgs { lateinit var uri: String }
 @InvokeArg
 internal class ReadChunkArgs { lateinit var uri: String; var offset: Long = 0; var length: Int = 1048576 }
@@ -116,7 +118,13 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   private val running = AtomicBoolean(false)
   private val notificationPermissionAsked = AtomicBoolean(false)
   private val shareLock = Any()
-  private val pendingShares = mutableListOf<String>()
+  // App-private preferences survive process death until Rust publishes and
+  // acknowledges each manifest. Copy the set; SharedPreferences owns it.
+  private val sharePrefs get() = activity.getSharedPreferences("incoming-shares", Context.MODE_PRIVATE)
+  private fun pendingShareSet(): MutableSet<String> = sharePrefs.getStringSet("paths", emptySet())!!.toMutableSet()
+  private fun savePendingShares(paths: Set<String>) {
+    if (!sharePrefs.edit().putStringSet("paths", paths).commit()) throw IllegalStateException("cannot save pending shares")
+  }
   private val shareDir: File get() = File(activity.cacheDir, "incoming-shares")
   private val maxSharedBytes = 512L * 1024L * 1024L
   private val stageLock = Any()
@@ -423,9 +431,18 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
   }
 
   @Command
-  fun takePendingShares(invoke: Invoke) {
-    val paths = synchronized(shareLock) { pendingShares.toList().also { pendingShares.clear() } }
+  fun pendingShares(invoke: Invoke) {
+    val paths = synchronized(shareLock) { pendingShareSet().sorted() }
     invoke.resolveObject(mapOf("paths" to paths))
+  }
+
+  @Command
+  fun acknowledgeShares(invoke: Invoke) {
+    val paths = invoke.parseArgs(SharePathsArgs::class.java).paths
+    runIo(invoke, "Cannot acknowledge shared files") {
+      synchronized(shareLock) { savePendingShares(pendingShareSet().apply { removeAll(paths.toSet()) }) }
+      mapOf("success" to true)
+    }
   }
 
   // Export batches are private until FileProvider grants an exact URI to the
@@ -871,22 +888,33 @@ class LinSCPAndroidPlugin(private val activity: Activity) : Plugin(activity) {
     Thread({
       try {
         val files = stageUris(uris.map(Uri::toString))
-        synchronized(shareLock) { pendingShares.addAll(files) }
-      } catch (_: Exception) { /* Invalid or inaccessible share URIs are not queued. */ }
+        try {
+          synchronized(shareLock) { savePendingShares(pendingShareSet().apply { addAll(files) }) }
+        } catch (e: Exception) {
+          files.forEach { File(it).parentFile?.deleteRecursively() }
+          throw e
+        }
+      } catch (e: Exception) {
+        android.util.Log.w("LinSCPShare", "Unable to stage shared files")
+        activity.runOnUiThread {
+          android.widget.Toast.makeText(activity, "Cannot import shared files", android.widget.Toast.LENGTH_LONG).show()
+        }
+      }
     }, "linscp-incoming-share").start()
   }
 
   private fun stageUris(uris: List<String>): List<String> = synchronized(stageLock) {
     if (uris.size > 100) throw IllegalStateException("a maximum of 100 shared items is supported")
     if (!shareDir.exists() && !shareDir.mkdirs()) throw IllegalStateException("cannot create private staging directory")
-    shareDir.listFiles()?.filter { System.currentTimeMillis() - it.lastModified() > 3L * 24 * 60 * 60 * 1000 }?.forEach { it.deleteRecursively() }
+    val pendingBatches = synchronized(shareLock) { pendingShareSet().mapNotNull { File(it).parentFile?.absolutePath }.toSet() }
+    shareDir.listFiles()?.filter { it.absolutePath !in pendingBatches && System.currentTimeMillis() - it.lastModified() > 3L * 24 * 60 * 60 * 1000 }?.forEach { it.deleteRecursively() }
     val staged = mutableListOf<String>()
     val batches = mutableListOf<File>()
     var totalBytes = 0L
     try {
       for (raw in uris) {
         val uri = Uri.parse(raw)
-        if (uri.scheme != "content") continue
+        if (uri.scheme != "content") throw IllegalStateException("only content URIs can be shared")
         val candidate = queryDisplayName(uri)?.replace(Regex("[^A-Za-z0-9._ -]"), "_")?.take(100)?.trim()
         val name = candidate?.takeUnless { it.isBlank() || it == "." || it == ".." } ?: "shared-file"
         val batch = File(shareDir, UUID.randomUUID().toString())

@@ -282,7 +282,16 @@ adb shell rm /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin
 if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-edited ]]; then
   echo "SAF provider did not persist edited bytes" >&2; exit 1
 fi
+# A mixed valid/invalid URI was rejected after the first file opened. No
+# partial incoming staging file may survive that failure.
+if adb shell run-as "$application" find cache/incoming-shares -type f | tr -d '\r' | grep -q .; then
+  echo "Rejected share left a staged file" >&2; exit 1
+fi
 restart_and_run saf-reopen
+# Deliver a real ACTION_SEND with a URI under the persisted provider grant.
+share_uri='content://com.android.externalstorage.documents/tree/primary%3ADocuments%2FLinSCP-Ungranted-Smoke/document/primary%3ADocuments%2FLinSCP-Ungranted-Smoke%2Fmarker.txt'
+adb shell am start -n "$application/.MainActivity" -a android.intent.action.SEND -t text/plain --eu android.intent.extra.STREAM "$share_uri"
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" share-intent
 # Enroll only on this disposable emulator, then exercise the real system
 # BiometricPrompt and Keystore CryptoObject across a process restart.
 exercise_biometrics

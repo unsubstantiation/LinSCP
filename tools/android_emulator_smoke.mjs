@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'share-intent', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -277,6 +277,12 @@ const expression = `
     const expected = phase === 'saf-pick-finish' ? 'saf-original' : 'saf-edited';
     if (before.content !== expected) throw new Error('Unexpected provider bytes');
     if (phase === 'saf-pick-finish') {
+      // A later invalid URI must roll back the first staged provider file.
+      const document = tree + '/document/' + encodeURIComponent('primary:Documents/LinSCP-Ungranted-Smoke/marker.txt');
+      let refused = false;
+      try { await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|stageUris', {uris: [document, 'file:///not-a-content-uri']}); }
+      catch (_) { refused = true; }
+      if (!refused) throw new Error('A mixed valid and invalid share was accepted');
       const stale = String(BigInt(before.info.mtime) * 1000000000n - 1n);
       let rejected;
       try { await invoke('POST', '/api/local/save', {tab, path: 'marker.txt', content: 'stale write', base_mtime_ns: stale}); }
@@ -621,6 +627,21 @@ const expression = `
     await runTask('/api/transfer/keepuptodate', {...sync, count: 1});
     const watched = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/watch.txt'));
     if (watched.content !== 'watched provider file') throw new Error('SAF keep-up-to-date missed the file');
+  }
+  if (${JSON.stringify(phase)} === 'share-intent') {
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    let offer;
+    for (let i = 0; i < 30 && !offer; i++) {
+      const pending = await invoke('GET', '/api/shell/pending');
+      offer = pending.pending?.find(item => item.items?.some(file => file.name === 'marker.txt'));
+      if (!offer) await sleep(1000);
+    }
+    if (!offer) throw new Error('Android SEND intent did not produce a pending manifest');
+    const item = offer.items.find(file => file.name === 'marker.txt');
+    const read = await invoke('GET', '/api/local/edit?path=' + encodeURIComponent(item.path));
+    if (read.content !== 'saf-edited') throw new Error('Shared document contents differ');
+    await invoke('POST', '/api/shell/dismiss', {id: offer.id});
+    return {root, incomingShareIntent: true};
   }
   if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();

@@ -113,7 +113,7 @@ class AndroidApplicationIdTests(unittest.TestCase):
         for command in ['pickTree', 'grantedTrees', 'listTree', 'statUri', 'readUri',
                         'readUriChunk', 'writeUri', 'beginWriteUri', 'appendUriChunk',
                         'mkdirUri', 'deleteUri', 'renameUri',
-                        'stageUris', 'takePendingShares', 'openExternalUri',
+                        'stageUris', 'pendingShares', 'acknowledgeShares', 'openExternalUri',
                         'foregroundStart', 'foregroundUpdate', 'foregroundStop']:
             self.assertIn('fun ' + command + '(', kotlin)
         self.assertIn('"rdp", "vnc", "spice"', kotlin)

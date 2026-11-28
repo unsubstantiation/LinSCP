@@ -12871,12 +12871,19 @@
 
   let shellOffer = null;
   const shellOfferedOnTab = {};
+  let shellPendingError = false;
 
   async function checkShellPending() {
     if (handlingShare) return;
     if ($('shellUploadModal').classList.contains('open')) return;
     const data = await apiGet('/api/shell/pending');
-    const pending = (data && data.pending) || [];
+    if (!data || !data.success) {
+      if (!shellPendingError) toast(errorMessage(data && data.error, t('Cannot queue the transfer.')), true);
+      shellPendingError = true;
+      return;
+    }
+    shellPendingError = false;
+    const pending = data.pending || [];
     for (const item of pending) {
       // Offered once per tab: "Later" defers without nagging, but moving
       // to another tab offers the files against that one instead.
@@ -12884,8 +12891,8 @@
       // One file set, two hosts: the desktop's `--shell-upload` selection and
       // Android's share hand-off both arrive as this manifest. The desktop
       // confirms against a tab because the user may have no connection yet;
-      // Android's share already happened, so it goes through the drop path,
-      // which asks the same overwrite questions and reports the same way.
+      // Android's share already happened, so it is sent to the transfer queue;
+      // the consume endpoint reports any per-item refusal.
       if (await queueSharedFiles(item)) return;
       shellOffer = item;
       shellOfferedOnTab[item.id] = state.activeTab;
@@ -12906,7 +12913,7 @@
   /* Android's share sheet stages what another app sent and records the same
    * manifest the desktop's `--shell-upload` selection does. A share is a drop
    * the user already made, so it is queued at once through the same request
-   * the drop path uses instead of waiting behind a dialog; the desktop's
+   * shell-selection endpoint uses instead of waiting behind a dialog; the desktop's
    * selection keeps its confirmation because there the user may not be
    * connected yet. */
   async function queueSharedFiles(item) {

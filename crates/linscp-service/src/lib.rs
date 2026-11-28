@@ -8512,7 +8512,11 @@ impl CommanderService {
                     "The dropped SAF URI must name a document, not a tree root.".to_string(),
                 );
             }
-            return Ok((parsed.parent_uri(), parsed.leaf_name()));
+            let leaf = parsed.leaf_name();
+            if leaf != leaf.trim() {
+                return Err("Dropped names with leading or trailing whitespace are not supported.".to_string());
+            }
+            return Ok((parsed.parent_uri(), leaf));
         }
         let path = Path::new(path);
         let leaf = path
@@ -8520,6 +8524,11 @@ impl CommanderService {
             .and_then(|name| name.to_str())
             .ok_or_else(|| "The dropped item has no usable name.".to_string())?
             .to_string();
+        // Transfer name validation currently normalizes surrounding whitespace.
+        // Reject rather than silently copying/uploading under a different name.
+        if leaf != leaf.trim() {
+            return Err("Dropped names with leading or trailing whitespace are not supported.".to_string());
+        }
         let parent = path
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
@@ -8812,6 +8821,9 @@ impl CommanderService {
         // left to the byte path below, which has staged files since before
         // paths existed.
         let source_paths = Self::drop_source_paths(&body);
+        for path in &source_paths {
+            if let Err(error) = Self::dropped_path_split(path) { return api_error(400, error); }
+        }
         let single_plain_file = source_paths.len() == 1
             && matches!(Self::dropped_path_kind(&source_paths[0]), Ok(DroppedKind::File));
         if !source_paths.is_empty() && !single_plain_file {
@@ -18698,6 +18710,14 @@ mod tests {
         assert_eq!(both.status, 409, "{}", both.payload);
         assert_eq!(both.payload["conflicts"], json!(["report.txt"]));
         assert_eq!(std::fs::read(local.join("notes.txt")).unwrap(), b"notes");
+        #[cfg(not(windows))]
+        {
+            let trailing = outside.join("trailing-space ");
+            std::fs::write(&trailing, b"preserve whitespace").unwrap();
+            let spaced = drop_local(json!({"local_dir": local.to_string_lossy(), "source_paths": [trailing.to_string_lossy()]}));
+            assert_eq!(spaced.status, 400, "{}", spaced.payload);
+            assert!(!local.join("trailing-space").exists());
+        }
 
 
         // The page's approval is what turns a conflict into a replacement, and
