@@ -19,4 +19,13 @@ jobs:
         with:
           key: transfer-move-review
       - name: Test SAF transfer and risk regressions
-        run: cargo test -p linscp-service saf_ -- --nocapture --test-threads=1
+        shell: bash
+        run: |
+          set +e
+          cargo test -p linscp-service saf_ -- --nocapture --test-threads=1 > saf-test.log 2>&1
+          status=$?
+          tail -100 saf-test.log
+          if [ "$status" != 0 ]; then
+            python -c 'import pathlib; s=pathlib.Path("saf-test.log").read_text(errors="replace"); s=s.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A"); print("::error::" + s[-12000:])'
+          fi
+          exit "$status"
