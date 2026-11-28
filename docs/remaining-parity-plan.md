@@ -505,14 +505,14 @@ Session transfers with a granted local side stage through private temporary file
 
 **Area:** Editing/search · **Status:** partial
 
-CLI editing supports explicit legacy-encoding selection ('edit -encoding=ENC'): the file is converted between its encoding and UTF-8, the round trip is byte exact with the BOM preserved, and invalid sequences or unrepresentable output are refused without a silent replacement. Browser editor/search remain UTF-8-only and reject binary files.
+CLI and browser editor support explicit legacy encodings with strict decoding and encoding, line-ending and BOM controls. When opening undecodable text the browser offers an encoding retry; content search accepts an encoding and skips binary or undecodable files. Remote editor and search downloads are bounded by streamed bytes, not just server-reported sizes.
 
-**Next:** The live half is still unevidenced: unit has no build target and cannot be compiled. Runnable residue: service-commands, which refuses a binary file, an invalid byte sequence and an unknown encoding, and round-trips a legacy encoding byte exactly with its byte-order mark; and engine-editor, which edits a file in a legacy encoding and uploads it in that encoding (the editor double is a shell command, so that case runs on the Unix hosts).
+**Next:** GUI behavior is exercised with a stub service, and service encoding/search cases use local or mock fixtures; live-server non-UTF-8 round trips and packaged Android remain unverified. Binary detection is heuristic, not a guarantee that arbitrary binary data is rejected.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Cover the search path as well as the editor path: the browser search rejects binary files too.
+- [ ] Exercise non-UTF-8 editor and search against live servers and packaged Android, including binary and invalid-sequence cases.
+- [ ] Retain strict refusal of unrepresentable output and document binary detection limits.
 
 ## automation.upstream-xml-compatibility
 
