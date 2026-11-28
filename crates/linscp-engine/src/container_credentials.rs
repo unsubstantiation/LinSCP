@@ -3,7 +3,7 @@
 //! This is not wired into CommanderService. Do not use this provisional schema
 //! as the application's active vault until all readers, key materialization,
 //! backup/restore, and lock/unlock paths use the same transaction boundary.
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use linscp_crypto::SessionMasterKey;
@@ -18,6 +18,7 @@ const MAX_KEYS: usize = 2000;
 const MAX_KEY_BYTES: usize = 1024 * 1024;
 const MAX_METADATA_BYTES: usize = 32 * 1024;
 const MAX_TLS_BYTES: usize = 384 * 1024;
+const MAX_PROTECTED_BYTES: usize = 8 * 1024 * 1024;
 const PUBLIC_KEY_FIELDS: &[&str] = &["linscp_public_key_file", "linscp_tunnel_public_key_file"];
 const TLS_FIELDS: &[&str] = &["ca_certificate_file", "tls_certificate_file", "certificate", "tls_certificate_key_file"];
 
@@ -65,12 +66,15 @@ struct Document {
     tls: Vec<TlsRecord>,
     #[serde(default)]
     public_keys: Vec<PublicKeyRecord>,
+    #[serde(default)]
+    protected: BTreeMap<String, String>,
 }
 
 impl Drop for Document {
     fn drop(&mut self) {
         self.session_key_b64.zeroize();
         self.sessions_ini.zeroize();
+        for value in self.protected.values_mut() { value.zeroize(); }
     }
 }
 
@@ -78,7 +82,7 @@ impl Document {
     fn fresh() -> Self {
         let mut key = Zeroizing::new([0u8; 32]);
         rand::thread_rng().fill_bytes(&mut *key);
-        Self { version: 1, session_key_b64: BASE64.encode(&*key), sessions_ini: String::new(), keys: Vec::new(), tls: Vec::new(), public_keys: Vec::new() }
+        Self { version: 1, session_key_b64: BASE64.encode(&*key), sessions_ini: String::new(), keys: Vec::new(), tls: Vec::new(), public_keys: Vec::new(), protected: BTreeMap::new() }
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, String> {
@@ -107,6 +111,12 @@ impl Document {
 
     fn validate(&self) -> Result<(), String> {
         if self.version != 1 { return Err("Unsupported credential container version".into()); }
+        for (domain, encoded) in &self.protected {
+            if !matches!(domain.as_str(), "workspaces" | "ssh-host-keys") { return Err("Unknown protected container domain".into()); }
+            if encoded.len() > (MAX_PROTECTED_BYTES + 2) / 3 * 4 { return Err("Protected container data is too large".into()); }
+            let value = Zeroizing::new(BASE64.decode(encoded).map_err(|_| "Invalid protected container data")?);
+            if value.len() > MAX_PROTECTED_BYTES { return Err("Protected container data is too large".into()); }
+        }
         let key = self.session_key()?;
         let sessions = SessionStore::parse_ini(&self.sessions_ini, Some(&key))?;
         if sessions.sites().iter().any(|site| site.summary().has_unreadable_secret || site.setting_error.is_some()) {
@@ -474,6 +484,19 @@ impl ContainerSessionVault {
         Ok(())
     }
 
+    fn check_protected_path(&self, path: &std::path::Path, domain: &str) -> Result<(), linscp_platform::PlatformError> {
+        let expected = match domain {
+            "workspaces" => "workspaces.json",
+            "ssh-host-keys" => "sshhostkeys",
+            _ => return Err(Self::error("Unsupported container protected-file domain")),
+        };
+        if path.file_name() != Some(std::ffi::OsStr::new(expected)) {
+            return Err(Self::error("Protected-file name does not match its domain"));
+        }
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(std::path::Path::new("."));
+        self.check_root(parent)
+    }
+
     fn error(message: impl ToString) -> linscp_platform::PlatformError {
         linscp_platform::PlatformError::SecretVault(message.to_string())
     }
@@ -492,6 +515,38 @@ impl linscp_platform::SecretVault for ContainerSessionVault {
 
     fn load_or_create_master_key(&self, config_dir: &std::path::Path) -> Result<Zeroizing<[u8; 32]>, linscp_platform::PlatformError> {
         self.load_master_key(config_dir)?.ok_or_else(|| Self::error("Vault is locked"))
+    }
+
+    fn seal_session_store(&self, plaintext: &[u8]) -> Result<Vec<u8>, linscp_platform::PlatformError> {
+        let master = self.load_or_create_master_key(&self.root)?;
+        linscp_platform::password_vault::seal_blob_with_master_key(plaintext, &master)
+    }
+
+    fn open_session_store(&self, encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, linscp_platform::PlatformError> {
+        let master = self.load_or_create_master_key(&self.root)?;
+        linscp_platform::password_vault::open_blob_with_master_key(encrypted, &master)
+    }
+
+    fn read_protected_file(&self, path: &std::path::Path, domain: &str) -> Result<linscp_platform::ProtectedFileRead, linscp_platform::PlatformError> {
+        self.check_protected_path(path, domain)?;
+        let guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_ref().ok_or_else(|| Self::error("Vault is locked"))?;
+        let document = session.read().map_err(Self::error)?;
+        match document.protected.get(domain) {
+            Some(value) => Ok(linscp_platform::ProtectedFileRead::Plaintext(Zeroizing::new(BASE64.decode(value).map_err(Self::error)?))),
+            None => Ok(linscp_platform::ProtectedFileRead::Missing),
+        }
+    }
+
+    fn write_protected_file(&self, path: &std::path::Path, domain: &str, value: &[u8]) -> Result<bool, linscp_platform::PlatformError> {
+        self.check_protected_path(path, domain)?;
+        if value.len() > MAX_PROTECTED_BYTES { return Err(Self::error("Protected container data is too large")); }
+        let mut guard = self.unlocked.lock().map_err(|_| Self::error("Container session is unavailable"))?;
+        let session = guard.as_mut().ok_or_else(|| Self::error("Vault is locked"))?;
+        let mut document = session.read().map_err(Self::error)?;
+        if let Some(mut previous) = document.protected.insert(domain.to_string(), BASE64.encode(value)) { previous.zeroize(); }
+        session.write(&document).map_err(Self::error)?;
+        Ok(true)
     }
 
     fn read_session_ini(&self, config_dir: &std::path::Path) -> Result<linscp_platform::SessionIniRead, linscp_platform::PlatformError> {
@@ -550,6 +605,42 @@ mod tests {
         unlocked.save_sessions_with_materials(&SessionStore::new(), &[], &[], &[]).unwrap();
         unlocked.remove_tls_material(tls_id).unwrap();
         unlocked.remove_public_key(pub_id).unwrap();
+    }
+
+    #[test]
+    fn protected_workspace_and_hostkeys_live_inside_container() {
+        use linscp_platform::SecretVault;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let unlocked = vault.unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        let workspace = dir.path().join("workspaces.json");
+        let hostkeys = dir.path().join("sshhostkeys");
+        assert!(crate::protected_file::read(&workspace, "workspaces", &bridge).unwrap().is_none());
+        crate::protected_file::write(&workspace, "workspaces", &bridge, b"private workspace").unwrap();
+        crate::protected_file::migrate(&workspace, "workspaces", &bridge, |value| {
+            assert_eq!(value, b"private workspace"); Ok(())
+        }).unwrap();
+        let mut cache = crate::hostkeys::HostKeyCache::new();
+        cache.upsert("example.test", 22, "ssh-ed25519", "SHA256:test").unwrap();
+        cache.save_protected(&hostkeys, &bridge).unwrap();
+        assert_eq!(crate::hostkeys::HostKeyCache::load_protected(&hostkeys, &bridge).unwrap().lookup("example.test", 22, "ssh-ed25519"), Some("SHA256:test"));
+        assert!(!workspace.exists() && !hostkeys.exists());
+        assert!(crate::protected_file::read(&workspace, "ssh-host-keys", &bridge).is_err());
+        assert!(crate::protected_file::write(&dir.path().join("other"), "workspaces", &bridge, b"x").is_err());
+        let blob = bridge.seal_session_store(b"protected blob").unwrap();
+        assert_eq!(bridge.open_session_store(&blob).unwrap().as_slice(), b"protected blob");
+        let disk = std::fs::read(&path).unwrap();
+        assert!(!disk.windows(b"private workspace".len()).any(|w| w == b"private workspace"));
+        bridge.lock().unwrap();
+        assert!(crate::protected_file::read(&workspace, "workspaces", &bridge).is_err());
+        assert!(bridge.open_session_store(&blob).is_err());
+        let reopened = CredentialContainer::acquire(&path).unwrap().unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), reopened).unwrap();
+        assert_eq!(crate::protected_file::read(&workspace, "workspaces", &bridge).unwrap().unwrap().as_slice(), b"private workspace");
+        assert_eq!(bridge.open_session_store(&blob).unwrap().as_slice(), b"protected blob");
     }
 
     #[test]

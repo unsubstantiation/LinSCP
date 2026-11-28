@@ -280,6 +280,13 @@ pub enum SessionIniRead {
     Plaintext(Zeroizing<String>),
 }
 
+/// Optional virtual storage for a domain-separated protected file.
+pub enum ProtectedFileRead {
+    Unhandled,
+    Missing,
+    Plaintext(Zeroizing<Vec<u8>>),
+}
+
 /// Platform-neutral `sessions.key` master-key vault. The key file itself is an
 /// owner-only private file; secrecy comes from the password wrap (`LSCPVLT1`),
 /// which is the only wrapping on every build.
@@ -292,6 +299,14 @@ pub trait SecretVault: Send + Sync {
         Ok(SessionIniRead::Unhandled)
     }
     fn write_session_ini(&self, _config_dir: &Path, _text: &str) -> Result<bool, PlatformError> {
+        Ok(false)
+    }
+    /// A handled backend must authenticate data, preserve domain separation,
+    /// validate the requested location and fail closed when locked.
+    fn read_protected_file(&self, _path: &Path, _domain: &str) -> Result<ProtectedFileRead, PlatformError> {
+        Ok(ProtectedFileRead::Unhandled)
+    }
+    fn write_protected_file(&self, _path: &Path, _domain: &str, _value: &[u8]) -> Result<bool, PlatformError> {
         Ok(false)
     }
     /// The local password vault protects the entire session store, not just secrets.

@@ -127,16 +127,7 @@ impl PasswordSecretVault {
 
     pub fn seal_local_blob(&self, plaintext: &[u8]) -> Result<Vec<u8>, PlatformError> {
         let master = self.master_key_copy()?;
-        let mut nonce = [0u8; NONCE_LEN];
-        rand::thread_rng().fill_bytes(&mut nonce);
-        let cipher = Aes256Gcm::new_from_slice(&master[..]).map_err(|_| vault_error("Invalid local vault key"))?;
-        let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: BLOB_MAGIC })
-            .map_err(|_| vault_error("Could not encrypt local vault data"))?;
-        let mut output = Vec::with_capacity(BLOB_MAGIC.len() + nonce.len() + ciphertext.len());
-        output.extend_from_slice(BLOB_MAGIC);
-        output.extend_from_slice(&nonce);
-        output.extend_from_slice(&ciphertext);
-        Ok(output)
+        seal_blob_with_master_key(plaintext, &master)
     }
 
     pub fn open_local_blob(&self, encrypted: &[u8]) -> Result<Zeroizing<Vec<u8>>, PlatformError> {
@@ -170,6 +161,20 @@ impl SecretVault for PasswordSecretVault {
     fn load_or_create_master_key(&self, _config_dir: &Path) -> Result<Zeroizing<[u8; 32]>, PlatformError> {
         self.master_key_copy()
     }
+}
+
+/// Encrypt a local-vault blob with an already unlocked master key.
+pub fn seal_blob_with_master_key(plaintext: &[u8], master: &[u8; 32]) -> Result<Vec<u8>, PlatformError> {
+    let mut nonce = [0u8; NONCE_LEN];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let cipher = Aes256Gcm::new_from_slice(master).map_err(|_| vault_error("Invalid local vault key"))?;
+    let ciphertext = cipher.encrypt(Nonce::from_slice(&nonce), Payload { msg: plaintext, aad: BLOB_MAGIC })
+        .map_err(|_| vault_error("Could not encrypt local vault data"))?;
+    let mut output = Vec::with_capacity(BLOB_MAGIC.len() + nonce.len() + ciphertext.len());
+    output.extend_from_slice(BLOB_MAGIC);
+    output.extend_from_slice(&nonce);
+    output.extend_from_slice(&ciphertext);
+    Ok(output)
 }
 
 /// Open a local-vault blob using the source key contained inside an already
