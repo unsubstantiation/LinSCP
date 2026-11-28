@@ -70,8 +70,8 @@ open route registers that bridge and the page polls it, forwards input, and
 requests close. Poll, input and close carry a service-issued generation so
 delayed requests from an earlier viewer cannot operate on a replacement bridge.
 This generation is not an authentication credential. The bridge sends protocol keepalives and closes on prolonged server silence
-while it is able to read. The corresponding modules passed isolated tests with stubbed SSH; the complete
-Rust workspace has not been built or tested here.
+while it is able to read. Linux and Windows CI run the service's X2Go-focused
+unit tests; they use synthetic graphics streams and do not establish live-server compatibility.
 
 Wire-layout facts were researched from the public GPL-3.0
 [Casement KDrive client](https://github.com/Inkbraid/casement-plugin-x2go)
@@ -242,8 +242,7 @@ setup failure, or drop. Cleanup on drop is best-effort: runtime shutdown,
 process termination, a broken SSH connection, or an invalid/lost startup reply
 can still leave an agent behind. The cookie is redacted in debug output and
 zeroized when the parsed session is dropped. These primitives are wired into
-the service; their tests passed in an isolated harness with stubbed SSH and
-zeroization, but the complete Rust application has not been compiled here.
+the service and tested with synthetic responses, not live servers.
 Startup replies and command behavior still need verification against live X2Go
 servers.
 
@@ -253,8 +252,7 @@ connection. The caller must use the same destination connection that created
 the agent; it never falls back to direct TCP. The handshake and wire decoder
 are connected to the experimental viewer through the service bridge.
 Opening or dropping the stream does not start or terminate an agent. The SSH
-mock integration tests are included but have not been run in this environment;
-they use an echo server, not X2Go.
+mock integration tests use an echo server, not X2Go.
 
 ## Still required for a verified viewer
 
