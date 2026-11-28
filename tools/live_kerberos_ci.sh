@@ -51,6 +51,7 @@ cat > "$KRB5_KDC_PROFILE" <<CONF
 CONF
 kdb5_util create -s -P fixture-master -r "$realm"
 kadmin.local -r "$realm" -q "addprinc -randkey host/linscp-fixture.invalid@$realm"
+kadmin.local -r "$realm" -q "modprinc +ok_as_delegate +allow_forwardable host/linscp-fixture.invalid@$realm"
 kadmin.local -r "$realm" -q "ktadd -k $root/host.keytab host/linscp-fixture.invalid@$realm"
 kadmin.local -r "$realm" -q "addprinc -randkey $fixture_user@$realm"
 kadmin.local -r "$realm" -q "ktadd -k $root/user.keytab $fixture_user@$realm"
@@ -62,6 +63,7 @@ for _ in {1..30}; do
   sleep .1
 done
 if [[ "$ready" != 1 ]]; then cat "$root/kdc.log"; echo 'KDC failed to issue credentials' >&2; exit 1; fi
+klist -f
 ssh-keygen -q -t ed25519 -N '' -f "$root/ssh_host_key"
 cat > "$root/sshd_config" <<CONF
 ListenAddress 127.0.0.1
@@ -95,7 +97,8 @@ else: raise SystemExit('sshd fixture did not start')
 PY
 if ! cargo test -q -p linscp-engine --test live_kerberos -- --ignored --nocapture >"$root/test.log" 2>&1; then
   echo '--- test log ---'; tail -80 "$root/test.log"
-  echo '--- sshd log ---'; tail -100 "$root/sshd.log"
+  echo '--- sshd GSSAPI diagnostics ---'; grep -Ei 'gss|krb|delegat|credential|error|failed|accept' "$root/sshd.log" | tail -100 || true
+  echo '--- sshd log ---'; tail -50 "$root/sshd.log"
   echo '--- KDC log ---'; tail -40 "$root/kdc.log"
   exit 1
 fi

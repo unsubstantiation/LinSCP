@@ -31,7 +31,10 @@ async fn live_kerberos_authentication_and_delegation() {
         let (conn, _) = connect_ssh_for_shell(&spec, Path::new("."), false, false, "en", 0, None)
             .await.unwrap_or_else(|error| panic!("Kerberos connect (delegation={delegate}): {error}"));
         let result = conn.exec_command("if [ -n \"$KRB5CCNAME\" ] && klist -s; then echo yes; else echo no; fi").await.unwrap();
-        assert_eq!(String::from_utf8_lossy(&result.stdout).trim(), expected, "delegation={delegate}, stderr={}", String::from_utf8_lossy(&result.stderr));
+        if String::from_utf8_lossy(&result.stdout).trim() != expected {
+            let diagnostic = conn.exec_command(r#"printf 'KRB5CCNAME=%s\n' "$KRB5CCNAME"; klist -f 2>&1 || true"#).await.unwrap();
+            panic!("delegation={delegate}, got {}, expected {expected}; {}", String::from_utf8_lossy(&result.stdout), String::from_utf8_lossy(&diagnostic.stdout));
+        }
         conn.disconnect().await.unwrap();
     }
 }
