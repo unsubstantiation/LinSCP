@@ -334,17 +334,13 @@ The native GUI embeds its frontend and engine in one executable; there is no sep
 
 **Area:** Desktop integration · **Status:** partial
 
-A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, the retired GUI harness and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.
+The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI.
 
-**Next:** The source-shape checks in wayland-compatibility run on every platform, but the C++ session detector and the console launcher it describes are exercised by UnitTest.cpp and ScriptTest.py, which have no build target and need a `linscp` binary this repo does not build - so they are not evidence. No case runs against a live compositor either, so what a real Wayland session does with this build is not certified here.
+**Next:** No real Wayland compositor, desktop environment, drag-and-drop, DPI or XWayland interoperability has been tested. Source-shape checks do not establish runtime compatibility.
 
 **Acceptance criteria:**
 
-- [ ] A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.
-- [ ] Give UnitTest.cpp a build target, or port its cases to Rust tests.
-- [ ] Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.
-- [ ] wayland-compatibility cannot run on Windows or Android (it is a Linux display-server guard); record platform-scoped evidence for the Linux-only behavior, or cite additional runnable suites there.
+- [ ] Exercise native GUI and terminal selection on real supported Wayland compositors and X11, including mixed XWayland sessions, scaling and native desktop interactions.
 
 ## locale.translations
 
@@ -388,7 +384,7 @@ CMake wraps the native Tauri build, registers Rust and UI CTest entries, and ins
 
 **Area:** Packaging/platforms · **Status:** partial
 
-debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged.
+debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg.
 
 **Next:** The Linux CI package smoke passed on one branch run after an earlier unexplained GUI-launch failure. Desktop menu integration, upgrades/removal and other Debian versions are not validated; the upstream CLI is deliberately omitted.
 
@@ -568,7 +564,7 @@ Full exports refuse external SSH/TLS material, CA directories and file-based pub
 
 **Area:** Desktop integration · **Status:** partial
 
-RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}). Android viewer launch is restricted in both the frontend and native bridge to allowed schemes and no userinfo; RDP/VNC/SPICE viewer URIs additionally refuse paths, queries and fragments. The debug APK emulator smoke invokes the native bridge directly to test unsafe URI refusals.
+RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets.
 
 **Next:** The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help no longer advertises an unimplemented embedded RDP fallback; gateway responses are hints rather than a bundled viewer.
 

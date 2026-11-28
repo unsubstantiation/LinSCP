@@ -153,8 +153,8 @@ pub fn host_can_spawn_gui_viewer() -> bool {
 /// Resolves the viewer binary for `ticket.viewer`, trying ordered fallbacks per OS:
 ///
 /// * RDP on Linux: `xfreerdp3`, `xfreerdp`, `wlfreerdp`, `sdl-freerdp`; Windows: `mstsc` (`System32\\mstsc.exe`); macOS: `open`
-/// * VNC: `vncviewer` (includes tigervnc), `xtigervncviewer`, `remmina`
-/// * SPICE: `remote-viewer`, `virt-viewer`, `spicy`
+/// * VNC: `vncviewer` or its TigerVNC executable names
+/// * SPICE: `remote-viewer`
 /// * X2Go: no external viewer; the built-in KDrive viewer is not yet available
 /// * X11: `waypipe` (Wayland) or `ssh -X` fallback
 pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
@@ -203,8 +203,6 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
                 "vncviewer",
                 "tigervnc-viewer",
                 "xtigervncviewer",
-                "remmina",
-                "gvncviewer",
             ] {
                 if let Some(p) = find_executable_on_path(cand) {
                     return Some(p);
@@ -216,9 +214,6 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
             for cand in [
                 &ticket.viewer,
                 "remote-viewer",
-                "virt-viewer",
-                "spicy",
-                "spicec",
             ] {
                 if let Some(p) = find_executable_on_path(cand) {
                     return Some(p);
