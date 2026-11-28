@@ -1,0 +1,400 @@
+name: Final review Linux
+
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    shell: bash
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Linux checks & unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Remove temporary branch-only workflows before repository policy checks
+        run: rm -f .github/workflows/final-review-*.yml
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-tests
+
+      - name: Install test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
+            cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            python3-paramiko python3-pyftpdlib python3-openssl krb5-kdc krb5-admin-server krb5-user openssh-server
+
+      - name: Check GUI distribution, workflow triggers, and X2Go
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
+          python3 -m unittest discover -s tools/tests -p test_native_listeners.py
+          python3 -m unittest discover -s tools/tests -p test_native_ipc_policy.py
+          python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
+          python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
+          python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
+          python3 -m unittest discover -s tools/tests -p test_ppk_fixture_format.py
+          
+      - name: Install and test the shared frontend
+        run: |
+          set -euo pipefail
+          npm --prefix ui ci --no-audit --no-fund
+          npm --prefix ui test
+          python3 tools/update_translations.py --check && python3 tools/check_shared_frontend.py
+
+      - name: Check the parity ledger and its repo-state suites
+        run: |
+          set -euo pipefail
+          python3 tools/check_upstream_parity.py
+          python3 -m unittest discover -s tools/tests -p test_build_version.py
+          python3 -m unittest discover -s tools/tests -p test_parity_inventory.py
+          python3 -m unittest discover -s tools/tests -p test_platform_conversion.py
+          python3 -m unittest discover -s tools/tests -p test_wayland_compatibility.py
+          python3 -m unittest discover -s tools/tests -p test_translations.py
+          python3 -m unittest discover -s tools/tests -p test_unified_locales.py
+          python3 -m unittest discover -s tools/tests -p test_shared_frontend.py
+          python3 tools/check_ci_test_execution.py
+          python3 -m unittest discover -s tools/tests -p test_rust_cross_lang_parity.py
+          python3 -m unittest discover -s tools/tests -p test_repo_hygiene.py
+          python3 -m unittest discover -s tools/tests -p test_ci_test_execution.py
+
+      - name: Exercise offline workspace unit tests
+        run: |
+          set -euo pipefail
+          python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
+
+      - name: Exercise isolated Kerberos and SSH delegation
+        run: python3 tools/run_cargo_ci.py bash tools/live_kerberos_ci.sh
+
+      - name: Validate XML action log against the pinned schema
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/linscp-xmlschema
+          /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
+          export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          export LINSCP_XML_SERVICE_OUTPUT="$RUNNER_TEMP/linscp-gui-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log -- --nocapture
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
+
+      - name: Exercise live protocol integration tests
+        env:
+          LSCP_LIVE_SFTP: "1"
+          LSCP_LIVE_WEBDAV: "1"
+          LSCP_LIVE_FTP: "1"
+          LSCP_LIVE_FTPES: "1"
+          LSCP_LIVE_FTPS_IMPLICIT: "1"
+          LSCP_LIVE_S3: "1"
+          RUST_MIN_STACK: "16777216"
+        run: python3 tools/run_cargo_ci.py cargo test -p linscp-service live_ -- --nocapture --test-threads=1
+
+      - name: Validate live WebDAV action log against the pinned schema
+        run: |
+          set -euo pipefail
+          export LSCP_LIVE_WEBDAV=1
+          export RUST_MIN_STACK=16777216
+          export LINSCP_XML_LIVE_OUTPUT="$RUNNER_TEMP/linscp-live-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service live_webdav_gui_upload_download -- --nocapture --test-threads=1
+          /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
+  build:
+    name: Debian package (.deb)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-deb-release
+
+      - name: Install packaging and smoke-test dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get -o Acquire::Retries=3 update -qq
+          sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
+            build-essential cmake dpkg-dev debhelper pkg-config \
+            libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
+            xvfb xdotool xauth openbox x11-utils weston
+
+      - name: Build the frontend bundle
+        run: |
+          set -euo pipefail
+          npm --prefix ui ci --no-audit --no-fund
+          npm --prefix ui run build
+
+      - name: Build the binary package
+        env:
+          DEB_BUILD_OPTIONS: "nocheck"
+        run: python3 tools/run_cargo_ci.py dpkg-buildpackage -b -us -uc -d -j$(nproc)
+
+      - name: Check the package contents
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          debs=(../linscp_*_*.deb)
+          test "${#debs[@]}" -eq 1 || { echo "::error::Expected exactly one .deb, found ${#debs[@]}"; exit 1; }
+          deb="${debs[0]}"
+          echo "Built $deb"
+          dpkg-deb --contents "$deb"
+          contents=$(dpkg-deb --contents "$deb" | awk '{print $NF}' | sed 's|^\./||' | sort)
+          for path in usr/bin/linscp-gui \
+                      usr/share/applications/linscp.desktop \
+                      usr/share/pixmaps/linscp.png \
+                      usr/share/icons/hicolor/scalable/apps/linscp.svg; do
+            echo "$contents" | grep -qx "$path" ||
+              { echo "::error::$path is missing from the package"; exit 1; }
+          done
+          if echo "$contents" | grep -qx usr/bin/linscp; then
+            echo "::error::The retired console executable must not be packaged"
+            exit 1
+          fi
+          cp "$deb" "$GITHUB_WORKSPACE/"
+
+      - name: Install and smoke test the package
+        run: |
+          set -euo pipefail
+          sudo dpkg -i ../linscp_*_*.deb
+          test -x /usr/bin/linscp-gui
+
+      - name: Smoke test the native window
+        run: |
+          set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR"' EXIT
+          if xvfb-run -a bash -euo pipefail -c '
+            export WEBKIT_DISABLE_COMPOSITING_MODE=1
+            export WEBKIT_DISABLE_DMABUF_RENDERER=1
+            export LIBGL_ALWAYS_SOFTWARE=1
+            openbox >/dev/null 2>&1 &
+            wm=$!
+            sleep 1
+            linscp-gui &
+            app=$!
+            trap "kill $app $wm 2>/dev/null || true" EXIT
+            for i in $(seq 1 120); do
+              if ! kill -0 "$app" 2>/dev/null; then
+                wait "$app" || true
+                echo "Application exited before opening a window" >&2
+                exit 1
+              fi
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then
+                python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
+                echo "LinSCP window opened"
+                exit 0
+              fi
+              sleep 1
+            done
+            echo "The LinSCP window did not open within 120 seconds" >&2
+            exit 1
+          ' > native-smoke.log 2>&1; then
+            cat native-smoke.log
+          else
+            cat native-smoke.log
+            exit 1
+          fi
+
+      - name: Smoke test the native window on headless Weston
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d)
+          config=$(mktemp -d)
+          chmod 700 "$runtime"
+          export XDG_RUNTIME_DIR="$runtime" LINSCP_CONFIG_DIR="$config"
+          export WAYLAND_DISPLAY=linscp-wayland-smoke XDG_SESSION_TYPE=wayland
+          export GDK_BACKEND=wayland LIBGL_ALWAYS_SOFTWARE=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
+          unset DISPLAY
+          app= compositor=
+          cleanup() {
+            if [ -n "$app" ]; then kill "$app" 2>/dev/null || true; wait "$app" 2>/dev/null || true; fi
+            if [ -n "$compositor" ]; then kill "$compositor" 2>/dev/null || true; wait "$compositor" 2>/dev/null || true; fi
+            rm -rf "$runtime" "$config"
+          }
+          trap cleanup EXIT
+          weston --backend=headless-backend.so --use-pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 --log=weston-smoke.log &
+          compositor=$!
+          for i in $(seq 1 30); do
+            test -S "$runtime/$WAYLAND_DISPLAY" && break
+            if ! kill -0 "$compositor" 2>/dev/null; then cat weston-smoke.log; exit 1; fi
+            sleep 1
+          done
+          if ! test -S "$runtime/$WAYLAND_DISPLAY"; then cat weston-smoke.log; exit 1; fi
+          WAYLAND_DEBUG=client linscp-gui >wayland-smoke.log 2>&1 &
+          app=$!
+          for i in $(seq 1 120); do
+            if ! kill -0 "$app" 2>/dev/null; then cat weston-smoke.log wayland-smoke.log; exit 1; fi
+            # Force the native Wayland backend and observe a configured, committed
+            # GTK toplevel instead of treating process liveness as a window.
+            if grep -qE 'xdg_toplevel@[0-9]+\.set_title\("LinSCP' wayland-smoke.log &&
+               grep -qE 'xdg_surface@[0-9]+\.ack_configure' wayland-smoke.log &&
+               grep -qE 'wl_surface@[0-9]+\.commit' wayland-smoke.log; then
+              python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
+              echo "Native LinSCP Wayland toplevel configured and committed under headless Weston"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat weston-smoke.log wayland-smoke.log
+          echo "Wayland toplevel did not configure and commit within 120 seconds" >&2
+          exit 1
+
+      - name: Build and smoke test a custom-prefix Make install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          trap 'rm -rf "$stage"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          make -C source/linux install PREFIX="$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >make-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat make-smoke.log
+            exit 1
+          '
+
+      - name: Build and smoke test a custom-prefix CMake install
+        run: |
+          set -euo pipefail
+          stage=$(mktemp -d)
+          build=$(mktemp -d)
+          trap 'rm -rf "$stage" "$build"' EXIT
+          export PREFIX_DIR="$stage/custom prefix"
+          cmake -S . -B "$build" -DCMAKE_INSTALL_PREFIX=/opt/linscp
+          cmake --build "$build"
+          cmake --install "$build" --prefix "$PREFIX_DIR"
+          test -x "$PREFIX_DIR/bin/linscp-gui"
+          test -f "$PREFIX_DIR/share/applications/linscp.desktop"
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1 LIBGL_ALWAYS_SOFTWARE=1
+          xvfb-run -a bash -euo pipefail -c '
+            openbox >/dev/null 2>&1 & wm=$!
+            trap "pkill -f \"^$PREFIX_DIR/bin/linscp-gui\" 2>/dev/null || true; kill $wm 2>/dev/null || true" EXIT
+            gio launch "$PREFIX_DIR/share/applications/linscp.desktop" "sftp://example.invalid/" >cmake-smoke.log 2>&1
+            for i in $(seq 1 120); do
+              if xdotool search --onlyvisible --name "^LinSCP" >/dev/null 2>&1; then exit 0; fi
+              sleep 1
+            done
+            cat cmake-smoke.log
+            exit 1
+          '
+
+      - name: Smoke test the file-manager actions
+        run: |
+          set -euo pipefail
+          export LINSCP_CONFIG_DIR=$(mktemp -d)
+          export XDG_DATA_HOME=$(mktemp -d)
+          trap 'rm -rf "$LINSCP_CONFIG_DIR" "$XDG_DATA_HOME"' EXIT
+
+          linscp-gui --install-shell-integration
+          for path in "kio/servicemenus/linscp-upload.desktop" \
+                      "nautilus/scripts/Upload with LinSCP" \
+                      "nemo/actions/linscp-upload.nemo_action"; do
+            test -f "$XDG_DATA_HOME/$path" || { echo "::error::$path was not written"; exit 1; }
+          done
+          grep -q -- '--shell-upload' "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::the Dolphin action does not call --shell-upload"; exit 1; }
+
+          selection=$(mktemp)
+          timeout 60 linscp-gui --shell-upload "$selection"
+          manifests=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          test -n "$manifests" || { echo "::error::--shell-upload recorded no manifest"; exit 1; }
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['items'], d" "$manifests"
+
+          first="$PWD/first file&odd.txt"
+          second="$PWD/second*.glob"
+          : > "$first"
+          : > "$second"
+          rm -rf "$LINSCP_CONFIG_DIR"/shell-manifests
+          selected=$(printf '%s\n%s' "$first" "$second")
+          NAUTILUS_SCRIPT_SELECTED_FILE_PATHS="$selected" \
+            timeout 60 "$XDG_DATA_HOME/nautilus/scripts/Upload with LinSCP"
+          staged=$(find "$LINSCP_CONFIG_DIR" -path '*shell-manifests/*.json' -print -quit)
+          python3 -c "import json,sys; d=json.load(open(sys.argv[1])); paths=sorted(i['path'] for i in d['items']); assert len(paths)==2, paths; assert paths[0].endswith('first file&odd.txt'), paths; assert paths[1].endswith('second*.glob'), paths" "$staged"
+          rm -f "$first" "$second" "$selection"
+
+          linscp-gui --uninstall-shell-integration
+          test ! -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop" ||
+            { echo "::error::uninstall left the Dolphin action behind"; exit 1; }
+
+          usage=$(linscp-gui --help)
+          case "$usage" in
+            *--shell-upload*) ;;
+            *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
+          esac
+
+      - name: Exercise Debian upgrade and removal
+        run: |
+          set -euo pipefail
+          deb=$(find .. -maxdepth 1 -name 'linscp_*_*.deb' -print -quit)
+          test -n "$deb"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          dpkg-deb -R "$deb" "$work/old"
+          # Same payload with an older synthetic version tests dpkg lifecycle,
+          # not migration from a historically released package.
+          sed -i 's/^Version:.*/Version: 0.0.0~chunk8/' "$work/old/DEBIAN/control"
+          dpkg-deb -b "$work/old" "$work/old.deb"
+          sudo dpkg -i --force-downgrade "$work/old.deb"
+          test "$(dpkg-query -W -f='${Version}' linscp)" = '0.0.0~chunk8'
+          export LINSCP_CONFIG_DIR="$work/config" XDG_DATA_HOME="$work/data"
+          mkdir -p "$LINSCP_CONFIG_DIR"
+          echo preserve-user-data > "$LINSCP_CONFIG_DIR/sentinel"
+          linscp-gui --install-shell-integration
+          sudo dpkg -i "$deb"
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
+          test -x /usr/bin/linscp-gui
+          sudo dpkg --remove linscp
+          test ! -e /usr/bin/linscp-gui
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
+          # Integration is per-user and is not a dpkg-managed file.
+          test -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop"
+          sudo dpkg --purge linscp
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
+
+      - name: Upload the Debian package
+        uses: actions/upload-artifact@v7
+        with:
+          name: linscp-debian
+          path: linscp_*_*.deb
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14

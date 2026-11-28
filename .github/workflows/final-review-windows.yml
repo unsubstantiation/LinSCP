@@ -1,0 +1,131 @@
+name: Final review Windows
+
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Windows (MSVC)
+    runs-on: windows-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+          cache: "npm"
+          cache-dependency-path: "ui/package-lock.json"
+
+      - name: Install the UI dependencies
+        working-directory: ui
+        shell: bash
+        run: npm ci --no-audit --no-fund
+
+      - name: Build the TypeScript UI
+        working-directory: ui
+        shell: bash
+        run: npm run build
+
+      - name: Test the TypeScript UI
+        working-directory: ui
+        shell: bash
+        run: python ../tools/run_cargo_ci.py npm test
+
+      - name: Run the Rust workspace unit tests
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo test --workspace
+
+      - name: Build the portable Tauri application
+        shell: bash
+        run: python tools/run_cargo_ci.py cargo build --release -p linscp-tauri --features native-shell
+
+      - name: Smoke test the native window
+        shell: pwsh
+        run: |
+          $app = Start-Process -FilePath "$PWD/target/release/linscp-gui.exe" -PassThru
+          try {
+            $ready = $false
+            for ($i = 0; $i -lt 30; $i++) {
+              Start-Sleep -Seconds 1
+              $app.Refresh()
+              if ($app.HasExited) { throw "Application exited before opening a window: $($app.ExitCode)" }
+              if ($app.MainWindowHandle -ne 0 -and $app.MainWindowTitle -like 'LinSCP*') { $ready = $true; break }
+            }
+            if (-not $ready) { throw 'The LinSCP window did not open within 30 seconds' }
+          } finally {
+            if (-not $app.HasExited) { Stop-Process -Id $app.Id -Force }
+          }
+
+      - name: Smoke test the Explorer action
+        shell: pwsh
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP "linscp-a3"
+          Remove-Item -Recurse -Force $root -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Force -Path (Join-Path $root "appdata"), (Join-Path $root "config") | Out-Null
+          $env:APPDATA = Join-Path $root "appdata"
+          $env:LINSCP_CONFIG_DIR = Join-Path $root "config"
+          $exe = "$PWD/target/release/linscp-gui.exe"
+          $sendto = Join-Path $env:APPDATA "Microsoft\Windows\SendTo\Upload with LinSCP.cmd"
+
+          $install = Start-Process -FilePath $exe -ArgumentList "--install-shell-integration" -Wait -PassThru
+          if ($install.ExitCode -ne 0) { throw "--install-shell-integration exited $($install.ExitCode)" }
+          if (-not (Test-Path $sendto)) { throw "the Send To shortcut was not written" }
+          if (-not (Select-String -Path $sendto -Pattern '--shell-upload' -Quiet)) {
+            throw "the Send To shortcut does not call --shell-upload"
+          }
+
+          $selection = Join-Path $root "report.pdf"
+          Set-Content -Path $selection -Value "payload"
+          $process = Start-Process -FilePath $sendto -ArgumentList "`"$selection`"" -PassThru
+          if (-not $process.WaitForExit(60000)) { Stop-Process -Id $process.Id -Force; throw "the Send To action did not return" }
+          if ($process.ExitCode -ne 0) { throw "the Send To action exited $($process.ExitCode)" }
+
+          $manifest = Get-ChildItem -Path $env:LINSCP_CONFIG_DIR -Recurse -Filter "*.json" |
+            Where-Object { $_.FullName -like "*shell-manifests*" } | Select-Object -First 1
+          if (-not $manifest) { throw "--shell-upload recorded no manifest" }
+          $staged = Get-Content -Raw $manifest.FullName | ConvertFrom-Json
+          if (-not $staged.items) { throw "the manifest has no items" }
+          if ($staged.items[0].path -ne $selection) { throw "the manifest names $($staged.items[0].path)" }
+
+          $uninstall = Start-Process -FilePath $exe -ArgumentList "--uninstall-shell-integration" -Wait -PassThru
+          if ($uninstall.ExitCode -ne 0) { throw "--uninstall-shell-integration exited $($uninstall.ExitCode)" }
+          if (Test-Path $sendto) { throw "uninstall left the Send To shortcut behind" }
+
+      - name: Smoke test Windows URL registration
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path 'target/release/linscp-gui.exe').Path
+          try {
+            $p = Start-Process -FilePath $exe -ArgumentList '--install-url-handlers' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "URL registration failed: $($p.ExitCode)" }
+            & reg.exe query 'HKCU\Software\Classes\LinSCP.Url\shell\open\command'
+            if ($LASTEXITCODE -ne 0) { throw 'URL command missing' }
+            & reg.exe query 'HKCU\Software\LinSCP\UrlHandlers\Capabilities\URLAssociations' /v sftp
+            if ($LASTEXITCODE -ne 0) { throw 'SFTP association missing' }
+          } finally {
+            $p = Start-Process -FilePath $exe -ArgumentList '--uninstall-url-handlers' -Wait -PassThru
+            if ($p.ExitCode -ne 0) { throw "URL unregister failed: $($p.ExitCode)" }
+          }
+          & reg.exe query 'HKCU\Software\Classes\LinSCP.Url' 2>$null
+          if ($LASTEXITCODE -eq 0) { throw 'URL registration was not removed' }
+          exit 0
+
+      - name: Upload the portable application
+        uses: actions/upload-artifact@v7
+        with:
+          name: linscp-windows
+          path: target/release/linscp-gui.exe
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
