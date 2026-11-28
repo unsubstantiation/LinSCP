@@ -12200,9 +12200,11 @@ fn import_offlineotp_entries(
         if staged_site_names.is_empty() {
             return Ok((0, skipped, ignored));
         }
+        // An atomic write can report an error after publishing (for example,
+        // if its durability barrier fails). Do not delete keys at that point.
+        sessions_published = true;
         store.save_to_dir(config_root, secret_vault)
             .map_err(|error| format!("Cannot save imported sessions: {error}"))?;
-        sessions_published = true;
         if hostkeys_changed {
             hostkey_cache.save_protected(&config_root.join("sshhostkeys"), secret_vault)
                 .map_err(|error| format!("Cannot save imported SSH host keys: {error}"))?;

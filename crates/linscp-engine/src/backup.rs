@@ -77,6 +77,7 @@ fn validate_portable_session_material(ini: &str) -> Result<(), String> {
             ("tunnel public key", site.extra_fields.get("linscp_tunnel_public_key_file").map(String::as_str), "vaultpub://"),
             ("CA certificate", site.extra_fields.get("ca_certificate_file").map(String::as_str), "vaulttls://"),
             ("client certificate", site.extra_fields.get("tls_certificate_file").map(String::as_str), "vaulttls://"),
+            ("client certificate", site.extra_fields.get("certificate").map(String::as_str), "vaulttls://"),
             ("client key", site.extra_fields.get("tls_certificate_key_file").map(String::as_str), "vaulttls://"),
         ] {
             if value.is_some_and(|v| !v.trim().is_empty() && !v.starts_with(prefix)) {
@@ -205,7 +206,7 @@ fn session_tls_references(ini: &str) -> Result<BTreeSet<String>, String> {
     let store = SessionStore::parse_ini(ini, None)?;
     let mut ids = BTreeSet::new();
     for site in store.sites() {
-        for field in ["ca_certificate_file", "tls_certificate_file", "tls_certificate_key_file"] {
+        for field in ["ca_certificate_file", "tls_certificate_file", "certificate", "tls_certificate_key_file"] {
             if let Some(id) = site.extra_fields.get(field).and_then(|v| v.strip_prefix("vaulttls://")) {
                 if !valid_key_id(id) { return Err("Invalid vault TLS certificate reference in saved sessions.".into()); }
                 ids.insert(id.to_string());

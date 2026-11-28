@@ -16,7 +16,7 @@ jobs:
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libssl-dev pkg-config libssh2-1-dev
       - name: Engine backup tests
-        run: python3 tools/run_cargo_ci.py cargo test -p linscp-engine backup:: -- --nocapture
+        run: 'python3 tools/run_cargo_ci.py cargo test -p linscp-engine backup:: -- --nocapture'
       - name: Service backup tests
         run: python3 tools/run_cargo_ci.py cargo test -p linscp-service key_session -- --nocapture
       - name: Service offlineotp tests
