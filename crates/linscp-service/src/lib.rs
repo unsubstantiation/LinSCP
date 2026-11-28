@@ -12249,6 +12249,8 @@ fn plan_offlineotp_import(
 
 #[derive(Default)]
 struct OfflineOtpMaterialStage {
+    existing_ssh: Vec<StagedSessionKey>,
+    existing_public: Vec<(String, String)>,
     ssh: Vec<StagedSessionKey>,
     public: Vec<(String, String)>,
     tls: Vec<(String, zeroize::Zeroizing<Vec<u8>>)>,
@@ -12261,21 +12263,50 @@ fn random_vault_material_id() -> String {
 }
 
 impl OfflineOtpMaterialStage {
-    fn stage_key(&mut self, key: &SshKeyRecord) -> Result<(Option<String>, Option<String>), String> {
+    fn load_existing(root: &Path, vault: &dyn SecretVault) -> Result<Self, String> {
+        let mut stage = Self::default();
+        let keys = vault.list_vault_ssh_keys(root).map_err(|e| e.to_string())?.ok_or("Transactional vault does not enumerate SSH keys")?;
+        let public_ids = vault.list_vault_public_keys(root).map_err(|e| e.to_string())?.ok_or("Transactional vault does not enumerate public keys")?;
+        if keys.len() > 2000 || public_ids.len() > 4000 { return Err("Too many existing vault keys".into()); }
+        for key in keys {
+            if !valid_vault_key_id(&key.id) { return Err("Invalid existing SSH key ID".into()); }
+            let private = match vault.read_vault_material(root, linscp_platform::VaultMaterialKind::SshPrivate, &key.id).map_err(|e| e.to_string())? {
+                linscp_platform::VaultMaterialRead::Plaintext(bytes) if !bytes.is_empty() && bytes.len() <= 1024 * 1024 => bytes,
+                _ => return Err("Cannot read existing vault SSH key".into()),
+            };
+            let public = read_export_public_key(root, vault, &key.id, 32 * 1024, false)?;
+            stage.existing_ssh.push(StagedSessionKey { id: key.id, private, label: key.label, public });
+        }
+        for id in public_ids {
+            if !valid_vault_key_id(&id) { return Err("Invalid existing public key ID".into()); }
+            let public = read_export_public_key(root, vault, &id, 32 * 1024, true)?;
+            if public.is_empty() { return Err("Existing public key is empty".into()); }
+            stage.existing_public.push((id, public));
+        }
+        Ok(stage)
+    }
+
+    fn stage_key(&mut self, key: &SshKeyRecord, strict_label: bool) -> Result<(Option<String>, Option<String>), String> {
         if key.private_key.len() > 32 * 1024 || key.public_key.len() > 32 * 1024 {
             return Err("Imported SSH key exceeds the 32 KiB per-key limit.".into());
         }
         let public = if key.public_key.is_empty() { derive_public_ssh_key_optional(&key.private_key).unwrap_or_default() } else { key.public_key.clone() };
         if key.private_key.is_empty() {
             if public.is_empty() { return Err("Imported SSH key is empty.".into()); }
-            if let Some((id, _)) = self.public.iter().find(|(_, value)| *value == public) {
+            if let Some((id, _)) = self.existing_public.iter().chain(&self.public).find(|(_, value)| *value == public) {
                 return Ok((None, Some(format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"))));
+            }
+            if let Some(existing) = self.existing_ssh.iter().chain(&self.ssh).find(|record| record.public == public) {
+                return Ok((None, Some(format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{}", existing.id))));
             }
             let id = random_vault_material_id();
             self.public.push((id.clone(), public));
             return Ok((None, Some(format!("{LOCAL_VAULT_PUBLIC_KEY_PREFIX}{id}"))));
         }
-        if let Some(existing) = self.ssh.iter().find(|record| constant_time_bytes_eq(&record.private, key.private_key.as_bytes())) {
+        if let Some(existing) = self.existing_ssh.iter().chain(&self.ssh).find(|record| constant_time_bytes_eq(&record.private, key.private_key.as_bytes())) {
+            if strict_label && existing.label != sanitize_vault_key_label(&key.label) {
+                return Err(format!("Cannot restore vault key '{}' because the same private key already has different metadata.", key.label));
+            }
             if !public.is_empty() && existing.public != public {
                 return Err("Imported records contain conflicting public keys for the same private key.".into());
             }
@@ -12328,11 +12359,14 @@ fn import_offlineotp_entries(
     let mut sessions_published = false;
     let result = (|| {
         let OfflineOtpImportPlan { sites, vault_keys, ignored } = plan_offlineotp_import(imported, selection)?;
+        if transactional && (!vault_keys.is_empty() || sites.iter().any(|site| site.ssh_key.is_some() || site.tunnel_key.is_some())) {
+            materials = OfflineOtpMaterialStage::load_existing(config_root, secret_vault)?;
+        }
         // Stage standalone keys first, so referenced keys deduplicate against
         // the restored user label rather than inventing a session-derived one.
         for key in &vault_keys {
             if transactional {
-                materials.stage_key(key)?;
+                materials.stage_key(key, true)?;
                 continue;
             }
             let dir = config_root.join("keys");
@@ -12392,14 +12426,14 @@ fn import_offlineotp_entries(
             // Serialized paths are local to the exporting computer and are never trusted on import.
             clear_imported_key_paths(&mut candidate.site);
             if let Some(key) = candidate.ssh_key.as_ref() {
-                let (private_path, public_path) = if transactional { materials.stage_key(key)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
+                let (private_path, public_path) = if transactional { materials.stage_key(key, false)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
                 candidate.site.private_key = private_path;
                 if let Some(public) = public_path {
                     candidate.site.extra_fields.insert("linscp_public_key_file".into(), public);
                 }
             }
             if let Some(key) = candidate.tunnel_key.as_ref() {
-                let (private_path, public_path) = if transactional { materials.stage_key(key)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
+                let (private_path, public_path) = if transactional { materials.stage_key(key, false)? } else { stage_offlineotp_key(config_root, key, secret_vault, &mut created_files)? };
                 candidate.site.tunnel.keyfile = private_path;
                 if let Some(public) = public_path {
                     candidate.site.extra_fields.insert("linscp_tunnel_public_key_file".into(), public);
@@ -13657,7 +13691,15 @@ mod tests {
         let vault = ContainerSessionVault::new(dir.path(), file.unlock("test password").ok().unwrap()).unwrap();
         let key = SshKeyRecord { label: format!("{OFFLINEOTP_VAULT_KEY_PREFIX}11111111111111111111111111111111:My key"), public_key: "ssh-ed25519 public".into(), private_key: "private key".into(), host: String::new(), port: 0, username: String::new(), password: String::new() };
         let imported = offlineotp_vault::ImportedCredentialVault { entries: vec![CredentialEntry::SshKey(key)], ignored_entries: 0 };
-        assert_eq!(import_offlineotp_entries(dir.path(), SessionStore::new(), imported, &vault, None, false).unwrap().0, 0);
+        assert_eq!(import_offlineotp_entries(dir.path(), SessionStore::new(), imported.clone(), &vault, None, false).unwrap().0, 0);
+        let path = dir.path().join("vault.dat");
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(import_offlineotp_entries(dir.path(), SessionStore::new(), imported.clone(), &vault, None, false).unwrap().0, 0);
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let mut conflicting = imported;
+        if let CredentialEntry::SshKey(key) = &mut conflicting.entries[0] { key.label = format!("{OFFLINEOTP_VAULT_KEY_PREFIX}11111111111111111111111111111111:Different label"); }
+        assert!(import_offlineotp_entries(dir.path(), SessionStore::new(), conflicting, &vault, None, false).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), before);
         let exported = offlineotp_entries_from_sessions(&SessionStore::new(), dir.path(), &vault, None, true).unwrap();
         assert_eq!(exported.len(), 1);
         match &exported[0] {
