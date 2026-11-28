@@ -555,6 +555,7 @@ pub struct QueueManager {
     event_tx: broadcast::Sender<Value>,
     local_fs: Arc<dyn LocalFs>,
     xml_log_path: Arc<Mutex<Option<PathBuf>>>,
+    xml_log_lock: Arc<Mutex<()>>,
 }
 
 impl QueueManager {
@@ -571,6 +572,7 @@ impl QueueManager {
             event_tx,
             local_fs,
             xml_log_path: Arc::new(Mutex::new(None)),
+            xml_log_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -580,15 +582,17 @@ impl QueueManager {
         }
     }
 
-    fn open_task_logger(&self) -> SessionLogger {
+    pub(crate) fn xml_log_lock(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.xml_log_lock)
+    }
+
+    pub(crate) fn open_task_logger(&self) -> SessionLogger {
         if let Ok(guard) = self.xml_log_path.lock() {
-            if let Some(ref p) = *guard {
-                if let Ok(logger) = SessionLogger::open_append_xml(p, "gui") {
-                    return logger;
-                }
+            if let Some(ref path) = *guard {
+                return SessionLogger::open_shared_xml(path.clone(), self.xml_log_lock());
             }
         }
-        SessionLogger::open(None, 0, false, None, None, false, "").unwrap()
+        SessionLogger::default()
     }
 
     fn ensure_worker_running(&self) {

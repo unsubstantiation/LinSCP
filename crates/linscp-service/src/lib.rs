@@ -239,6 +239,7 @@ impl CommanderService {
             UserPreferences::default()
         };
         let queue = queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs.clone());
+        let xml_log_lock = queue.xml_log_lock();
         let initial_xml = Self::resolve_xml_log_path(&config_root, &preferences).ok().flatten();
         queue.set_xml_log_path(initial_xml);
         Self {
@@ -276,7 +277,7 @@ impl CommanderService {
             recovery_gate: Arc::new(std::sync::atomic::AtomicBool::new(recovery_needed)),
             config_activity: Arc::new(tokio::sync::RwLock::new(())),
             queue,
-            xml_log_lock: Arc::new(Mutex::new(())),
+            xml_log_lock,
             share_export_status: Arc::new(Mutex::new(share_export::ShareExportStatus::default())),
             share_export_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             desktop_spawn_allowed: false,
@@ -7900,22 +7901,25 @@ impl CommanderService {
             default_path
         };
         let _guard = self.xml_log_lock.lock().expect("xml log lock");
-        match std::fs::read(&target) {
-            Ok(bytes) => {
-                let max = 512 * 1024usize;
-                let truncated = bytes.len() > max;
-                let slice = if truncated { &bytes[bytes.len() - max..] } else { &bytes[..] };
-                ApiReply {
-                    status: 200,
-                    payload: json!({
-                        "success": true,
-                        "enabled": prefs.xml_log_enabled,
-                        "path": target.to_string_lossy(),
-                        "exists": true,
-                        "size": bytes.len(),
-                        "truncated": truncated,
-                        "content": String::from_utf8_lossy(slice),
-                    }),
+        use std::io::{Read, Seek, SeekFrom};
+        match std::fs::File::open(&target) {
+            Ok(mut file) => {
+                let result = (|| -> std::io::Result<(u64, Vec<u8>)> {
+                    let size = file.metadata()?.len();
+                    let max = 512 * 1024u64;
+                    file.seek(SeekFrom::Start(size.saturating_sub(max)))?;
+                    let mut bytes = Vec::new();
+                    file.take(max).read_to_end(&mut bytes)?;
+                    Ok((size, bytes))
+                })();
+                match result {
+                    Ok((size, bytes)) => ApiReply { status: 200, payload: json!({
+                        "success": true, "enabled": prefs.xml_log_enabled,
+                        "path": target.to_string_lossy(), "exists": true,
+                        "size": size, "truncated": size > 512 * 1024,
+                        "content": String::from_utf8_lossy(&bytes),
+                    }) },
+                    Err(e) => api_error(500, format!("Cannot read XML log '{}': {e}", target.display())),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ApiReply {
@@ -21530,6 +21534,50 @@ mod tests {
             reset_mosh.payload["install_script"],
             reset_mosh.payload["default_install_script"]
         );
+    }
+
+    #[test]
+    fn queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let mut prefs = svc.dispatch(request("GET", "/api/preferences", json!({}))).payload["preferences"].clone();
+        prefs["xml_log_enabled"] = json!(true);
+        prefs["xml_log_path"] = json!("actions.xml");
+        assert_eq!(svc.dispatch(request("POST", "/api/preferences", json!({"action":"save", "preferences":prefs}))).status, 200);
+        // Keep a queue logger alive across a direct operation, as happens while
+        // a network transfer is pending. Each record must survive both writes.
+        let mut task_logger = svc.queue.open_task_logger();
+        svc.record_gui_xml_action("gui", |l| l.record_mkdir("/direct", Ok(())));
+        task_logger.record_transfer(true, "/local", "/remote", Some(5), Ok(()));
+        svc.record_gui_xml_action("gui", |l| l.record_rm("/old", false, Ok(())));
+        drop(task_logger);
+        let reply = svc.dispatch(request("GET", "/api/logs/xml", json!({})));
+        let xml = reply.payload["content"].as_str().unwrap();
+        assert_eq!(xml.matches("<mkdir>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<upload>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<rm>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("</session>").count(), 1, "{xml}");
+        assert!(xml.ends_with("</session>\n"), "{xml}");
+        // An unfinished existing log is never erased by a subsequent operation.
+        let path = tmp.path().join("actions.xml");
+        std::fs::write(&path, b"<session>unfinished").unwrap();
+        svc.record_gui_xml_action("gui", |l| l.record_mkdir("/lost", Ok(())));
+        assert_eq!(std::fs::read(path).unwrap(), b"<session>unfinished");
+    }
+
+    #[test]
+    fn xml_log_preview_reads_only_bounded_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let path = tmp.path().join("session-actions.xml");
+        let bytes = vec![b'x'; 600_000];
+        std::fs::write(path, &bytes).unwrap();
+        let reply = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs/xml".into(), body: json!({}) });
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.payload["size"], 600_000);
+        assert_eq!(reply.payload["truncated"], true);
+        assert_eq!(reply.payload["content"].as_str().unwrap().len(), 512 * 1024);
     }
 
     #[tokio::test]

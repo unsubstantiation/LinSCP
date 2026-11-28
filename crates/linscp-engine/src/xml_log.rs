@@ -5,6 +5,7 @@
 use std::fs::{File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use linscp_platform::terminal::utc_ymdhms;
 use linscp_types::FileEntry;
@@ -125,7 +126,7 @@ pub fn xml_escape_attr(text: &str) -> String {
             '\n' => out.push_str("&#10;"),
             '\r' => out.push_str("&#13;"),
             '\t' => out.push_str("&#9;"),
-            c if (c as u32) < 0x20 => {}
+            c if (c as u32) < 0x20 || c == '\u{fffe}' || c == '\u{ffff}' => {}
             c => out.push(c),
         }
     }
@@ -141,7 +142,7 @@ pub fn xml_escape_text(text: &str) -> String {
             '<' => out.push_str("&lt;"),
             '>' => out.push_str("&gt;"),
             '\n' | '\r' | '\t' => out.push(ch),
-            c if (c as u32) < 0x20 => {}
+            c if (c as u32) < 0x20 || c == '\u{fffe}' || c == '\u{ffff}' => {}
             c => out.push(c),
         }
     }
@@ -165,6 +166,9 @@ pub struct SessionLogger {
     rotation: Option<LogRotationPolicy>,
 
     xml_file: Option<File>,
+    // Shared GUI writers append one complete operation under the same lock.
+    // Never hold a blocking mutex over an asynchronous transfer.
+    xml_shared: Option<(PathBuf, Arc<Mutex<()>>)>,
     xml_session_name: String,
     xml_header_written: bool,
     pending_group_line: Option<String>,
@@ -181,6 +185,7 @@ impl Default for SessionLogger {
             text_log_sensitive: false,
             rotation: None,
             xml_file: None,
+            xml_shared: None,
             xml_session_name: "nosession".to_string(),
             xml_header_written: false,
             pending_group_line: None,
@@ -241,6 +246,7 @@ impl SessionLogger {
             text_log_sensitive,
             rotation,
             xml_file,
+            xml_shared: None,
             xml_session_name,
             xml_header_written: false,
             pending_group_line: None,
@@ -268,34 +274,24 @@ impl SessionLogger {
             .open(xp)
             .map_err(|e| format!("Cannot open XML log file '{}': {e}", xp.display()))?;
         let _ = linscp_platform::terminal::set_local_permissions(xp, 0o600);
-        let len = f.metadata().map(|m| m.len()).unwrap_or(0);
+        let len = f.metadata().map_err(|e| format!("Cannot inspect XML log: {e}"))?.len();
         let mut header_already_present = false;
         if len > 0 {
             let tail_start = len.saturating_sub(64);
-            if f.seek(SeekFrom::Start(tail_start)).is_ok() {
-                let mut tail = Vec::new();
-                if f.read_to_end(&mut tail).is_ok() {
-                    let mut trimmed = tail.as_slice();
-                    while let Some((&last, rest)) = trimmed.split_last() {
-                        if matches!(last, b' ' | b'\t' | b'\r' | b'\n') {
-                            trimmed = rest;
-                        } else {
-                            break;
-                        }
-                    }
-                    if let Some(prefix) = trimmed.strip_suffix(b"</session>") {
-                        let new_len = tail_start + prefix.len() as u64;
-                        if f.set_len(new_len).is_ok() && f.seek(SeekFrom::End(0)).is_ok() {
-                            let _ = f.write_all(b"\n");
-                            header_already_present = true;
-                        }
-                    }
-                }
+            f.seek(SeekFrom::Start(tail_start)).map_err(|e| format!("Cannot seek XML log: {e}"))?;
+            let mut tail = Vec::new();
+            f.read_to_end(&mut tail).map_err(|e| format!("Cannot read XML log: {e}"))?;
+            let mut trimmed = tail.as_slice();
+            while let Some((&last, rest)) = trimmed.split_last() {
+                if matches!(last, b' ' | b'\t' | b'\r' | b'\n') { trimmed = rest; } else { break; }
             }
-            if !header_already_present {
-                let _ = f.set_len(0);
-                let _ = f.seek(SeekFrom::Start(0));
-            }
+            let prefix = trimmed.strip_suffix(b"</session>")
+                .ok_or_else(|| "Existing XML log is incomplete or has an unexpected ending; refusing to overwrite it.".to_string())?;
+            let new_len = tail_start + prefix.len() as u64;
+            f.set_len(new_len).map_err(|e| format!("Cannot append XML log: {e}"))?;
+            f.seek(SeekFrom::End(0)).map_err(|e| format!("Cannot seek XML log: {e}"))?;
+            f.write_all(b"\n").map_err(|e| format!("Cannot append XML log: {e}"))?;
+            header_already_present = true;
         }
         let xml_session_name =
             if initial_session_name.is_empty() || initial_session_name == "session" {
@@ -309,6 +305,7 @@ impl SessionLogger {
             text_log_sensitive: false,
             rotation: None,
             xml_file: Some(f),
+            xml_shared: None,
             xml_session_name,
             xml_header_written: header_already_present,
             pending_group_line: None,
@@ -316,6 +313,19 @@ impl SessionLogger {
             group_open: false,
             xml_closed: false,
         })
+    }
+
+    /// GUI queue logger: append each complete record while holding the
+    /// service lock, never holding a blocking mutex across await points.
+    pub fn open_shared_xml(path: PathBuf, lock: Arc<Mutex<()>>) -> Self {
+        let mut logger = Self::default();
+        logger.xml_groups = false;
+        logger.xml_shared = Some((path, lock));
+        logger
+    }
+
+    fn xml_enabled(&self) -> bool {
+        self.xml_file.is_some() || self.xml_shared.is_some()
     }
 
     pub fn set_session_name(&mut self, name: &str) {
@@ -428,6 +438,14 @@ impl SessionLogger {
     }
 
     fn write_xml(&mut self, chunk: &str) {
+        if let Some((path, lock)) = &self.xml_shared {
+            if let Ok(_guard) = lock.lock() {
+                if let Ok(mut logger) = Self::open_append_xml(path, "gui") {
+                    logger.write_xml(chunk);
+                }
+            }
+            return;
+        }
         if self.xml_file.is_none() {
             return;
         }
@@ -522,7 +540,7 @@ impl SessionLogger {
             0,
             &format!("{tag} '{filename}' -> '{destination}' ({})", if result.is_ok() { "ok" } else { "failed" }),
         );
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -538,7 +556,7 @@ impl SessionLogger {
     }
 
     pub fn record_rm(&mut self, filename: &str, recursive: bool, result: Result<(), &str>) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -551,7 +569,7 @@ impl SessionLogger {
     }
 
     pub fn record_mkdir(&mut self, filename: &str, result: Result<(), &str>) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -569,7 +587,7 @@ impl SessionLogger {
         destination: &str,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let tag = if is_copy { "cp" } else { "mv" };
@@ -589,7 +607,7 @@ impl SessionLogger {
         recursive: bool,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -603,7 +621,7 @@ impl SessionLogger {
     }
 
     pub fn record_touch(&mut self, filename: &str, mtime: i64, result: Result<(), &str>) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -624,7 +642,7 @@ impl SessionLogger {
         exit_code: i32,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -649,7 +667,7 @@ impl SessionLogger {
         entries: Option<&[FileEntry]>,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -674,7 +692,7 @@ impl SessionLogger {
         entry: Option<&FileEntry>,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -696,7 +714,7 @@ impl SessionLogger {
         hex_digest: Option<&str>,
         result: Result<(), &str>,
     ) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -712,7 +730,7 @@ impl SessionLogger {
     }
 
     pub fn record_cwd(&mut self, cwd: &str, result: Result<(), &str>) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -724,7 +742,7 @@ impl SessionLogger {
     }
 
     pub fn record_difference(&mut self, diff: &XmlDiffRecord, result: Result<(), &str>) {
-        if self.xml_file.is_none() {
+        if !self.xml_enabled() {
             return;
         }
         let indent = self.op_indent();
@@ -893,6 +911,32 @@ mod tests {
         assert!(xml.contains("alice:***@example.com"));
         assert!(xml.contains("line1&#10;line2"));
         assert!(xml.ends_with("</session>\n"));
+    }
+
+    #[test]
+    fn xml_log_rejects_incomplete_existing_file_without_truncating_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("incomplete.xml");
+        let original = b"<session><upload>partial";
+        std::fs::write(&path, original).unwrap();
+        assert!(SessionLogger::open_append_xml(&path, "gui").is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn xml_log_filters_invalid_xml_characters_in_names_and_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unicode.xml");
+        {
+            let mut logger = SessionLogger::open_append_xml(&path, "gui").unwrap();
+            logger.record_mkdir("/a\u{fffe}b\u{ffff}c\u{1}d 🚀", Err("bad\u{fffe} error"));
+        }
+        let xml = std::fs::read_to_string(path).unwrap();
+        let parsed = roxmltree::Document::parse(&xml).unwrap();
+        let filename = parsed.descendants().find(|n| n.has_tag_name((SESSION_XML_NAMESPACE, "filename"))).unwrap();
+        assert_eq!(filename.attribute("value"), Some("/abcd 🚀"));
+        let message = parsed.descendants().find(|n| n.has_tag_name((SESSION_XML_NAMESPACE, "message"))).unwrap();
+        assert_eq!(message.text(), Some("bad error"));
     }
 
     #[test]

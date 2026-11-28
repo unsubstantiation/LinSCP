@@ -1,0 +1,16 @@
+name: Chunk 9 XML checks
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test -p linscp-engine xml_log
+      - run: cargo test -p linscp-service xml
