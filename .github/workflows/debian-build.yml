@@ -141,7 +141,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
             build-essential cmake dpkg-dev debhelper pkg-config \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            xvfb xdotool xauth openbox x11-utils
+            xvfb xdotool xauth openbox x11-utils weston
 
       - name: Build the frontend bundle
         run: |
@@ -219,6 +219,51 @@ jobs:
             cat native-smoke.log
             exit 1
           fi
+
+      - name: Smoke test the native window on headless Weston
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d)
+          config=$(mktemp -d)
+          chmod 700 "$runtime"
+          export XDG_RUNTIME_DIR="$runtime" LINSCP_CONFIG_DIR="$config"
+          export WAYLAND_DISPLAY=linscp-wayland-smoke XDG_SESSION_TYPE=wayland
+          export GDK_BACKEND=wayland LIBGL_ALWAYS_SOFTWARE=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
+          unset DISPLAY
+          app= compositor=
+          cleanup() {
+            if [ -n "$app" ]; then kill "$app" 2>/dev/null || true; wait "$app" 2>/dev/null || true; fi
+            if [ -n "$compositor" ]; then kill "$compositor" 2>/dev/null || true; wait "$compositor" 2>/dev/null || true; fi
+            rm -rf "$runtime" "$config"
+          }
+          trap cleanup EXIT
+          weston --backend=headless-backend.so --use-pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 --log=weston-smoke.log &
+          compositor=$!
+          for i in $(seq 1 30); do
+            test -S "$runtime/$WAYLAND_DISPLAY" && break
+            if ! kill -0 "$compositor" 2>/dev/null; then cat weston-smoke.log; exit 1; fi
+            sleep 1
+          done
+          if ! test -S "$runtime/$WAYLAND_DISPLAY"; then cat weston-smoke.log; exit 1; fi
+          WAYLAND_DEBUG=client linscp-gui >wayland-smoke.log 2>&1 &
+          app=$!
+          for i in $(seq 1 120); do
+            if ! kill -0 "$app" 2>/dev/null; then cat weston-smoke.log wayland-smoke.log; exit 1; fi
+            # Force the native Wayland backend and observe a configured, committed
+            # GTK toplevel instead of treating process liveness as a window.
+            if grep -qE 'xdg_toplevel@[0-9]+\.set_title\("LinSCP' wayland-smoke.log &&
+               grep -qE 'xdg_surface@[0-9]+\.ack_configure' wayland-smoke.log &&
+               grep -qE 'wl_surface@[0-9]+\.commit' wayland-smoke.log; then
+              python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
+              echo "Native LinSCP Wayland toplevel configured and committed under headless Weston"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat weston-smoke.log wayland-smoke.log
+          echo "Wayland toplevel did not configure and commit within 120 seconds" >&2
+          exit 1
 
       - name: Build and smoke test a custom-prefix Make install
         run: |
