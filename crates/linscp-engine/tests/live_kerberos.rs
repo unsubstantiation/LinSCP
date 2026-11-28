@@ -23,7 +23,11 @@ async fn live_kerberos_authentication_and_delegation() {
     wrong.raw_fields.insert("logical_host".into(), "wrong.invalid".into());
     assert!(connect_ssh_for_shell(&wrong, Path::new("."), false, false, "en", 0, None).await.is_err(), "wrong service principal must not authenticate");
     for (delegate, expected) in [(false, "no"), (true, "yes")] {
-        spec.raw_fields.insert("gssapi_fwd_tgt".into(), if delegate { "1" } else { "0" }.into());
+        if delegate {
+            spec.raw_fields.insert("gssapi_fwd_tgt".into(), "1".into());
+        } else {
+            spec.raw_fields.remove("gssapi_fwd_tgt");
+        }
         let (conn, _) = connect_ssh_for_shell(&spec, Path::new("."), false, false, "en", 0, None)
             .await.unwrap_or_else(|error| panic!("Kerberos connect (delegation={delegate}): {error}"));
         let result = conn.exec_command("if [ -n \"$KRB5CCNAME\" ] && klist -s; then echo yes; else echo no; fi").await.unwrap();

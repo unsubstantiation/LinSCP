@@ -72,7 +72,7 @@ GSSAPICleanupCredentials yes
 GSSAPIStrictAcceptorCheck no
 AllowUsers $USER
 Subsystem sftp internal-sftp
-LogLevel VERBOSE
+LogLevel DEBUG3
 CONF
 sudo mkdir -p /run/sshd
 sudo env KRB5_CONFIG="$KRB5_CONFIG" KRB5_KTNAME="FILE:$root/host.keytab" /usr/sbin/sshd -D -e -f "$root/sshd_config" >"$root/sshd.log" 2>&1 & sshd_pid=$!
@@ -87,6 +87,10 @@ for _ in range(100):
     except OSError: time.sleep(.1)
 else: raise SystemExit('sshd fixture did not start')
 PY
-if ! python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test live_kerberos -- --ignored --nocapture; then
-  echo '--- sshd log ---'; cat "$root/sshd.log"; echo '--- KDC log ---'; cat "$root/kdc.log"; exit 1
+if ! cargo test -q -p linscp-engine --test live_kerberos -- --ignored --nocapture >"$root/test.log" 2>&1; then
+  echo '--- test log ---'; tail -80 "$root/test.log"
+  echo '--- sshd log ---'; tail -100 "$root/sshd.log"
+  echo '--- KDC log ---'; tail -40 "$root/kdc.log"
+  exit 1
 fi
+cat "$root/test.log"
