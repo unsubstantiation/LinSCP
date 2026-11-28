@@ -8817,16 +8817,13 @@ impl CommanderService {
         // over one path per item, and the page only names them. Each item is
         // staged under its own leaf name and the queue is asked once, so one
         // drop is one queue entry, one conflict answer and the same overwrite
-        // rules a transfer out of the local pane obeys. A lone plain file is
-        // left to the byte path below, which has staged files since before
-        // paths existed.
+        // rules a transfer out of the local pane obeys. Even one native file
+        // uses bounded streaming rather than being read wholly into memory.
         let source_paths = Self::drop_source_paths(&body);
         for path in &source_paths {
             if let Err(error) = Self::dropped_path_split(path) { return api_error(400, error); }
         }
-        let single_plain_file = source_paths.len() == 1
-            && matches!(Self::dropped_path_kind(&source_paths[0]), Ok(DroppedKind::File));
-        if !source_paths.is_empty() && !single_plain_file {
+        if !source_paths.is_empty() {
             let staging = match self.drop_staging_dir() {
                 Ok(path) => path,
                 Err(error) => return api_error(500, error),
@@ -23625,6 +23622,29 @@ mod tests {
             .map(|rd| rd.filter_map(Result::ok).collect())
             .unwrap_or_default();
         assert!(leftover.is_empty(), "refused drops must clean up batch staging directories");
+
+        // A single native file must take the same bounded streaming path.
+        let single = drop_src.join("single.txt");
+        std::fs::write(&single, b"native single").unwrap();
+        let single_drop = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(), path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/srv", "name": "single.txt",
+                "source_path": single.to_string_lossy(), "source_paths": [single.to_string_lossy()]}),
+        }).await;
+        assert_eq!(single_drop.status, 200, "{}", single_drop.payload);
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(session.bytes_of("/srv/single.txt").as_deref(), Some(b"native single".as_slice()));
+        let oversized_single = drop_src.join("single-too-large");
+        std::fs::write(&oversized_single, vec![0; 1025]).unwrap();
+        let refused_single = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(), path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/srv", "source_paths": [oversized_single.to_string_lossy()]}),
+        }).await;
+        assert_eq!(refused_single.status, 400, "{}", refused_single.payload);
+        assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
 
         let ok_dir = drop_src.join("validpkg");
         std::fs::create_dir_all(ok_dir.join("sub")).unwrap();
