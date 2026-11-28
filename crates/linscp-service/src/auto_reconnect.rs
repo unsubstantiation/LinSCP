@@ -59,7 +59,15 @@ pub fn interval(site: &StoredSite) -> u64 {
 
 pub type Intentions = BTreeMap<String, Identity>;
 pub fn load(root: &Path, vault: &dyn SecretVault) -> Result<Intentions, String> {
-    match std::fs::read(root.join("auto-reconnect.json")) {
+    let path = root.join("auto-reconnect.json");
+    match vault.read_protected_file(&path, "auto-reconnect").map_err(|e| e.to_string())? {
+        linscp_platform::ProtectedFileRead::Unhandled => {},
+        linscp_platform::ProtectedFileRead::Missing => return Ok(BTreeMap::new()),
+        linscp_platform::ProtectedFileRead::Plaintext(bytes) => {
+            return serde_json::from_slice(&bytes).map_err(|e| format!("Cannot read auto-reconnect state: {e}"));
+        }
+    }
+    match std::fs::read(path) {
         Ok(bytes) => {
             if let Some(encrypted) = bytes.strip_prefix(HEADER) {
                 let plain = vault.open_session_store(encrypted).map_err(|e| e.to_string())?;
@@ -78,6 +86,8 @@ pub fn load(root: &Path, vault: &dyn SecretVault) -> Result<Intentions, String> 
 }
 pub fn save(root: &Path, vault: &dyn SecretVault, intentions: &Intentions) -> Result<(), String> {
     let bytes = zeroize::Zeroizing::new(serde_json::to_vec(intentions).map_err(|e| e.to_string())?);
+    let path = root.join("auto-reconnect.json");
+    if vault.write_protected_file(&path, "auto-reconnect", &bytes).map_err(|e| e.to_string())? { return Ok(()); }
     let mut payload = zeroize::Zeroizing::new(CONTEXT.to_vec());
     payload.extend_from_slice(&bytes);
     let encrypted = vault.seal_session_store(&payload).map_err(|e| e.to_string())?;
@@ -88,6 +98,14 @@ pub fn save(root: &Path, vault: &dyn SecretVault, intentions: &Intentions) -> Re
 }
 pub fn protect_existing(root: &Path, vault: &dyn SecretVault) -> Result<(), String> {
     let path = root.join("auto-reconnect.json");
+    match vault.read_protected_file(&path, "auto-reconnect").map_err(|e| e.to_string())? {
+        linscp_platform::ProtectedFileRead::Unhandled => {},
+        linscp_platform::ProtectedFileRead::Missing => return Ok(()),
+        linscp_platform::ProtectedFileRead::Plaintext(bytes) => {
+            serde_json::from_slice::<Intentions>(&bytes).map_err(|e| format!("Cannot read auto-reconnect state: {e}"))?;
+            return Ok(());
+        }
+    }
     match std::fs::read(&path) {
         Ok(bytes) if !bytes.starts_with(HEADER) => {
             let intentions = load(root, vault)?;
@@ -102,6 +120,41 @@ pub fn protect_existing(root: &Path, vault: &dyn SecretVault) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn container_backend_persists_reconnect_state_without_a_sidecar() {
+        use linscp_engine::container_credentials::{ContainerSessionVault, CredentialContainer};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("vault.dat");
+        let vault = CredentialContainer::acquire(&path).unwrap();
+        vault.create("test password").unwrap();
+        let unlocked = vault.unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        assert!(load(dir.path(), &bridge).unwrap().is_empty());
+        let mut site = StoredSite::new("saved", linscp_types::ProtocolScheme::Sftp, "private.example");
+        site.username = "alice".into();
+        let mut expected = Intentions::new();
+        expected.insert("saved".into(), Identity::of(&site));
+        save(dir.path(), &bridge, &expected).unwrap();
+        protect_existing(dir.path(), &bridge).unwrap();
+        assert_eq!(load(dir.path(), &bridge).unwrap(), expected);
+        assert!(!dir.path().join("auto-reconnect.json").exists());
+        let disk = std::fs::read(&path).unwrap();
+        assert!(!disk.windows(b"private.example".len()).any(|part| part == b"private.example"));
+        let wrong_root = tempfile::tempdir().unwrap();
+        assert!(load(wrong_root.path(), &bridge).is_err());
+        bridge.lock().unwrap();
+        assert!(load(dir.path(), &bridge).is_err());
+        assert!(save(dir.path(), &bridge, &expected).is_err());
+        assert!(!dir.path().join("auto-reconnect.json").exists());
+        let unlocked = CredentialContainer::acquire(&path).unwrap().unlock("test password").ok().unwrap();
+        let bridge = ContainerSessionVault::new(dir.path(), unlocked).unwrap();
+        assert_eq!(load(dir.path(), &bridge).unwrap(), expected);
+        // A corrupted record is not silently interpreted as an empty state.
+        bridge.write_protected_file(&dir.path().join("auto-reconnect.json"), "auto-reconnect", b"not-json").unwrap();
+        assert!(load(dir.path(), &bridge).is_err());
+        assert!(protect_existing(dir.path(), &bridge).is_err());
+    }
+
     #[test]
     fn defaults_and_invalid_values_are_safe() {
         let mut site = StoredSite::new("site", linscp_types::ProtocolScheme::Sftp, "host");

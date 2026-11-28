@@ -112,7 +112,7 @@ impl Document {
     fn validate(&self) -> Result<(), String> {
         if self.version != 1 { return Err("Unsupported credential container version".into()); }
         for (domain, encoded) in &self.protected {
-            if !matches!(domain.as_str(), "workspaces" | "ssh-host-keys") { return Err("Unknown protected container domain".into()); }
+            if !matches!(domain.as_str(), "workspaces" | "ssh-host-keys" | "auto-reconnect") { return Err("Unknown protected container domain".into()); }
             if encoded.len() > (MAX_PROTECTED_BYTES + 2) / 3 * 4 { return Err("Protected container data is too large".into()); }
             let value = Zeroizing::new(BASE64.decode(encoded).map_err(|_| "Invalid protected container data")?);
             if value.len() > MAX_PROTECTED_BYTES { return Err("Protected container data is too large".into()); }
@@ -488,6 +488,7 @@ impl ContainerSessionVault {
         let expected = match domain {
             "workspaces" => "workspaces.json",
             "ssh-host-keys" => "sshhostkeys",
+            "auto-reconnect" => "auto-reconnect.json",
             _ => return Err(Self::error("Unsupported container protected-file domain")),
         };
         if path.file_name() != Some(std::ffi::OsStr::new(expected)) {
