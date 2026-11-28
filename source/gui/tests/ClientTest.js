@@ -4368,7 +4368,7 @@ function options(id) {
       sessions: [{ session_id: 'alice-50-1700000000_stDXFCE_dp24', display: 50, status: 'S', desktop: 'XFCE' }]
     };
     responses['/api/x2go/terminate'] = { success: true };
-    responses['/api/x2go/open'] = { success: true, generation: '9' };
+    responses['/api/x2go/open'] = { success: true, generation: '9', resumed: true };
     responses['/api/x2go/poll'] = { success: true, message: null };
     responses['/api/x2go/input'] = { success: true };
     responses['/api/x2go/suspend'] = { success: true };
@@ -4381,6 +4381,15 @@ function options(id) {
       doc.querySelectorAll('#x2goSessionSelect option').length === 2);
     doc.getElementById('x2goSessionSelect').value = 'alice-50-1700000000_stDXFCE_dp24';
     doc.getElementById('x2goClipboardOptIn').checked = true;
+    const savedDecoder = window.TextDecoder;
+    window.TextDecoder = TextDecoder;
+    const savedClipboard = Object.getOwnPropertyDescriptor(window.navigator, 'clipboard');
+    const remoteClipboardWrites = [];
+    Object.defineProperty(window.navigator, 'clipboard', {configurable: true, value: {
+      writeText: async value => { remoteClipboardWrites.push(value); },
+      readText: async () => 'local clipboard'
+    }});
+    responses['/api/x2go/clipboard'] = { success: true };
     await window.launchRemoteDesktop();
     await new Promise(resolve => setTimeout(resolve, 40));
     const resumedOpen = calls.filter(call => call.path === '/api/x2go/open').pop();
@@ -4388,11 +4397,40 @@ function options(id) {
     check('X2Go launch forwards resume_session_id and allow_clipboard',
       resumedBody.resume_session_id === 'alice-50-1700000000_stDXFCE_dp24' &&
       resumedBody.allow_clipboard === true);
+    responses['/api/x2go/poll'] = { success: true, message: {type: 'selection', selection: {
+      selection: 0, format: 0, chunkSize: 5, first: true, last: true, compressedSize: 0, total: 5, data: 'aGVsbG8='
+    }} };
+    await new Promise(resolve => setTimeout(resolve, 160));
+    check('X2Go opted-in server selection reaches the local clipboard', remoteClipboardWrites.includes('hello'));
+    responses['/api/x2go/poll'] = { success: true, message: {type: 'demand-selection', selection: 0} };
+    await new Promise(resolve => setTimeout(resolve, 160));
+    const clipboardCall = calls.filter(call => call.path === '/api/x2go/clipboard').pop();
+    check('X2Go selection demand sends local clipboard text',
+      !!clipboardCall && JSON.parse(clipboardCall.options.body).text === 'local clipboard');
+    responses['/api/x2go/poll'] = { success: true, message: null };
     await window.suspendX2GoViewer();
     const suspendCall = calls.filter(call => call.path === '/api/x2go/suspend').pop();
     check('Suspending the X2Go viewer calls /api/x2go/suspend without /api/x2go/close',
       !!suspendCall && JSON.parse(suspendCall.options.body).generation === '9' &&
       !doc.getElementById('x2goViewerModal').classList.contains('open'));
+    window.openRemoteDesktop();
+    doc.getElementById('remoteDesktopKind').value = 'x2go';
+    window.remoteDesktopKindChanged();
+    await window.refreshX2GoSessions();
+    doc.getElementById('x2goSessionSelect').value = 'alice-50-1700000000_stDXFCE_dp24';
+    responses['/api/x2go/poll'] = { success: true, message: {type: 'invalid'} };
+    const suspendedBeforeFailure = calls.filter(call => call.path === '/api/x2go/suspend').length;
+    const closedBeforeFailure = calls.filter(call => call.path === '/api/x2go/close').length;
+    await window.launchRemoteDesktop();
+    await new Promise(resolve => setTimeout(resolve, 60));
+    check('A failed resumed X2Go viewer requests suspension rather than termination',
+      calls.filter(call => call.path === '/api/x2go/suspend').length === suspendedBeforeFailure + 1 &&
+      calls.filter(call => call.path === '/api/x2go/close').length === closedBeforeFailure);
+    responses['/api/x2go/poll'] = { success: true, message: null };
+    window.TextDecoder = savedDecoder;
+    if (savedClipboard) Object.defineProperty(window.navigator, 'clipboard', savedClipboard);
+    else delete window.navigator.clipboard;
+    delete responses['/api/x2go/clipboard'];
     window.openRemoteDesktop();
     doc.getElementById('remoteDesktopKind').value = 'x2go';
     window.remoteDesktopKindChanged();

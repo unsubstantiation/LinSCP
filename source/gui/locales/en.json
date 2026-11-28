@@ -330,6 +330,7 @@
   "Close server monitor": "Close server monitor",
   "Close the active session": "Close the active session",
   "Close the current X2Go desktop first.": "Close the current X2Go desktop first.",
+  "Closing terminates the remote session. Suspend it to resume later.": "Closing terminates the remote session. Suspend it to resume later.",
   "Close tunnel": "Close tunnel",
   "Close without saving your changes?": "Close without saving your changes?",
   "Closed the SSH desktop tunnel.": "Closed the SSH desktop tunnel.",

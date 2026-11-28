@@ -795,6 +795,7 @@
     "Close tunnel": "Tunnel schließen",
     "Close without saving your changes?": "Ohne Speichern der Änderungen schließen?",
     "Closed the SSH desktop tunnel.": "Der SSH-Desktop-Tunnel wurde geschlossen.",
+    "Closing terminates the remote session. Suspend it to resume later.": "Beim Schließen wird die entfernte Sitzung beendet. Halten Sie sie an, um sie später fortzusetzen.",
     "Collapse or expand bottom panel": "Unteren Bereich ein- oder ausklappen",
     "Color depth:": "Farbtiefe:",
     "Combined X2Go + XFCE preview (untick XFCE or use Preferences to save separately)": "Kombinierte X2Go- + XFCE-Vorschau (XFCE abwählen oder Einstellungen zum getrennten Speichern nutzen)",

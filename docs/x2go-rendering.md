@@ -57,7 +57,7 @@ clipboard (`write_selection`) packets, tracks live wire frame-cache IDs and
 evictions via `WireFrameTracker` + `FrameCache::apply_deleted_frames` (failing
 closed on unknown cached frame references), preserves output order, applies
 bounded backpressure, and supports explicit session suspend (`x2gosuspend-session`)
-or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. The service
+or termination (`x2goterminate-session`) as well as best-effort cleanup on closure. A deliberately closed viewer terminates its remote session; use Suspend to preserve it. On unexpected failure, newly started agents are terminated and resumed sessions are suspended, to avoid discarding an existing desktop. The service
 can associate a bridge with the exact connected SSH tab and exposes nonblocking
 poll, input, and close routes. Closing or reconnecting a tab releases its bridge;
 an abandoned viewer lease expires after 60 seconds. Explicit suspend keeps the
@@ -140,7 +140,7 @@ bounds parsed incoming messages, enables input only after a main image, and
 closes on overflow, decode errors or disconnect. A supplied transport must write
 packets, request a new main image on reinitialization, and arrange remote agent
 cleanup; the reader delivers messages and uses a heuristic to identify barrier replies.
-Tests exercise this wiring with a simulated transport and WebView. The page
+The page connects the opted-in text clipboard callbacks to native clipboard APIs, falling back to WebView clipboard access where available; malformed or interleaved selection chunks are discarded. Clipboard permissions and actual protocol interoperability remain platform-dependent. Tests exercise this wiring with a simulated transport and WebView. The page
 uses `/api/x2go/open`, poll, input and close; it has not been tested against an
 actual X2Go server. Generic desktop launch/ticket requests still reject X2Go.
 
@@ -237,8 +237,7 @@ the reply and immediately creates a cleanup guard. A cancelled caller leaves
 startup running so the resulting guard can attempt cleanup. A guarded graphics
 session can also launch a fixed XFCE, MATE or LXDE command after negotiation;
 the background command's exit status does not prove the desktop started.
-The guard attempts bounded termination over the same SSH connection on close,
-setup failure, or drop. Cleanup on drop is best-effort: runtime shutdown,
+The guard attempts bounded termination over the same SSH connection on explicit close. For a resumed session it instead attempts suspension on setup failure, a lost viewer, or guard drop; a guard is created before issuing the resume command so even an ambiguous reply triggers an attempt. A newly started agent is terminated on failure. These operations continue when their caller is cancelled, but are not durable. Cleanup on drop is best-effort: runtime shutdown,
 process termination, a broken SSH connection, or an invalid/lost startup reply
 can still leave an agent behind. The cookie is redacted in debug output and
 zeroized when the parsed session is dropped. These primitives are wired into

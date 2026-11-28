@@ -8,17 +8,18 @@ function setup(options = {}) {
   const dom = new JSDOM('<div id="view"></div>');
   const painted = [], writes = [], errors = [];
   let closes = 0, mainRequests = 0;
+  const closeReasons = [];
   dom.window.HTMLCanvasElement.prototype.getContext = () => ({
     createImageData: (w,h) => ({data: new Uint8ClampedArray(w*h*4)}),
     putImageData: (image,x,y) => painted.push({pixels:[...image.data], x, y}),
   });
-  const transport = { async write(p) { writes.push(packetType(p)); }, close() { closes++; },
+  const transport = { async write(p) { writes.push(packetType(p)); }, close(failed) { closes++; closeReasons.push(failed); },
     async requestMainImage() { mainRequests++; } };
   const decoder = { async decode(_b,w,h) { return {width:w,height:h,pixels:new Uint8ClampedArray(w*h*4).fill(42)}; } };
   const viewer = new KDriveViewerSession(dom.window.document.getElementById('view'), transport,
     {capsLock:false,numLock:false,rightAltIsAltGr:false,decoder,onError:e => errors.push(e.message),...options});
   function key(code, down) { viewer.element.dispatchEvent(new dom.window.KeyboardEvent(down ? 'keydown' : 'keyup', {code, key:code, bubbles:true, cancelable:true})); }
-  return {dom, viewer, transport, painted, writes, errors, key, get closes() {return closes;}, get mainRequests() {return mainRequests;}};
+  return {dom, viewer, transport, painted, writes, errors, key, closeReasons, get closes() {return closes;}, get mainRequests() {return mainRequests;}};
 }
 const region = {sourceId:0,sourceX:0,sourceY:0,x:0,y:0,width:2,height:1,data:Uint8Array.of(1)};
 const main = () => ({type:'frame',frame:{width:2,height:1,x:-1,y:-1,cacheId:0,windowId:0,regions:[region]}});
@@ -30,7 +31,7 @@ test('a main image enables captured input and paints the desktop', async () => {
   assert.deepEqual(s.painted[0].pixels, Array(8).fill(42));
   s.viewer.element.focus(); s.key('KeyA', true); s.key('KeyA', false); await tick();
   assert.deepEqual(s.writes, [2,3]);
-  s.viewer.close(); s.viewer.close(); assert.equal(s.closes, 1); s.dom.window.close();
+  s.viewer.close(); s.viewer.close(); assert.equal(s.closes, 1); assert.deepEqual(s.closeReasons, [false]); s.dom.window.close();
 });
 
 test('input packets stop at the barrier until the reader acknowledges', async () => {
@@ -53,7 +54,7 @@ test('reinitialize disables input until a fresh main image', async () => {
 test('bad or missed frames fail closed and notify once', async () => {
   const s = setup(); await s.viewer.receive(main());
   await assert.rejects(s.viewer.receive({type:'frame', frame:{...main().frame,x:0,y:0,cacheId:99,regions:[]}}));
-  assert.equal(s.closes, 1); assert.deepEqual(s.errors, ['The KDrive viewer session ended.']);
+  assert.equal(s.closes, 1); assert.deepEqual(s.closeReasons, [true]); assert.deepEqual(s.errors, ['The KDrive viewer session ended.']);
   await assert.rejects(s.viewer.receive(main()), /closed/);
   s.viewer.close(); assert.equal(s.closes, 1); s.dom.window.close();
 });
@@ -105,6 +106,23 @@ test('resize enqueues geometry event and selection/cursor messages update state'
   s.dom.window.close();
 });
 
+
+test('clipboard chunks require a matching first chunk and selection', async () => {
+  const selections = [];
+  const s = setup({onSelection: (text, sel) => selections.push([text, sel])});
+  const chunk = (selection, first, last, data) => ({type:'selection', selection: {
+    selection, first, last, format:0, compressedSize:0, total:data.length, chunkSize:data.length,
+    data:new TextEncoder().encode(data)
+  }});
+  await s.viewer.receive(chunk(0, false, true, 'orphan'));
+  await s.viewer.receive(chunk(0, true, false, 'left'));
+  await s.viewer.receive(chunk(1, false, true, 'wrong'));
+  await s.viewer.receive(chunk(0, false, true, 'tail'));
+  assert.deepEqual(selections, []);
+  await s.viewer.receive(chunk(1, true, true, 'valid'));
+  assert.deepEqual(selections, [['valid', 1]]);
+  s.viewer.close(); s.dom.window.close();
+});
 
 test('closing interrupts a pending main-image request', async () => {
   const s = setup(); await s.viewer.receive(main());
