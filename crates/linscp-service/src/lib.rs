@@ -19292,6 +19292,7 @@ mod tests {
         docs: Mutex<HashMap<String, MockDoc>>,
         mtime: i64,
         listing_injection: Mutex<Option<String>>,
+        reported_sizes: Mutex<HashMap<String, u64>>,
     }
 
     /// A second granted tree, so cross-tree copies and moves have somewhere
@@ -19300,7 +19301,7 @@ mod tests {
 
     impl MockBridge {
         fn with_file(name: &str, content: &[u8]) -> Self {
-            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271, listing_injection: Mutex::new(None) };
+            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271, listing_injection: Mutex::new(None), reported_sizes: Mutex::new(HashMap::new()) };
             bridge.add_file(&Self::doc_uri(name), content);
             bridge
         }
@@ -19331,7 +19332,9 @@ mod tests {
         }
 
         fn entry_for_uri(&self, uri: &str, doc: &MockDoc) -> FileEntry {
-            FileEntry { name: Self::leaf_of(uri), size: doc.bytes.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0), is_dir: doc.bytes.is_none(), is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
+            let size = self.reported_sizes.lock().expect("m").get(uri).copied()
+                .unwrap_or_else(|| doc.bytes.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0));
+            FileEntry { name: Self::leaf_of(uri), size, is_dir: doc.bytes.is_none(), is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
         }
 
         fn bytes_of(&self, name: &str) -> Option<Vec<u8>> {
@@ -20538,6 +20541,23 @@ mod tests {
         assert_eq!(preview.status, 400, "{}", preview.payload);
         assert!(preview.payload["error"].as_str().unwrap_or("").contains("Invalid directory entry name"));
         assert_eq!(bridge.bytes_of("safe.txt").as_deref(), Some(b"safe".as_slice()));
+    }
+
+    #[test]
+    fn saf_search_charges_underreported_oversized_documents() {
+        let oversized = vec![b'x'; ops::MAX_SEARCH_FILE_BYTES as usize + 1];
+        let bridge = Arc::new(MockBridge::with_file("00.txt", &oversized));
+        for index in 0..9 {
+            let uri = MockBridge::doc_uri(&format!("{index:02}.txt"));
+            if index > 0 { bridge.add_file(&uri, &oversized); }
+            bridge.reported_sizes.lock().unwrap().insert(uri, 1);
+        }
+        let fs = NativeLocalFs::with_saf(bridge);
+        let stats = ops::search_saf_bounded_with_encoding(&fs, SAF_GRANTED_DIR, &FileMask::default(), Some("needle"), false, None, 500).unwrap();
+        assert_eq!(stats.scanned, 8);
+        assert_eq!(stats.skipped, 8);
+        assert_eq!(stats.bytes_scanned, ops::MAX_SEARCH_TOTAL_BYTES);
+        assert!(stats.truncated);
     }
 
     #[tokio::test]

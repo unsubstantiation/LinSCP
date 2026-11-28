@@ -2739,7 +2739,10 @@
         ],
         "service": [
           "live_webdav_sync_encoding_and_interrupted_delete",
-          "saf_sync_preview_and_run_moves_bytes_both_ways"
+          "saf_sync_preview_and_run_moves_bytes_both_ways",
+          "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads",
+          "saf_search_and_sync_reject_provider_path_components",
+          "sync_preview_refuses_windows_case_aliases_before_deletion"
         ],
         "android-emulator": [
           "verifyAndroidGrantedSafSync",
@@ -5105,13 +5108,16 @@
         ],
         "service": [
           "live_webdav_sync_encoding_and_interrupted_delete",
-          "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads"
+          "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads",
+          "remote_search_charges_failed_oversized_reads_to_total_budget",
+          "saf_search_and_sync_reject_provider_path_components"
         ],
         "gui": [
           "undecodable file offers encoding retry without opening the editor",
           "retry opens with selected lowercase backend encoding",
           "cancelling another file retry preserves the open editor format",
-          "new empty file saves selected encoding"
+          "new empty file saves selected encoding",
+          "content search forwards selected text encoding"
         ],
         "android-emulator": [
           "verifyAndroidRemoteEditingAndInterruptedDelete"
@@ -5132,7 +5138,7 @@
           "android-emulator"
         ]
       },
-      "gap": "Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.",
+      "gap": "Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; Linux additionally exercises UTF-16LE with a BOM; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.",
       "acceptance": [
         "Exercise additional encodings and negative cases against other servers, Android providers and physical devices.",
         "Retain strict refusal of unrepresentable output and document binary detection limits."

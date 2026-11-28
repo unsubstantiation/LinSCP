@@ -940,22 +940,19 @@ fn search_local_walk(
                 return Ok(());
             }
             let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            stats.scanned += 1;
             let Ok(file) = std::fs::File::open(&path) else {
                 stats.skipped += 1;
                 continue;
             };
             let mut bytes = Vec::new();
-            if file.take(remaining + 1).read_to_end(&mut bytes).is_err() {
+            let read_result = file.take(remaining + 1).read_to_end(&mut bytes);
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add((bytes.len() as u64).min(remaining));
+            if read_result.is_err() || bytes.len() as u64 > remaining {
                 stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
                 continue;
             }
-            if bytes.len() as u64 > remaining {
-                stats.skipped += 1;
-                if remaining < MAX_SEARCH_FILE_BYTES { stats.truncated = true; return Ok(()); }
-                continue;
-            }
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
@@ -1129,20 +1126,20 @@ fn search_saf_walk(
                 stats.truncated = true;
                 return Ok(());
             }
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            stats.scanned += 1;
             let Ok(bytes) = fs.read_bytes(&full_uri) else {
                 stats.skipped += 1;
                 continue;
             };
-            if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+            // The bridge reads a whole document (and has its own larger cap).
+            // Charge oversized or underreported documents to the search budget.
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add((bytes.len() as u64).min(remaining));
+            if bytes.len() as u64 > remaining {
                 stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
                 continue;
             }
-            if stats.bytes_scanned.saturating_add(bytes.len() as u64) > MAX_SEARCH_TOTAL_BYTES {
-                stats.truncated = true;
-                return Ok(());
-            }
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;

@@ -505,7 +505,7 @@ Session transfers with a granted local side stage through private temporary file
 
 CLI and browser editor support explicit legacy encodings with strict decoding and encoding, line-ending and BOM controls. When opening undecodable text the browser offers an encoding retry; content search accepts an encoding and skips binary or undecodable files. Remote editor and search downloads are bounded by streamed bytes, not just server-reported sizes.
 
-**Next:** Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.
+**Next:** Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; Linux additionally exercises UTF-16LE with a BOM; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.
 
 **Acceptance criteria:**
 
