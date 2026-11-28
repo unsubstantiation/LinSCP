@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'share-intent', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'share-fail', 'share-intent', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -627,6 +627,22 @@ const expression = `
     await runTask('/api/transfer/keepuptodate', {...sync, count: 1});
     const watched = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/watch.txt'));
     if (watched.content !== 'watched provider file') throw new Error('SAF keep-up-to-date missed the file');
+  }
+  if (${JSON.stringify(phase)} === 'share-fail') {
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    let pending = [];
+    for (let i = 0; i < 30 && !pending.length; i++) {
+      pending = (await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|pendingShares')).paths;
+      if (!pending.length) await sleep(1000);
+    }
+    if (!pending.length) throw new Error('SEND intent did not stage a pending file');
+    let refused = false;
+    try { await invoke('GET', '/api/shell/pending'); }
+    catch (error) { refused = error.status === 500; }
+    if (!refused) throw new Error('Blocked manifest publication did not report an error');
+    const again = (await window.__TAURI_INTERNALS__.invoke('plugin:linscp-android|pendingShares')).paths;
+    if (!again.includes(pending[0])) throw new Error('Failed publication lost the pending file');
+    return {root, failedShareRetained: true};
   }
   if (${JSON.stringify(phase)} === 'share-intent') {
     const root = (await invoke('GET', '/api/status')).local_dir;

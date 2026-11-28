@@ -12912,8 +12912,8 @@
 
   /* Android's share sheet stages what another app sent and records the same
    * manifest the desktop's `--shell-upload` selection does. A share is a drop
-   * the user already made, so it is queued at once through the same request
-   * shell-selection endpoint uses instead of waiting behind a dialog; the desktop's
+   * the user already made, so it is queued at once through the same
+   * shell-selection endpoint instead of waiting behind a dialog; the desktop's
    * selection keeps its confirmation because there the user may not be
    * connected yet. */
   async function queueSharedFiles(item) {
@@ -12940,8 +12940,9 @@
         refreshQueue();
       }
       if (refused) {
-        toast(tn("{count} shared file could not be queued.",
-          "{count} shared files could not be queued.", refused), true);
+        const reasons = (result.refused || []).map(entry => entry.name + ': ' + entry.error);
+        if (reasons.length) toast(t("These files could not be queued: {reasons}", {reasons: reasons.join('; ')}), true);
+        if ((result.missing || []).length) toast(t("Some files are no longer there: {names}", {names: result.missing.join(', ')}), true);
       }
       return true;
     } finally {

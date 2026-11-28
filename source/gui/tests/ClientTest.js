@@ -2309,6 +2309,12 @@ function options(id) {
     text('customCommandsResult'));
   window.closeModal('customCommandsModal');
 
+  responses['/api/shell/pending'] = { success: false, error: 'share manifest disk full' };
+  await window.checkShellPending();
+  check('pending share publication errors reach the user log', lastLogLine().includes('share manifest disk full'), lastLogLine());
+  responses['/api/shell/pending'] = { success: true, pending: [] };
+  await window.checkShellPending();
+
   /* A file-manager selection is offered in a dialog; only confirming
    * it queues anything, and names are shown as text, never markup. */
   responses['/api/shell/pending'] = { success: true, pending: [{

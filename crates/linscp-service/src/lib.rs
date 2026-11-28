@@ -8832,19 +8832,10 @@ impl CommanderService {
                 Err(error) => return api_error(500, error),
             };
             let mut names: Vec<String> = Vec::new();
-            let mut staged_paths: Vec<PathBuf> = Vec::new();
-            // A failed drop removes what it already staged: the queue never saw
-            // those names, so nothing else will.
-            let tidy = |staged: &[PathBuf], batch_dir: &Path| {
-                for path in staged {
-                    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
-                        let _ = std::fs::remove_dir_all(path);
-                    } else {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-                let _ = std::fs::remove_dir(batch_dir);
-            };
+            // The private batch may also contain the current partially copied
+            // file when a read or write fails. Remove the entire batch, not
+            // just the names that completed successfully.
+            let tidy = || { let _ = std::fs::remove_dir_all(&staging); };
             let mut staged_files = 0usize;
             let mut staged_bytes = 0u64;
             for path in &source_paths {
@@ -8856,21 +8847,20 @@ impl CommanderService {
                 ) {
                     Ok(relative) => relative,
                     Err(error) => {
-                        tidy(&staged_paths, &staging);
+                        tidy();
                         return api_error(400, error);
                     }
                 };
                 if names.contains(&relative) {
                     // Two items of one drop cannot share a name: the queue
                     // would upload the same staging path twice.
-                    tidy(&staged_paths, &staging);
+                    tidy();
                     return api_error(400, "Two dropped items have the same name.");
                 }
-                staged_paths.push(staging.join(&relative));
                 names.push(relative);
             }
             if names.is_empty() {
-                tidy(&staged_paths, &staging);
+                tidy();
                 return api_error(400, "The drop contained nothing that can be uploaded.");
             }
             let mut request = json!({
@@ -8896,7 +8886,7 @@ impl CommanderService {
                 // refusal), so the staged copy is ours again. It has to go now:
                 // the page retries the same drop with the decision, and a
                 // staging entry that already exists would refuse that retry.
-                tidy(&staged_paths, &staging);
+                tidy();
             }
             return reply;
         }
