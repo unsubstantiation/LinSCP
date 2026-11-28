@@ -1,0 +1,16 @@
+name: Chunk 8 checks
+on:
+  push:
+    branches: [arena/4b00efe6-linscp]
+jobs:
+  rust:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo test -p linscp-proto remote_desktop
+      - run: cargo test -p linscp-platform desktop
+      - run: cargo test -p linscp-service desktop_requested_tunnels_do_not_fall_back_to_direct_connections

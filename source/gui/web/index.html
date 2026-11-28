@@ -10132,7 +10132,7 @@
     updateRemoteDesktopScriptToolbarState();
     $('remoteDesktopStatus').textContent = t('Checking…');
     try {
-      const data = await apiPost('/api/desktop/check', { tab: tabId, kind: kind, host: host, port: port });
+      const data = await apiPost('/api/desktop/check', { tab: tabId, kind: kind, host: host, port: port, tunnel_via_ssh: !!($('remoteDesktopTunnel') && $('remoteDesktopTunnel').checked) });
       if (generation !== remoteDesktopState.generation) return;
       remoteDesktopState.lastCheck = {data, tabId, kind, host, port};
       const desktopMissing = kind === 'x2go' && data && data.success && data.desktop_checked === true && !data.desktop;

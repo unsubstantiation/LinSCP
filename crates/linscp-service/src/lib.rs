@@ -9922,6 +9922,9 @@ impl CommanderService {
         let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
         let tunneled = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false)
             || spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+        if tunneled {
+            return api_error(400, "A downloadable ticket cannot create an SSH forward. Launch through a connected SSH session instead.");
+        }
         let cfg = linscp_proto::remote_desktop::RemoteDesktopConnectConfig {
             scheme,
             kind,
@@ -10233,11 +10236,13 @@ impl CommanderService {
         // Prefer desktop tab spec if provided
         let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
         let mut via_tab_id: Option<u64> = None;
+        let mut configured_jump = false;
         if let Some(tid) = tab_id {
             let state = self.state.lock().expect("state mutex");
             if let Some(tab) = state.tabs.get(&tid) {
                 if let Some(spec) = tab.spec.as_ref() {
                     if spec.session.protocol.is_remote_desktop() {
+                        configured_jump = spec.session.tunnel.as_ref().is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
                         kind = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
                         if target_host.is_empty() { target_host = spec.session.host.clone(); }
                         if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
@@ -10392,6 +10397,10 @@ impl CommanderService {
         if kind == RemoteDesktopKind::X2Go {
             return api_error(400, "Connect an SSH session to this server to check X2Go before installing.");
         }
+        // A direct probe would leak the target when an SSH route was requested.
+        if configured_jump || body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false) {
+            return api_error(400, "Cannot probe the desktop directly when an SSH tunnel is requested. Connect an SSH session first.");
+        }
         // No SSH session: try TCP probe if direct desktop port
         let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
         if tcp_ok {
@@ -10530,7 +10539,14 @@ impl CommanderService {
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| tabs::parse_tab_id_value(body.get("via_tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
         let mut kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
-        let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let mut target_port: u16 = match body.get("port") {
+            None | Some(Value::Null) => 0,
+            Some(value) => match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+                Some(port) => port,
+                None => return api_error(400, "Invalid desktop port."),
+            },
+        };
+        if target_host.chars().any(char::is_control) { return api_error(400, "Invalid desktop host."); }
         let mut desktop_tab_spec: Option<tabs::TabRuntime> = None;
         let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
         let mut via_tab_id: Option<u64> = None;
@@ -10585,6 +10601,16 @@ impl CommanderService {
             if let Some(tab) = desktop_tab_spec.as_ref() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
         }
         if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        let want_ssh_tunnel = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false);
+        let configured_jump = desktop_tab_spec.as_ref().and_then(|tab| tab.spec.as_ref())
+            .and_then(|spec| spec.session.tunnel.as_ref())
+            .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
+        if (want_ssh_tunnel || configured_jump) && kind == RemoteDesktopKind::X11 {
+            return api_error(400, "SSH jump forwarding is not supported for external X11 or Waypipe viewers.");
+        }
+        if want_ssh_tunnel && via_session.is_none() && !configured_jump {
+            return api_error(400, "SSH desktop tunnel requested but no connected SSH session or configured jump is available.");
+        }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
         let (script, default_script, is_custom) = self
@@ -10637,11 +10663,7 @@ impl CommanderService {
                 Err(e) => return api_error(400, format!("Could not verify the remote desktop server: {e}")),
             }
         } else if !target_host.is_empty() && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
-            let has_jump_tunnel = desktop_tab_spec
-                .as_ref()
-                .and_then(|t| t.spec.as_ref())
-                .and_then(|s| s.session.tunnel.as_ref())
-                .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
+            let has_jump_tunnel = configured_jump || want_ssh_tunnel;
             // When no SSH jump tunnel is configured, probe direct TCP reachability;
             // when a jump tunnel is configured, the desktop port is reached via SSH forwarding below.
             let tcp_ok = if has_jump_tunnel {
@@ -10687,7 +10709,6 @@ impl CommanderService {
             (target_host.clone(), target_port, match kind { RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp, RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc, RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice, RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go, RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11 })
         };
         // Try to find the desktop tab to get full spec (including raw_fields, tunnel)
-        let want_ssh_tunnel = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false);
         let tab_for_launch = if let Some(tid) = tab_id { self.state.lock().expect("m").tabs.get(&tid).cloned() } else { None };
         let (cfg, target, mut tunneled) = if let Some(tab) = tab_for_launch.as_ref() {
             if let Some(spec) = tab.spec.as_ref() {
@@ -10714,6 +10735,10 @@ impl CommanderService {
             let t = format!("{}:{}", spec_host, spec_port);
             (c, t, want_ssh_tunnel)
         };
+        if tunneled && kind == RemoteDesktopKind::Spice && cfg.desktop_opts.spice_tls_port.is_some() {
+            return api_error(400, "SPICE with a separate TLS port cannot use this single-port SSH forward.");
+        }
+        let target = cfg.target();
         let mut tunnel_port_opt = None;
         let mut tunnel_id_opt: Option<u64> = None;
         if (tunneled || want_ssh_tunnel) && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
@@ -10789,6 +10814,8 @@ impl CommanderService {
                     }
                     Err(e) => return api_error(500, format!("Could not open local SSH forwarder: {e}")),
                 }
+            } else {
+                return api_error(400, "SSH desktop tunnel requested but no connected SSH session or configured jump is available.");
             }
         }
         let proto_ticket = ticket_from_config(
@@ -13388,6 +13415,29 @@ mod tests {
         let reply = svc.dispatch(ApiEnvelope { method:"POST".into(), path:"/api/tabs/close".into(), body:json!({"tab":7}) });
         assert_eq!(reply.status, 200);
         assert!(tokio::time::timeout(std::time::Duration::from_secs(2), cleanup).await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn desktop_requested_tunnels_do_not_fall_back_to_direct_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        for path in ["/api/desktop/check", "/api/desktop/launch"] {
+            let reply = svc.dispatch_async(request(path, json!({"kind":"rdp", "host":"192.0.2.1", "tunnel_via_ssh":true}))).await;
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+        for port in [json!(65536), json!(-1), json!("3389")] {
+            let reply = svc.dispatch_async(request("/api/desktop/launch", json!({"kind":"rdp", "host":"example.test", "port":port}))).await;
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session, &tmp.path().to_string_lossy());
+        let (spec, _) = tabs::parse_gui_session_spec(&json!({"protocol":"sftp", "host":"example.test"}), None, tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().spec = Some(spec);
+        for path in ["/api/desktop/ticket", "/api/desktop/launch"] {
+            let reply = svc.dispatch(request(path, json!({"tab":id, "kind":"rdp", "tunnel_via_ssh":true})));
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
     }
 
     #[tokio::test]
