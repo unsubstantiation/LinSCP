@@ -28,6 +28,7 @@ import json
 import os
 import time
 import re
+import socket
 import sys
 import threading
 import urllib.parse
@@ -793,6 +794,16 @@ class DavHandler(BaseHTTPRequestHandler):
         if not self.authorized():
             return
         path = self.local_path()
+        # Deliberately break the TCP connection on a selected delete, while
+        # keeping the server alive so a test can inspect the surviving tree.
+        if path == os.environ.get("LSCP_TEST_DROP_DELETE", ""):
+            self.close_connection = True
+            try:
+                self.connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            self.connection.close()
+            return
         if "/.linscp-lock-" in path and SERVER_STORE.reject_next_stage_delete:
             SERVER_STORE.reject_next_stage_delete = False
             self.send_error_text(503, "Injected temporary cleanup failure.")

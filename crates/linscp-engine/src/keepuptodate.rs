@@ -213,9 +213,9 @@ where
         Err(e) if opts.continue_on_error => format!("Error: {e}"),
         Err(e) => return Err(e),
     };
-    if let Some(ref w) = watcher {
-        let _ = w.drain_changed_paths();
-    }
+    // Do not discard events that arrived while the initial snapshot was being
+    // planned or applied: a change after enumeration needs another pass now,
+    // not only when the safety-net polling interval expires.
     on_status(&pass1_status);
     let _ = std::io::Write::flush(&mut std::io::stdout());
 
@@ -329,4 +329,51 @@ mod tests {
         assert!(applied >= 2);
         assert_eq!(std::fs::read(target.join("later.txt")).unwrap(), b"later");
     }
+    // A source change is injected after local enumeration, while the first
+    // remote listing is being planned. The installed watcher must keep it.
+    struct ChangeDuringFirstPlan {
+        inner: NativeLocalFs,
+        source: std::path::PathBuf,
+        fired: std::sync::atomic::AtomicBool,
+    }
+    impl LocalFs for ChangeDuringFirstPlan {
+        fn list_roots(&self) -> Result<Vec<linscp_types::LocalRootEntry>, linscp_platform::PlatformError> { self.inner.list_roots() }
+        fn list_dir(&self, path: &str) -> Result<Vec<linscp_types::FileEntry>, linscp_platform::PlatformError> {
+            let snapshot = self.inner.list_dir(path)?;
+            if !self.fired.swap(true, Ordering::SeqCst) {
+                // Return the snapshot from before the change. Only a second
+                // pass can discover and transfer the new file.
+                std::fs::write(self.source.join("during.txt"), b"during").unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+            }
+            Ok(snapshot)
+        }
+        fn stat(&self, path: &str) -> Result<linscp_types::FileEntry, linscp_platform::PlatformError> { self.inner.stat(path) }
+        fn mkdir_all(&self, path: &str) -> Result<(), linscp_platform::PlatformError> { self.inner.mkdir_all(path) }
+        fn remove_file(&self, path: &str) -> Result<(), linscp_platform::PlatformError> { self.inner.remove_file(path) }
+        fn remove_dir_all(&self, path: &str) -> Result<(), linscp_platform::PlatformError> { self.inner.remove_dir_all(path) }
+        fn rename(&self, from: &str, to: &str) -> Result<(), linscp_platform::PlatformError> { self.inner.rename(from, to) }
+        fn read_bytes(&self, path: &str) -> Result<Vec<u8>, linscp_platform::PlatformError> { self.inner.read_bytes(path) }
+        fn write_bytes_atomic(&self, path: &str, data: &[u8]) -> Result<(), linscp_platform::PlatformError> { self.inner.write_bytes_atomic(path, data) }
+        fn set_mtime(&self, path: &str, mtime: i64) -> Result<(), linscp_platform::PlatformError> { self.inner.set_mtime(path, mtime) }
+        fn set_permissions_mode(&self, path: &str, mode: u32) -> Result<(), linscp_platform::PlatformError> { self.inner.set_permissions_mode(path, mode) }
+    }
+
+    #[tokio::test]
+    async fn changes_during_initial_sync_trigger_an_immediate_second_pass() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let target = tmp.path().join("target");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(source.join("first.txt"), b"first").unwrap();
+        let fs = Arc::new(ChangeDuringFirstPlan { inner: NativeLocalFs::new(), source: source.clone(), fired: AtomicBool::new(false) });
+        let session = LocalSyncSession::new(target.to_string_lossy().into_owned(), fs);
+        let opts = KeepUpToDateOptions { interval_ms: 30_000, max_passes: 2, install_signal_handlers: false, ..Default::default() };
+        let mut logger = SessionLogger::open(None, 0, false, None, None, false, "test").unwrap();
+        tokio::time::timeout(Duration::from_secs(6), run_keep_up_to_date(&session, &source, "/", None, &opts, &mut logger, |_| {}))
+            .await.expect("watcher did not wake before the polling interval").unwrap();
+        assert_eq!(std::fs::read(target.join("during.txt")).unwrap(), b"during");
+    }
+
 }

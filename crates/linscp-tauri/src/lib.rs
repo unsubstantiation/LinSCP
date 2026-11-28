@@ -21,6 +21,8 @@ pub struct TauriBridge {
     service: CommanderService,
     android: std::sync::Arc<android::AndroidState>,
     launch_urls: std::sync::Arc<std::sync::Mutex<std::collections::VecDeque<String>>>,
+    // Serialize peek, manifest publication and acknowledgement across windows.
+    share_handoff: std::sync::Arc<std::sync::Mutex<()>>,
 }
 
 impl Default for TauriBridge {
@@ -47,11 +49,12 @@ impl TauriBridge {
             service,
             android: std::sync::Arc::new(android::AndroidState::new()),
             launch_urls: Default::default(),
+            share_handoff: Default::default(),
         }
     }
 
     pub fn with_android_state(service: CommanderService, android: std::sync::Arc<android::AndroidState>) -> Self {
-        Self { service, android, launch_urls: Default::default() }
+        Self { service, android, launch_urls: Default::default(), share_handoff: Default::default() }
     }
 
     /// Bridge for a *windowed* host: the desktop app. A remote-desktop viewer
@@ -63,6 +66,7 @@ impl TauriBridge {
             service: service.with_desktop_spawn(true),
             android: std::sync::Arc::new(android::AndroidState::new()),
             launch_urls: Default::default(),
+            share_handoff: Default::default(),
         }
     }
 
@@ -79,6 +83,7 @@ impl TauriBridge {
             service: self.service.with_desktop_spawn(false),
             android: self.android,
             launch_urls: self.launch_urls,
+            share_handoff: self.share_handoff,
         }
     }
 
@@ -92,33 +97,50 @@ impl TauriBridge {
 
     /// Direct IPC entrypoint invoked by `TauriTransport` in `ui/src/transport/tauri.ts`.
     pub fn invoke(&self, envelope: ApiEnvelope) -> ApiReply {
-        self.stage_incoming_android_shares(&envelope);
+        if let Some(error) = self.stage_incoming_android_shares(&envelope) { return error; }
         self.service.dispatch(envelope)
     }
 
-    fn stage_incoming_android_shares(&self, envelope: &ApiEnvelope) {
-        if envelope.method.eq_ignore_ascii_case("GET")
-            && envelope.path.split('?').next() == Some("/api/shell/pending")
-        {
-            let Ok(_activity) = self.service.begin_config_activity() else { return; };
-            if let Ok(paths) = self.android_state().staged_share_paths() {
-                if !paths.is_empty() {
-                    let _ = linscp_service::ops::record_shell_upload_manifest(
-                        &self.service.config_root(), &paths,
-                    );
-                }
-            }
-        }
+    fn stage_incoming_android_shares(&self, envelope: &ApiEnvelope) -> Option<ApiReply> {
+        if !envelope.method.eq_ignore_ascii_case("GET")
+            || envelope.path.split('?').next() != Some("/api/shell/pending") { return None; }
+        let Ok(_activity) = self.service.begin_config_activity() else { return None; };
+        let result = (|| -> Result<(), String> {
+            let _lock = self.share_handoff.lock().map_err(|_| "Share hand-off lock failed".to_string())?;
+            let paths = self.android_state().staged_share_paths().map_err(|e| e.to_string())?;
+            publish_pending_shares(&paths, |path| {
+                linscp_service::ops::record_android_share_manifest(&self.service.config_root(), path)
+                    .map(|_| ())
+            }, |path| {
+                self.android_state().acknowledge_share_paths(&[path.to_path_buf()]).map_err(|e| e.to_string())
+            })
+        })();
+        result.err().map(|error| ApiReply { status: 500, payload: serde_json::json!({
+            "success": false, "error": format!("Cannot register shared files; retrying: {error}")
+        }) })
     }
 
     pub async fn invoke_async(&self, envelope: ApiEnvelope) -> ApiReply {
-        self.stage_incoming_android_shares(&envelope);
+        if let Some(error) = self.stage_incoming_android_shares(&envelope) { return error; }
         self.service.dispatch_async(envelope).await
     }
 
     pub fn android_state(&self) -> &std::sync::Arc<android::AndroidState> {
         &self.android
     }
+}
+
+// Kept separate so the failure/retry contract is testable without Android.
+fn publish_pending_shares(
+    pending: &[std::path::PathBuf],
+    mut publish: impl FnMut(&std::path::Path) -> Result<(), String>,
+    mut acknowledge: impl FnMut(&std::path::Path) -> Result<(), String>,
+) -> Result<(), String> {
+    for path in pending {
+        publish(path)?;
+        acknowledge(path)?;
+    }
+    Ok(())
 }
 
 #[cfg(feature = "native-shell")]
@@ -639,11 +661,12 @@ fn build_native_app_with_bridge(
     #[cfg(not(target_os = "android"))]
     let builder = builder.on_window_event(|window, event| {
         use tauri::{Emitter, WindowEvent};
-        if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, .. }) = event {
-            // The side is the pane the page last focused; the shell cannot
-            // know which pane is under the cursor, and the page can.
+        if let WindowEvent::DragDrop(tauri::DragDropEvent::Drop { paths, position }) = event {
+            // The webview converts the physical position to CSS pixels and
+            // identifies the pane under the cursor.
             let payload = serde_json::json!({
                 "paths": paths.iter().map(|path| path.to_string_lossy()).collect::<Vec<_>>(),
+                "position": { "x": position.x, "y": position.y },
             });
             let _ = window.emit("native:file-drop", payload);
         }
@@ -729,6 +752,22 @@ pub fn run() {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn shared_paths_are_acknowledged_only_after_publication() {
+        let pending = vec![std::path::PathBuf::from("staged-one"), std::path::PathBuf::from("staged-two")];
+        let mut acknowledged = Vec::new();
+        let result = publish_pending_shares(&pending,
+            |path| if path.ends_with("staged-two") { Err("disk full".into()) } else { Ok(()) },
+            |path| { acknowledged.push(path.to_path_buf()); Ok(()) });
+        assert!(result.is_err());
+        assert_eq!(acknowledged, pending[..1]);
+        let mut published = Vec::new();
+        publish_pending_shares(&pending[1..], |path| { published.push(path.to_path_buf()); Ok(()) },
+            |path| { acknowledged.push(path.to_path_buf()); Ok(()) }).unwrap();
+        assert_eq!(published, pending[1..]);
+        assert_eq!(acknowledged, pending);
+    }
 
     #[test]
     fn launch_url_queue_is_bounded_and_rejects_untrusted_schemes() {

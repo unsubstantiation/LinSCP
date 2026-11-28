@@ -1,8 +1,9 @@
 # Full application restore: crash-recovery transaction
 
 Full application restore is enabled in the GUI (`POST /api/backup/import`),
-the GUI-hosted console (`backup import <file>`), and the standalone script
-interpreter (`backup import <file>`). Every restore path executes the same
+and the GUI-hosted console (`backup import <file>`). The internal script
+interpreter supports the same command, but no standalone CLI is shipped. Full
+restore paths execute the same
 preflight-first, undo-journaled transaction in
 `crates/linscp-engine/src/backup.rs` backed by
 `crates/linscp-engine/src/restore_journal.rs`. Legacy non-transactional restore
@@ -76,8 +77,7 @@ and in-memory-only rollback paths have been removed.
   running GUI without racing configuration store renames.
 - **External writers and verification scope:** `ConfigDirectoryLock` is
   advisory; external editors or older binaries that do not honor `config.lock`
-  must not modify the configuration directory concurrently. Full CI Cargo test
-  execution on Linux, Windows (`windows-latest`), and Android targets remains
-  required alongside the local standalone journal/subprocess verification
-  binary because full offline Cargo crate dependencies are unavailable in this
-  audit sandbox.
+  must not modify the configuration directory concurrently. See the
+  [final parity review](final-parity-review.md) for subsequent CI evidence and
+  its platform and device limitations. Selective imports are not covered by
+  this full-restore transaction.

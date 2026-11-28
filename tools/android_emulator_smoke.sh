@@ -10,7 +10,7 @@ cleanup() {
   rm -f "${oversize_download_fixture:-}" "$log" "$ssh_log" "${app_root_file:-}" "${key_file:-}" "${sessions_file:-}" "${tampered:-}" "${observed:-}" "${portable_file:-}" "${source_key:-}" "${source_ssh_key:-}"
   rm -rf -- "$ssh_root" "$ssh_key_dir"
 }
-LSCP_TEST_PORT=0 python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
+LSCP_TEST_PORT=0 LSCP_TEST_DROP_DELETE=/android-partial/b.txt python3 source/linux/tests/TestDavServer.py >"$log" 2>&1 &
 server=$!
 trap cleanup EXIT
 for _ in $(seq 1 60); do
@@ -282,7 +282,22 @@ adb shell rm /sdcard/Documents/LinSCP-Ungranted-Smoke/cap-fixture/oversize.bin
 if [[ $(adb shell cat /sdcard/Documents/LinSCP-Ungranted-Smoke/marker.txt | tr -d '\r') != saf-edited ]]; then
   echo "SAF provider did not persist edited bytes" >&2; exit 1
 fi
+# A mixed valid/invalid URI was rejected after the first file opened. No
+# partial incoming staging file may survive that failure.
+adb shell run-as "$application" test -d cache/incoming-shares
+if adb shell run-as "$application" find cache/incoming-shares -type f | tr -d '\r' | grep -q .; then
+  echo "Rejected share left a staged file" >&2; exit 1
+fi
 restart_and_run saf-reopen
+# Force publication to fail without damaging any existing manifests, then
+# verify a real SEND survives the error and a process restart.
+adb shell run-as "$application" sh -c "'if [ -d config/shell-manifests ]; then mv config/shell-manifests config/shell-manifests-smoke-backup; fi; touch config/shell-manifests'"
+share_uri='content://com.android.externalstorage.documents/tree/primary%3ADocuments%2FLinSCP-Ungranted-Smoke/document/primary%3ADocuments%2FLinSCP-Ungranted-Smoke%2Fmarker.txt'
+adb shell am start -n "$application/.MainActivity" -a android.intent.action.SEND -t text/plain --eu android.intent.extra.STREAM "$share_uri"
+node tools/android_emulator_smoke.mjs "$port" "$application" "$app_root_file" share-fail
+adb shell am force-stop "$application"
+adb shell run-as "$application" sh -c "'rm config/shell-manifests; if [ -d config/shell-manifests-smoke-backup ]; then mv config/shell-manifests-smoke-backup config/shell-manifests; fi'"
+restart_and_run share-intent
 # Enroll only on this disposable emulator, then exercise the real system
 # BiometricPrompt and Keystore CryptoObject across a process restart.
 exercise_biometrics

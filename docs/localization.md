@@ -1,4 +1,4 @@
-# Linux localization
+# Localization
 
 ## Supported languages and coverage
 
@@ -6,29 +6,26 @@ English (`en`), Spanish (`es`), German (`de`) and French (`fr`) catalogs ship
 with the application, including whole help messages and plural variants. They
 are embedded at build time; there are no
 runtime downloads, gettext dependencies or installed OS locale requirements.
-A catalog walker reports interface strings still answered in English so a new
-message cannot slip through untranslated. The language selector is filled from
-the shipped catalogs.
+A catalog walker reports many strings still answered in English, but does not
+prove translation quality or discover every dynamically produced diagnostic.
+The native language selector uses the shipped catalogs.
 
 Translated surfaces:
 
 - Browser menus, toolbars, dialogs, help, ARIA labels, tooltips, placeholders,
   host-key verification, queue states and controls, synchronization summaries
   and reasons, search results, editor states and confirmation/error messages.
-- The whole command-line client: the per-command help texts, the status,
-  argument, switch and engine messages of the script engine, the operations
-  the error helpers name, the option listing, `-help` and option errors,
-  connection status, host-key warnings, client-side key passphrase prompts,
-  overwrite/delete confirmations and confirmation-answer hints.
+- The internal script engine has a separate catalog for help, status and
+  prompts. The retired standalone command-line executable is not shipped.
 - Browser plural forms and decimal/date presentation. CLI/protocol numbers
   remain locale independent.
 
 **This is not complete upstream language coverage.** Only English, Spanish,
 German and French are shipped, while upstream ships catalogs for many more
 languages.
-The inventory therefore retains `locale.translations` as **partial**, now for
-the missing languages alone: every message the client prints in this build
-goes through a catalog, and the compiler refuses a new one that does not.
+The inventory therefore retains `locale.translations` as **partial**: catalog
+and source checks do not prove that all runtime messages are translated or that
+translations are correct.
 Server-provided SSH challenges, protocol data, core/OS diagnostic details,
 command-console output and logs are deliberately retained verbatim. A browser
 operation failure is written into the Logs panel as a translated explanation
@@ -36,24 +33,13 @@ with the diagnostic detail, rather than popped up and lost;
 file contents, filenames, session names, paths, host-key fingerprints, command
 names and API enum values must never be translated.
 
-## CLI selection
+## Backend locale selection
 
-```sh
-LINSCP_LANGUAGE=es linscp -help
-LANG=de_DE.UTF-8 linscp -batch -command='nosuchcommand'
-```
-
-The first nonempty variable wins: `LINSCP_LANGUAGE`, `LC_ALL`, `LC_MESSAGES`,
-then `LANG`. An exact catalog is preferred; `es_MX.UTF-8` and `es_ES@formal`
-fall back to `es`, `de_AT.UTF-8` to `de` and `fr_CA.UTF-8` to `fr`. Unknown
-locales and `C`/`POSIX` use English. Selection changes
-messages only, not the process's numeric locale or protocol serialization.
-
-Confirmation hints are translated: `[S/n]`/`[s/N]` in Spanish, `[J/n]`/`[j/N]`
-in German and `[O/n]`/`[o/N]` in French. The client accepts the letter a hint shows for yes, in either case,
-and always `y`/`Y` for compatibility; any other answer is no. Noninteractive
-destructive actions still fail closed; translating a prompt does not authorize
-an action.
+The backend checks `LINSCP_LANGUAGE`, `LC_ALL`, `LC_MESSAGES`, then `LANG`.
+Supported region variants fall back to their language; unknown locales and
+`C`/`POSIX` fall back to English. The internal interpreter accepts each
+catalog's confirmation letter and `y`/`Y`; noninteractive destructive actions
+still fail closed. These settings do not imply a standalone CLI is shipped.
 
 ## Browser selection
 
@@ -63,17 +49,16 @@ storage. A change reloads only the page: backend sessions and queued transfers
 continue. Unsaved editor changes require confirmation before reloading.
 
 Without a saved preference, the served page uses the backend's locale selection
-(the same environment precedence as the CLI, resolved against the catalogs the
+(the backend environment precedence, resolved against the catalogs the
 page ships, so `de_DE.UTF-8` selects German). A standalone page without backend
 configuration chooses the first supported browser language, then English.
 Browser region tags such as `es-MX`, `de-AT` and `fr-CA` are supported. When storage is unavailable,
 the default still works; a preference change reports the storage failure rather
 than silently losing it.
 
-The GUI always runs its internal CLI subprocesses with
-`LINSCP_LANGUAGE=en`. The browser localizes their structured presentation
-separately. This is essential: language-dependent messages must not change the
-machine protocol, parsed sync plans, progress reports or error handling.
+The native GUI communicates with the in-process service rather than spawning
+an external CLI. Locale selection must not alter protocol data, paths or API
+enumerations.
 
 ## Catalog development
 
@@ -84,26 +69,13 @@ machine protocol, parsed sync plans, progress reports or error handling.
 2. Use named placeholders such as `{path}`. Preserve spelling and occurrence
    counts; translations may reorder them. Runtime values are substituted once
    and cannot become more placeholders or format directives.
-3. Use `Texts::Translate` for identified CLI messages; use `t` for dynamic
-   browser messages. Use `tn(one, other, count, values)` for singular/plural
-   forms; the page language's CLDR plural rule picks the form, so French
-   treats 0 as singular. Static page text and `title`, `aria-label` and
-   `placeholder` attributes are translated before startup. `code` and `kbd`
-   text and input values are not rewritten. Dynamic file/session data is
-   never walked or translated.
-   A message that the command-line client prints has to go through
-   `Texts::Translate`: the compiler rejects a `Console` call that prints a
-   plain literal (including `Confirm` and `ReadPassword` prompts and the
-   editor's `mConsole` calls), a command help text that nobody translated
-   and an error operation that is not in the catalog.
-   Switch names, enumerated values (`on|off`, `binary|ascii|automatic`),
-   command and option names, quoted commands such as `'option preset off'`
-   and protocol words (`LSCP-RESULT`, `SizeBytes`, `ModifiedEpoch`) stay
-   verbatim, because users type them and programs read them. Metavariables
-   such as `<file>` or `FILE` may be translated. The translation tests
-   enforce this, check that each catalog's `-help` lists every option and
-   command in the English order, and check that both confirmation hints
-   offer one consistent yes letter.
+3. Use `linscp-i18n` translation helpers for internal engine messages and `t`
+   for dynamic GUI messages. Use `tn(one, other, count, values)` for the GUI's
+   current singular/other forms. Static page text and relevant attributes are
+   translated before startup; runtime file/session data is not translated.
+   Command names, protocol values and placeholders must remain literal. The
+   catalog tests check known literals and placeholders, but they do not discover
+   every possible runtime string or establish translation quality.
 4. Run `python3 tools/update_translations.py` from the repository root. This
    validates both source catalog sets and regenerates the inline GUI catalog
    in `source/gui/web/index.html`, the unified `locales/*.json`, and the legacy
@@ -122,8 +94,10 @@ is escaped separately; ordinary translated text uses text nodes.
 
 Adding a language also requires reviewing plural rules (the browser's `tn`
 takes one singular and one plural form) and choosing the confirmation hint
-letters. The selector and the backend's locale selection are filled from the
-shipped catalogs, so a new catalog needs no code change. These Linux catalogs
+letters. The Rust backend explicitly embeds the supported catalog files in
+`crates/linscp-i18n/src/lib.rs`; adding a catalog also requires registering it
+there and testing selection. The current plural interface only models singular
+and other; languages with more categories need design and implementation work. These Linux catalogs
 are independent of upstream's Windows resource catalogs; they do not claim to
 reproduce all upstream translations.
 
@@ -167,3 +141,5 @@ available, but each updates only part of the generated output.
 
 The Makefile, CMake, relocatable installs and Debian packages all embed the same
 translations, so none of them needs catalog files at runtime.
+
+For the scope and prioritization of additional languages, see [remaining parity priorities](remaining-parity-priorities.md).

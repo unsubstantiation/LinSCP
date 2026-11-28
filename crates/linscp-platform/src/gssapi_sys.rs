@@ -527,6 +527,22 @@ mod windows_impl {
     const ISC_REQ_ALLOCATE_MEMORY: u32 = 0x0000_0100;
     const ISC_REQ_INTEGRITY: u32 = 0x0001_0000;
 
+    const ISC_RET_MUTUAL_AUTH: u32 = 0x0000_0002;
+
+    fn require_mutual_authentication(ctx_attrs: u32) -> Result<(), String> {
+        if ctx_attrs & ISC_RET_MUTUAL_AUTH == 0 {
+            return Err("SSPI mutual authentication was not established by the server.".to_string());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    #[test]
+    fn sspi_requires_negotiated_mutual_authentication() {
+        assert!(require_mutual_authentication(0).is_err());
+        assert!(require_mutual_authentication(ISC_RET_MUTUAL_AUTH).is_ok());
+    }
+
     const SEC_E_OK: SecurityStatus = 0;
     const SEC_I_CONTINUE_NEEDED: SecurityStatus = 0x0009_0312;
     const LOAD_LIBRARY_SEARCH_SYSTEM32: u32 = 0x0000_0800;
@@ -798,6 +814,9 @@ mod windows_impl {
                 ));
             }
             self.ctx = Some(new_ctx);
+            // A request flag is not proof the negotiated context has it.
+            // Do not send a MIC unless SSPI confirms mutual authentication.
+            require_mutual_authentication(ctx_attrs)?;
 
             // Compute RFC 4462 GSSAPI MIC using Kerberos SSPI `MakeSignature`.
             let mut data_copy = mic_data.to_vec();

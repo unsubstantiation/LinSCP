@@ -78,6 +78,9 @@ impl TransferPreset {
         if let Some(no) = self.newer_only {
             parts.push(format!("neweronly={}", if no { "on" } else { "off" }));
         }
+        if let Some(eol) = self.eol {
+            parts.push(format!("eol={}", eol.name()));
+        }
         if let Some(sp) = self.speed_kbytes_per_sec {
             parts.push(format!("speed={sp}"));
         }
@@ -125,6 +128,9 @@ impl TransferPreset {
     pub fn parse_setting(&mut self, raw_key: &str, raw_val: &str) -> Result<(), String> {
         let key = raw_key.trim().to_ascii_lowercase();
         let val = trim_quotes(raw_val.trim());
+        if val.chars().any(char::is_control) {
+            return Err(format!("Preset setting '{raw_key}' cannot contain control characters."));
+        }
         match key.as_str() {
             "transfer" | "transfermode" => {
                 self.transfer_mode = Some(match val.to_ascii_lowercase().as_str() {
@@ -264,10 +270,14 @@ impl TransferPresetStore {
                     ));
                 };
                 let name = trimmed[1..close].trim().to_string();
-                if name.is_empty() {
-                    return Err(format!(
-                        "The preset file '{path_label}' has an unnamed section."
-                    ));
+                if !is_valid_preset_name(&name) {
+                    return Err(format!("The preset file '{path_label}' has an unusable section name '{name}'."));
+                }
+                if store.presets.iter().any(|p| p.name.eq_ignore_ascii_case(&name)) {
+                    return Err(format!("The preset file '{path_label}' contains duplicate preset '{name}'."));
+                }
+                if !trimmed[close + 1..].trim().is_empty() {
+                    return Err(format!("The preset file '{path_label}' has trailing text after section '{name}'."));
                 }
                 current = Some(TransferPreset {
                     name,
@@ -381,6 +391,11 @@ impl TransferPresetStore {
         if !is_valid_preset_name(&preset.name) {
             return Err(format!("'{}' is not a usable preset name.", preset.name));
         }
+        if [&preset.host, &preset.username, &preset.remote_directory, &preset.local_directory, &preset.mask]
+            .iter().any(|value| value.chars().any(char::is_control))
+        {
+            return Err("Preset rules cannot contain control characters.".to_string());
+        }
         if let Some(existing) = self
             .presets
             .iter_mut()
@@ -422,6 +437,22 @@ impl TransferPresetStore {
         })
     }
 
+    /// Match a filename rule only when its session conditions also match.
+    /// Filename rules take precedence over session-only rules, in store order.
+    pub fn match_transfer(&self, host: &str, user: &str, remote_dir: &str, local_dir: &str, file_name: &str) -> Option<&TransferPreset> {
+        let session_matches = |p: &&TransferPreset| {
+            host_rule_matches(&p.host, host)
+                && field_matches(&p.username, user)
+                && field_matches(&p.remote_directory, remote_dir)
+                && field_matches(&p.local_directory, local_dir)
+        };
+        self.presets.iter().filter(session_matches).find(|p| {
+            p.has_mask_rule() && FileMask::parse(&p.mask)
+                .map(|m| m.accepts_name(file_name, false)).unwrap_or(false)
+        }).or_else(|| self.presets.iter().filter(session_matches)
+            .find(|p| p.has_session_rule() && !p.has_mask_rule()))
+    }
+
     pub fn match_mask(&self, file_name: &str) -> Option<&TransferPreset> {
         self.presets.iter().find(|p| {
             if !p.has_mask_rule() {
@@ -439,6 +470,8 @@ fn is_valid_preset_name(name: &str) -> bool {
     !t.is_empty()
         && !t.eq_ignore_ascii_case("off")
         && !t.eq_ignore_ascii_case("none")
+        && !t.eq_ignore_ascii_case("auto")
+        && !t.chars().any(char::is_control)
         && !t.contains('[')
         && !t.contains(']')
         && !t.contains('\n')
@@ -518,6 +551,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn transfer_matching_combines_rules_and_preserves_precedence() {
+        let store = TransferPresetStore::parse_ini(
+            "[wrong-host]\nhost=other.example\nmask=*.txt\n[rule]\nhost=prod.example\nuser=alice\nmask=*.txt\n[session]\nhost=prod.example\n", "mem").unwrap();
+        assert_eq!(store.match_transfer("prod.example", "alice", "/", "/", "a.txt").unwrap().name, "rule");
+        assert_eq!(store.match_transfer("prod.example", "bob", "/", "/", "a.txt").unwrap().name, "session");
+        assert_eq!(store.match_transfer("prod.example", "alice", "/", "/", "a.bin").unwrap().name, "session");
+        assert!(store.match_transfer("elsewhere", "alice", "/", "/", "a.txt").is_none());
+    }
+
+    #[test]
+    fn reserved_duplicate_and_injected_rules_are_refused() {
+        let mut store = TransferPresetStore::default();
+        assert!(store.add_or_update(TransferPreset { name: "AUTO".into(), ..Default::default() }).is_err());
+        assert!(store.add_or_update(TransferPreset { name: "valid".into(), host: "host\n[other]".into(), ..Default::default() }).is_err());
+        let mut preset = TransferPreset::default();
+        assert!(preset.parse_setting("host", "host\n[other]").is_err());
+        assert!(TransferPresetStore::parse_ini("[One]\n[one]\n", "mem").is_err());
+        assert!(TransferPresetStore::parse_ini("[Auto]\n", "mem").is_err());
+    }
+
+    #[test]
     fn preset_ini_roundtrips_and_matches_host_and_mask() {
         let mut p = TransferPreset {
             name: "logs".to_string(),
@@ -525,6 +579,8 @@ mod tests {
         };
         p.parse_setting("transfer", "ascii").unwrap();
         p.parse_setting("preservetime", "all").unwrap();
+        p.parse_setting("eol", "crlf").unwrap();
+        assert!(p.describe().contains("eol=crlf"));
         p.parse_setting("resumesupport", "64").unwrap();
         p.parse_setting("host", ".example.com").unwrap();
         p.parse_setting("mask", "*.log").unwrap();

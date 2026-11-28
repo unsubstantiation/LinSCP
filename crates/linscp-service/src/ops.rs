@@ -3,7 +3,7 @@
 //! checksum, `copyid`, cleanup, and shell-upload manifest operations for `CommanderService`.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use linscp_crypto::digests::{crc32_hex, md5_hex, sha1_hex, sha256_hex};
@@ -125,6 +125,48 @@ pub fn encode_editor_text(
         enc,
         include_bom.unwrap_or(false),
     )
+}
+
+/// Bound the destination as bytes arrive, not only by untrusted stat metadata.
+struct BoundedDownload {
+    bytes: Vec<u8>,
+    limit: usize,
+    exceeded: bool,
+}
+
+impl tokio::io::AsyncWrite for BoundedDownload {
+    fn poll_write(mut self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>, data: &[u8]) -> std::task::Poll<std::io::Result<usize>> {
+        if data.len() > self.limit.saturating_sub(self.bytes.len()) {
+            self.exceeded = true;
+            return std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "remote file exceeds the download limit")));
+        }
+        self.bytes.extend_from_slice(data);
+        std::task::Poll::Ready(Ok(data.len()))
+    }
+    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+    fn poll_shutdown(self: std::pin::Pin<&mut Self>, _cx: &mut std::task::Context<'_>) -> std::task::Poll<std::io::Result<()>> { std::task::Poll::Ready(Ok(())) }
+}
+
+async fn download_bounded_counted(session: &dyn RemoteSession, path: &str, limit: usize) -> (Result<Vec<u8>, String>, usize) {
+    let mut sink = BoundedDownload { bytes: Vec::new(), limit, exceeded: false };
+    let result = session.download(path, TransferRequest::default(), &mut sink, None).await;
+    // An oversized write can be larger than the bytes retained in the sink.
+    // Charge the full permitted amount to the search budget in that case.
+    let consumed = if sink.exceeded { limit } else { sink.bytes.len() };
+    if sink.exceeded { return (Err(format!("Remote file exceeds the {limit}-byte download limit.")), consumed); }
+    match result {
+        Ok(_) => (Ok(sink.bytes), consumed),
+        Err(error) => (Err(error.to_string()), consumed),
+    }
+}
+
+pub async fn download_bounded(session: &dyn RemoteSession, path: &str, limit: usize) -> Result<Vec<u8>, String> {
+    download_bounded_counted(session, path, limit).await.0
+}
+
+fn safe_search_entry_name(name: &str) -> bool {
+    !name.is_empty() && name != "." && name != ".."
+        && !name.contains(['/', '\\']) && !name.chars().any(char::is_control)
 }
 
 /// Reads a text file locally for the Commander editor, enforcing `MAX_GUI_EDIT_BYTES`
@@ -426,12 +468,7 @@ pub async fn read_remote_text_file(
     }
     let edit_tmp = config_root.join("edit-tmp");
     create_private_dir(&edit_tmp).map_err(|e| e.to_string())?;
-    let bytes = download_bytes(session, remote_path, TransferRequest::default())
-        .await
-        .map_err(|e| e.to_string())?;
-    if bytes.len() as u64 > MAX_GUI_EDIT_BYTES {
-        return Err("Remote file is too large for the built-in editor.".to_string());
-    }
+    let bytes = download_bounded(session, remote_path, MAX_GUI_EDIT_BYTES as usize).await?;
     if bytes.contains(&0) {
         return Err("Refusing to edit binary file containing NUL bytes.".to_string());
     }
@@ -644,6 +681,10 @@ async fn search_remote_walk(
         if entry.name == "." || entry.name == ".." {
             continue;
         }
+        if !safe_search_entry_name(&entry.name) {
+            stats.skipped += 1;
+            continue;
+        }
         if stats.matches.len() >= limit {
             stats.truncated = true;
             return Ok(());
@@ -712,13 +753,15 @@ async fn search_remote_walk(
                 stats.truncated = true;
                 return Ok(());
             }
-            let Ok(bytes) = download_bytes(session, &full_path, TransferRequest::default()).await
-            else {
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            stats.scanned += 1;
+            let (result, consumed) = download_bounded_counted(session, &full_path, remaining as usize).await;
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add(consumed as u64);
+            let Ok(bytes) = result else {
                 stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
                 continue;
             };
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
@@ -896,12 +939,20 @@ fn search_local_walk(
                 stats.truncated = true;
                 return Ok(());
             }
-            let Ok(bytes) = std::fs::read(&path) else {
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            stats.scanned += 1;
+            let Ok(file) = std::fs::File::open(&path) else {
                 stats.skipped += 1;
                 continue;
             };
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
+            let mut bytes = Vec::new();
+            let read_result = file.take(remaining + 1).read_to_end(&mut bytes);
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add((bytes.len() as u64).min(remaining));
+            if read_result.is_err() || bytes.len() as u64 > remaining {
+                stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
+                continue;
+            }
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
@@ -999,6 +1050,10 @@ fn search_saf_walk(
         if entry.name == "." || entry.name == ".." {
             continue;
         }
+        if !safe_search_entry_name(&entry.name) {
+            stats.skipped += 1;
+            continue;
+        }
         if stats.matches.len() >= limit {
             stats.truncated = true;
             return Ok(());
@@ -1071,16 +1126,20 @@ fn search_saf_walk(
                 stats.truncated = true;
                 return Ok(());
             }
+            let remaining = MAX_SEARCH_TOTAL_BYTES.saturating_sub(stats.bytes_scanned).min(MAX_SEARCH_FILE_BYTES);
+            stats.scanned += 1;
             let Ok(bytes) = fs.read_bytes(&full_uri) else {
                 stats.skipped += 1;
                 continue;
             };
-            if bytes.len() as u64 > MAX_SEARCH_FILE_BYTES {
+            // The bridge reads a whole document (and has its own larger cap).
+            // Charge oversized or underreported documents to the search budget.
+            stats.bytes_scanned = stats.bytes_scanned.saturating_add((bytes.len() as u64).min(remaining));
+            if bytes.len() as u64 > remaining {
                 stats.skipped += 1;
+                if stats.bytes_scanned >= MAX_SEARCH_TOTAL_BYTES { stats.truncated = true; return Ok(()); }
                 continue;
             }
-            stats.scanned += 1;
-            stats.bytes_scanned = stats.bytes_scanned.saturating_add(bytes.len() as u64);
             let Ok((text, _, _, _)) = decode_editor_bytes(&bytes, encoding) else {
                 stats.skipped += 1;
                 continue;
@@ -1948,6 +2007,29 @@ pub fn record_shell_upload_manifest(
     config_root: &Path,
     paths: &[PathBuf],
 ) -> Result<Value, String> {
+    let mut rnd = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut rnd);
+    let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    record_shell_upload_manifest_with_id(config_root, paths, &id)
+}
+
+/// Idempotent publication for one Android staged file. Its random staging path
+/// identifies the hand-off across a retry or process restart.
+pub fn record_android_share_manifest(config_root: &Path, path: &Path) -> Result<Value, String> {
+    let id = format!("android-{}", sha256_hex(path.to_string_lossy().as_bytes()));
+    let manifest = config_root.join("shell-manifests").join(format!("{id}.json"));
+    if manifest.exists() {
+        let existing = read_shell_manifest_file(&manifest)?;
+        let matches = existing.get("id").and_then(Value::as_str) == Some(id.as_str())
+            && existing.get("items").and_then(Value::as_array).is_some_and(|items| {
+                items.len() == 1 && items[0].get("path").and_then(Value::as_str) == path.to_str()
+            });
+        return if matches { Ok(existing) } else { Err("Conflicting Android share manifest".into()) };
+    }
+    record_shell_upload_manifest_with_id(config_root, &[path.to_path_buf()], &id)
+}
+
+fn record_shell_upload_manifest_with_id(config_root: &Path, paths: &[PathBuf], id: &str) -> Result<Value, String> {
     if paths.is_empty() {
         return Err("Provide at least one local file or folder to stage for upload.".to_string());
     }
@@ -1978,9 +2060,6 @@ pub fn record_shell_upload_manifest(
 
     let manifests_dir = config_root.join("shell-manifests");
     create_private_dir(&manifests_dir).map_err(|e| e.to_string())?;
-    let mut rnd = [0u8; 8];
-    rand::thread_rng().fill_bytes(&mut rnd);
-    let id = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -2033,9 +2112,25 @@ pub fn take_shell_manifest(config_root: &Path, id: &str) -> Result<Value, String
     let path = config_root
         .join("shell-manifests")
         .join(format!("{safe_id}.json"));
-    let val = read_shell_manifest_file(&path)
+    // Claim by renaming first. On Windows multiple DeleteFile calls may
+    // succeed while deletion is pending, so unlink-after-read is not a claim.
+    // A unique same-directory name makes only one rename succeed.
+    let mut rnd = [0u8; 16];
+    rand::thread_rng().fill_bytes(&mut rnd);
+    let suffix = rnd.iter().map(|b| format!("{b:02x}")).collect::<String>();
+    let claimed = path.with_file_name(format!(".claim-{safe_id}-{suffix}"));
+    std::fs::rename(&path, &claimed)
         .map_err(|_| format!("Pending shell upload '{safe_id}' is no longer available."))?;
-    let _ = std::fs::remove_file(&path);
+    let val = match read_shell_manifest_file(&claimed) {
+        Ok(val) => val,
+        Err(error) => {
+            if let Err(restore) = std::fs::rename(&claimed, &path) {
+                return Err(format!("Cannot read claimed shell upload: {error}; cannot restore it: {restore}"));
+            }
+            return Err(format!("Cannot read pending shell upload: {error}"));
+        }
+    };
+    std::fs::remove_file(&claimed).map_err(|e| format!("Cannot finish claiming shell upload: {e}"))?;
     Ok(val)
 }
 
@@ -2056,6 +2151,44 @@ mod tests {
     use linscp_engine::script::{ScriptInterpreter, ScriptRunConfig};
     use linscp_engine::xml_log::SessionLogger;
     use serde_json::json;
+
+    #[test]
+    fn shell_manifest_has_at_most_one_successful_consumer() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("shared.txt");
+        std::fs::write(&file, b"test").unwrap();
+        let doc = record_shell_upload_manifest(root.path(), &[file]).unwrap();
+        let id = doc["id"].as_str().unwrap().to_string();
+        let barrier = std::sync::Barrier::new(8);
+        let results = std::thread::scope(|scope| {
+            let mut threads = Vec::new();
+            for _ in 0..8 {
+                let root = root.path();
+                let id = &id;
+                let barrier = &barrier;
+                threads.push(scope.spawn(move || { barrier.wait(); take_shell_manifest(root, id).is_ok() }));
+            }
+            threads.into_iter().map(|thread| thread.join().unwrap()).filter(|ok| *ok).count()
+        });
+        assert_eq!(results, 1);
+    }
+
+    #[test]
+    fn android_share_manifest_is_idempotent_and_rejects_collision() {
+        let root = tempfile::tempdir().unwrap();
+        let staged = root.path().join("staged.txt");
+        std::fs::write(&staged, b"shared").unwrap();
+        let first = record_android_share_manifest(root.path(), &staged).unwrap();
+        let second = record_android_share_manifest(root.path(), &staged).unwrap();
+        assert_eq!(first, second);
+        assert_eq!(list_shell_manifests(root.path()).len(), 1);
+        let id = first["id"].as_str().unwrap();
+        let manifest = root.path().join("shell-manifests").join(format!("{id}.json"));
+        let mut altered = first.clone();
+        altered["items"][0]["path"] = json!("different");
+        std::fs::write(&manifest, serde_json::to_vec(&altered).unwrap()).unwrap();
+        assert!(record_android_share_manifest(root.path(), &staged).is_err());
+    }
 
     fn tab(is_local: bool) -> TabRuntime {
         TabRuntime {

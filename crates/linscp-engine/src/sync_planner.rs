@@ -450,15 +450,14 @@ fn collect_local_tree_fs(
     let mut children = fs.list_dir(root_uri).map_err(|e| format!("Cannot read local directory '{root_uri}': {e}"))?;
     children.sort_by(|a, b| a.name.cmp(&b.name));
     for child in children {
-        if child.name == "."
-            || child.name == ".."
-            || child.name.ends_with(".filepart")
-            || child.name.contains(".filepart.v")
-        {
+        if child.name == "." || child.name == ".." {
             continue;
         }
-        if child.name.contains('/') {
+        if !valid_sync_entry_name(&child.name) {
             return Err("Invalid directory entry name.".to_string());
+        }
+        if child.name.ends_with(".filepart") || child.name.contains(".filepart.v") {
+            continue;
         }
         if child.is_symlink {
             mark_ancestor_retained(retained_dirs, rel_prefix);
@@ -513,8 +512,12 @@ fn collect_local_tree(
         .map_err(|e| format!("Cannot read local directory '{}': {e}", root.display()))?;
     for item in rd {
         let de = item.map_err(|e| format!("Local directory read failed: {e}"))?;
-        let name = de.file_name().to_string_lossy().into_owned();
-        if name == "." || name == ".." || name.ends_with(".filepart") || name.contains(".filepart.v")
+        let name = de.file_name().into_string()
+            .map_err(|_| format!("Cannot synchronize a non-UTF-8 name in '{}'.", root.display()))?;
+        if !valid_sync_entry_name(&name) {
+            return Err(format!("Invalid local directory entry name in '{}'.", root.display()));
+        }
+        if name.ends_with(".filepart") || name.contains(".filepart.v")
         {
             continue;
         }
@@ -553,6 +556,27 @@ fn collect_local_tree(
     Ok(())
 }
 
+// Server/provider listings are untrusted path components, not relative paths.
+// Never let them escape the selected roots or be interpreted as separators on
+// another platform. Preserve ordinary whitespace in valid names.
+fn valid_sync_entry_name(name: &str) -> bool {
+    if crate::transfer::safe_tree_name(name).is_err() { return false; }
+    linscp_platform::is_sync_filename_supported(name)
+}
+
+fn reject_case_aliases<'a>(paths: impl Iterator<Item = &'a String>) -> Result<(), String> {
+    let mut seen = BTreeMap::<String, &str>::new();
+    for path in paths {
+        let key = path.to_lowercase();
+        if let Some(previous) = seen.insert(key, path.as_str()) {
+            if previous != path.as_str() {
+                return Err(format!("Synchronization paths differ only by case: '{previous}' and '{path}'."));
+            }
+        }
+    }
+    Ok(())
+}
+
 async fn collect_remote_tree(
     session: &dyn RemoteSession,
     root: &str,
@@ -567,11 +591,13 @@ async fn collect_remote_tree(
         .await
         .map_err(|e| format!("Cannot list remote directory '{root}': {e}"))?;
     for entry in entries {
-        if entry.name == "."
-            || entry.name == ".."
-            || entry.name.ends_with(".filepart")
-            || entry.name.contains(".filepart.v")
-        {
+        if entry.name == "." || entry.name == ".." {
+            continue;
+        }
+        if !valid_sync_entry_name(&entry.name) {
+            return Err("Invalid remote directory entry name.".to_string());
+        }
+        if entry.name.ends_with(".filepart") || entry.name.contains(".filepart.v") {
             continue;
         }
         if entry.is_symlink {
@@ -694,6 +720,13 @@ pub async fn plan_synchronization(
         &mut remote_retained,
     )
     .await?;
+
+    // Windows paths are normally case-insensitive. Do not turn two distinct
+    // remote spellings (or differing local/remote spellings) into destructive
+    // independent actions against the same local file.
+    if linscp_platform::sync_paths_case_insensitive() {
+        reject_case_aliases(local_map.keys().chain(remote_map.keys()))?;
+    }
 
     let mut all_paths = BTreeSet::new();
     all_paths.extend(local_map.keys().cloned());
@@ -1693,6 +1726,38 @@ impl RemoteSession for LocalSyncSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unsafe_sync_entry_names_are_refused() {
+        for name in ["", ".", "..", "../x.filepart", "a/b", "a\\b", "x:y", "bad\nname"] {
+            assert!(!valid_sync_entry_name(name), "accepted {name:?}");
+        }
+        assert!(valid_sync_entry_name("normal file.txt"));
+        #[cfg(windows)]
+        for name in ["CON", "con.txt", "AUX.txt", "LPT1.txt", "COM9", "COM¹.txt", "LPT³", "trailing.", "trailing ", "a?b"] {
+            assert!(!valid_sync_entry_name(name), "accepted {name:?}");
+        }
+    }
+
+    #[test]
+    fn case_alias_check_refuses_colliding_paths() {
+        let same = vec!["folder/File.txt".to_string(), "folder/File.txt".to_string()];
+        assert!(reject_case_aliases(same.iter()).is_ok());
+        let collision = vec!["folder/File.txt".to_string(), "folder/file.txt".to_string()];
+        assert!(reject_case_aliases(collision.iter()).unwrap_err().contains("differ only by case"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn invalid_utf8_local_names_are_not_lossily_synchronized() {
+        use std::os::unix::ffi::OsStringExt;
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join(std::ffi::OsString::from_vec(vec![0xff])), b"data").unwrap();
+        let mut entries = BTreeMap::new();
+        let mut retained = BTreeSet::new();
+        let error = collect_local_tree(tmp.path(), "", true, &FileMask::default(), &mut entries, &mut retained).unwrap_err();
+        assert!(error.contains("non-UTF-8"), "{error}");
+    }
 
     #[test]
     fn corrupt_sync_state_is_not_an_empty_baseline() {

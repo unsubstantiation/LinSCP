@@ -14,7 +14,7 @@ const application = process.argv[3];
 // compare it with the directory the device reports for the installed package.
 const rootFile = process.argv[4];
 const phase = process.argv[5] || 'initial';
-assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
+assert.ok(['initial', 'reopen-vault', 'tampered-key', 'tampered-sessions', 'backup-restore', 'portable-export', 'portable-setup', 'portable-import', 'portable-reopen', 'damaged-journal', 'saf-pick-start', 'saf-pick-finish', 'saf-reopen', 'share-fail', 'share-intent', 'bio-setup', 'bio-enroll-start', 'bio-enroll-finish', 'bio-unlock-start', 'bio-wrong-check', 'bio-unlock-finish', 'bio-invalidated'].includes(phase), 'unknown smoke phase');
 assert.ok(application && application.includes('.'), 'the harness must pass the application ID');
 const portableFile = process.argv[6];
 if (phase.startsWith('portable-')) assert.ok(portableFile, 'portable backup phase requires a private host file');
@@ -277,6 +277,12 @@ const expression = `
     const expected = phase === 'saf-pick-finish' ? 'saf-original' : 'saf-edited';
     if (before.content !== expected) throw new Error('Unexpected provider bytes');
     if (phase === 'saf-pick-finish') {
+      // A later invalid URI must roll back the first staged provider file.
+      const document = tree + '/document/' + encodeURIComponent('primary:Documents/LinSCP-Ungranted-Smoke/marker.txt');
+      let refusal = '';
+      try { await window.__TAURI_INTERNALS__.invoke('linscp_handle_share_intent', {uris: [document, 'file:///not-a-content-uri']}); }
+      catch (error) { refusal = String(error); }
+      if (!refusal.includes('only content URIs')) throw new Error('Mixed share did not reach the invalid second URI: ' + refusal);
       const stale = String(BigInt(before.info.mtime) * 1000000000n - 1n);
       let rejected;
       try { await invoke('POST', '/api/local/save', {tab, path: 'marker.txt', content: 'stale write', base_mtime_ns: stale}); }
@@ -373,10 +379,33 @@ const expression = `
     if (moved.content !== 'move into SAF') throw new Error('SAF move bytes differ');
     const listing = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/'));
     if (listing.entries?.some(entry => entry.name === 'saf-move.txt')) throw new Error('WebDAV move did not delete its source');
+    await verifyAndroidRemoteEditingAndInterruptedDelete(tab);
     await verifyAndroidGrantedSafSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafNestedSync(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafTreeTransfers(tree, localTab, root, tab, runTask);
     await verifyAndroidGrantedSafDocumentCap(tree, root, tab);
+  }
+  async function verifyAndroidRemoteEditingAndInterruptedDelete(tab) {
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-encoding'});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'café\\r\\n', encoding: 'windows-1252', eol: 'crlf'});
+    let refused = false;
+    try { await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt')); }
+    catch (error) { refused = error.status === 400; }
+    if (!refused) throw new Error('Non-UTF-8 remote file opened as UTF-8');
+    const edit = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
+    if (edit.content !== 'café\\r\\n' || edit.info.encoding !== 'windows-1252') throw new Error('Remote legacy text decoded incorrectly');
+    const search = await invoke('POST', '/api/remote/search', {tab, path: '/android-encoding', pattern: '*.txt', search_contents: true, content_query: 'café', encoding: 'windows-1252'});
+    if (search.matches?.length !== 1 || search.matches[0].name !== 'legacy.txt') throw new Error('Remote legacy text search failed: ' + JSON.stringify(search));
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-encoding/legacy.txt', content: 'naïve\\n', encoding: 'windows-1252', eol: 'crlf', base_mtime: edit.info.mtime});
+    const saved = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/android-encoding/legacy.txt') + '&encoding=windows-1252');
+    if (saved.content !== 'naïve\\r\\n') throw new Error('Remote legacy text save failed');
+    await invoke('POST', '/api/remote/mkdir', {tab, remote_dir: '/', name: 'android-partial'});
+    for (const name of ['a.txt', 'b.txt']) await invoke('POST', '/api/remote/save', {tab, path: '/android-partial/' + name, content: name});
+    await invoke('POST', '/api/remote/save', {tab, path: '/android-other.txt', content: 'other'});
+    const result = await invoke('POST', '/api/remote/delete', {tab, names: ['android-other.txt', 'android-partial']});
+    if (result.deleted?.join(',') !== 'android-other.txt' || result.failed?.[0]?.name !== 'android-partial' || !/partially deleted/.test(result.failed[0].error)) throw new Error('Interrupted remote delete was not reported: ' + JSON.stringify(result));
+    const remaining = await invoke('GET', '/api/remote/list?tab=' + tab + '&path=' + encodeURIComponent('/android-partial'));
+    if (remaining.entries?.some(entry => entry.name === 'a.txt') || !remaining.entries?.some(entry => entry.name === 'b.txt')) throw new Error('Interrupted delete did not leave expected partial tree');
   }
   async function verifyAndroidGrantedSafDocumentCap(tree, root, tab) {
     const dir = tree + '/document/cap-fixture';
@@ -621,6 +650,39 @@ const expression = `
     await runTask('/api/transfer/keepuptodate', {...sync, count: 1});
     const watched = await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent(remoteDir + '/watch.txt'));
     if (watched.content !== 'watched provider file') throw new Error('SAF keep-up-to-date missed the file');
+  }
+  if (${JSON.stringify(phase)} === 'share-fail') {
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    let refused = false;
+    for (let i = 0; i < 30 && !refused; i++) {
+      try { await invoke('GET', '/api/shell/pending'); }
+      catch (error) { refused = error.status === 500; }
+      if (!refused) await sleep(1000);
+    }
+    if (!refused) throw new Error('Blocked manifest publication did not report an error');
+    // A second poll must retry the same failed publication, not forget it.
+    let retried = false;
+    try { await invoke('GET', '/api/shell/pending'); }
+    catch (error) { retried = error.status === 500; }
+    if (!retried) throw new Error('Failed publication was not retried');
+    return {root, failedShareRetained: true};
+  }
+  if (${JSON.stringify(phase)} === 'share-intent') {
+    const root = (await invoke('GET', '/api/status')).local_dir;
+    let offer;
+    for (let i = 0; i < 30 && !offer; i++) {
+      const pending = await invoke('GET', '/api/shell/pending');
+      offer = pending.pending?.find(item => item.items?.some(file => file.name === 'marker.txt'));
+      if (!offer) await sleep(1000);
+    }
+    if (!offer) throw new Error('Android SEND intent did not produce a pending manifest');
+    const item = offer.items.find(file => file.name === 'marker.txt');
+    const parent = item.path.slice(0, item.path.lastIndexOf('/'));
+    const local = await invoke('POST', '/api/tabs/local', {local_dir: parent, remote_dir: root});
+    const read = await invoke('GET', '/api/local/edit?tab=' + local.tab.id + '&path=' + encodeURIComponent(item.name));
+    if (read.content !== 'saf-edited') throw new Error('Shared document contents differ');
+    await invoke('POST', '/api/shell/dismiss', {id: offer.id});
+    return {root, incomingShareIntent: true};
   }
   if (['saf-pick-start', 'saf-pick-finish', 'saf-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidGrantedSafEditing();
   if (['portable-export', 'portable-setup', 'portable-import', 'portable-reopen'].includes(${JSON.stringify(phase)})) return await verifyAndroidBackupAcrossVaults();
@@ -892,6 +954,30 @@ const expression = `
     try { await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['excluded.preset-bin'], preset: 'android-text-only'}); }
     catch (error) { refused = error.status === 400; }
     if (!refused) throw new Error('Deleted explicit preset silently fell back to defaults');
+
+    // Each member of a mixed selection must choose its own matching preset.
+    // A matching filename alone must not bypass an incompatible host rule.
+    await invoke('POST', '/api/presets/save', {name: 'android-wrong-host', host: 'wrong.invalid', mask: '*.auto-txt', transfer: 'ascii'});
+    await invoke('POST', '/api/presets/save', {name: 'android-auto-text', host: '127.0.0.1', mask: '*.auto-txt', transfer: 'binary'});
+    await invoke('POST', '/api/presets/save', {name: 'android-auto-binary', host: '127.0.0.1', mask: '*.auto-bin', transfer: 'binary'});
+    await invoke('POST', '/api/local/save', {path: root + '/one.auto-txt', content: 'text auto'});
+    await invoke('POST', '/api/local/save', {path: root + '/two.auto-bin', content: 'binary auto'});
+    const matched = await invoke('GET', '/api/presets?tab=' + tab + '&filename=' + encodeURIComponent('one.auto-txt'));
+    if (matched.matched !== 'android-auto-text') throw new Error('Automatic preset ignored session rule: ' + JSON.stringify(matched));
+    const oldTasks = new Set((await invoke('GET', '/api/transfers')).transfers.map(task => task.id));
+    await invoke('POST', '/api/transfer/upload', {tab, local_dir: root, remote_dir: '/', names: ['one.auto-txt', 'two.auto-bin']});
+    let mixedDone = false;
+    for (let i = 0; i < 120; i++) {
+      const tasks = (await invoke('GET', '/api/transfers')).transfers.filter(item => !oldTasks.has(item.id));
+      if (tasks.some(item => item.status === 'Failed' || item.status === 'Cancelled')) throw new Error('Automatic preset transfer failed: ' + JSON.stringify(tasks));
+      if (tasks.length === 2 && tasks.every(item => item.status === 'Completed')) { mixedDone = true; break; }
+      await sleep(250);
+    }
+    if (!mixedDone) throw new Error('Mixed automatic presets did not queue and finish both files');
+    for (const [name, content] of [['one.auto-txt', 'text auto'], ['two.auto-bin', 'binary auto']]) {
+      if ((await invoke('GET', '/api/remote/edit?tab=' + tab + '&path=' + encodeURIComponent('/' + name))).content !== content) throw new Error('Automatic preset transfer differs: ' + name);
+    }
+    for (const name of ['android-wrong-host', 'android-auto-text', 'android-auto-binary']) await invoke('POST', '/api/presets/delete', {name});
   }
   await verifyAndroidTransferPreset();
   const vault = await invoke('GET', '/api/vault/status');

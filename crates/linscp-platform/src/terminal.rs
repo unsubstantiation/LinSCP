@@ -1104,6 +1104,12 @@ pub fn spawn_proxy_command_stream(
     host: &str,
     port: u16,
 ) -> Result<Box<dyn AsyncStream>, PlatformError> {
+    // The template is intentionally a shell command, but its host substitution
+    // is untrusted session data. Do not let it become shell syntax on either
+    // Unix or Windows, even if the template author omitted quoting.
+    if host.is_empty() || !host.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')) {
+        return Err(PlatformError::Io(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Proxy command destination contains unsafe characters.")));
+    }
     let port_str = port.to_string();
     let expanded = command_template
         .replace("%host", host)
@@ -1142,4 +1148,14 @@ pub fn spawn_proxy_command_stream(
         stdout,
         stdin,
     }))
+}
+
+#[cfg(test)]
+mod proxy_command_security_tests {
+    #[test]
+    fn rejects_shell_metacharacters_in_proxy_destination() {
+        for host in ["example.test;touch-owned", "$(id)", "host&whoami", "host%PATH%", "bad host", "host\nnext"] {
+            assert!(super::spawn_proxy_command_stream("proxy %host %port", host, 22).is_err(), "{host}");
+        }
+    }
 }

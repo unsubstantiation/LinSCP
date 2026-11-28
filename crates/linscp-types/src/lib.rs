@@ -290,6 +290,9 @@ pub struct UserPreferences {
     /// Empty selects site/rule matching; "off" disables presets.
     #[serde(default)]
     pub preset: String,
+    /// Explicit manual overrides; absent in preferences written before this field existed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_overrides: Option<Vec<String>>,
     pub transfer: TransferMode,
     pub filemask: String,
     pub speed: u32,
@@ -323,6 +326,7 @@ impl Default for UserPreferences {
     fn default() -> Self {
         Self {
             preset: String::new(),
+            preset_overrides: None,
             transfer: TransferMode::Binary,
             filemask: String::new(),
             speed: 0,

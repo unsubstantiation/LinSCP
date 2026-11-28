@@ -151,7 +151,7 @@ async fn ordinary_ftp_resume_checks_prefix_and_keeps_control_connection_usable()
     std::fs::write(&stage, &payload[..100_000]).unwrap();
     assert!(download_single_file(&ftp, "/dest.txt", None, &destination, &flags, &mut logger, None).await.unwrap());
     assert_eq!(std::fs::read(&destination).unwrap(), payload);
-    assert!(!stage.exists());
+    assert_eq!(std::fs::read(&stage).unwrap(), payload[..100_000]);
     ftp.close().await.unwrap();
     server.await.unwrap();
 }

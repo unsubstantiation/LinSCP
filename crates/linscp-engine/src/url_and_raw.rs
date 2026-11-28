@@ -1550,8 +1550,9 @@ fn parse_tls_version_bound(val: &str) -> Result<TlsVersion, String> {
 
 fn host_bypassed_by_proxy(host: &str, proxy_localhost: bool, exclude_list: &str) -> bool {
     let h = host.trim().to_ascii_lowercase();
-    let is_loopback = matches!(h.as_str(), "localhost" | "127.0.0.1" | "::1")
-        || h.starts_with("127.");
+    let bare = h.strip_prefix('[').and_then(|s| s.strip_suffix(']')).unwrap_or(&h);
+    let is_loopback = bare == "localhost"
+        || bare.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback());
     if is_loopback && !proxy_localhost {
         return true;
     }
@@ -1723,7 +1724,13 @@ fn build_proxy_config(spec: &ParsedSiteSpec) -> Result<Option<ProxyConfig>, Stri
         .get("proxy_exclude")
         .map(String::as_str)
         .unwrap_or("");
-    if host_bypassed_by_proxy(&spec.session.host, proxy_localhost, exclude) {
+    // The proxy connects to the jump host, not the ultimate destination.
+    // Bypassing because the latter is local could otherwise expose the bastion
+    // connection directly even when no rule excludes it.
+    let network_host = spec.session.tunnel.as_ref()
+        .filter(|t| t.enabled && !t.host.is_empty())
+        .map_or(spec.session.host.as_str(), |t| t.host.as_str());
+    if host_bypassed_by_proxy(network_host, proxy_localhost, exclude) {
         return Ok(None);
     }
 
@@ -3011,6 +3018,24 @@ mod tests {
         assert_eq!(parse_site_url("x2go://alice@example.com/").unwrap().session.protocol, ProtocolScheme::X2Go);
         assert!(parse_site_url("nx://alice@example.com/").is_err());
         assert!(parse_site_url("nx3://alice@example.com/").is_err());
+    }
+
+    #[test]
+    fn proxy_bypass_uses_real_loopback_and_actual_jump_endpoint() {
+        assert!(host_bypassed_by_proxy("127.22.3.4", false, ""));
+        assert!(host_bypassed_by_proxy("[::1]", false, ""));
+        assert!(!host_bypassed_by_proxy("127.evil.example", false, ""));
+        assert!(!host_bypassed_by_proxy("127.0.0.1", true, ""));
+        let mut spec = parse_site_url("sftp://alice@127.0.0.1/").unwrap();
+        spec.raw_fields.insert("proxy_method".into(), "http".into());
+        spec.raw_fields.insert("proxy_host".into(), "proxy.example".into());
+        assert!(build_proxy_config(&spec).unwrap().is_none());
+        spec.session.tunnel = Some(TunnelConfig { enabled: true, host: "bastion.example".into(), ..Default::default() });
+        assert!(build_proxy_config(&spec).unwrap().is_some());
+        spec.raw_fields.insert("proxy_exclude".into(), "bastion.example".into());
+        assert!(build_proxy_config(&spec).unwrap().is_none());
+        spec.raw_fields.insert("proxy_exclude".into(), "127.0.0.1".into());
+        assert!(build_proxy_config(&spec).unwrap().is_some());
     }
 
     #[test]

@@ -60,6 +60,9 @@ fn validate_target_endpoint(host: &str, port: u16) -> Result<&str, ProtoError> {
             "Refusing empty or wildcard destination host.".to_string(),
         ));
     }
+    if trimmed.chars().any(|c| c.is_whitespace() || c.is_control() || matches!(c, '/' | '\\' | '@' | '?' | '#')) {
+        return Err(ProtoError::Transport("Destination host contains invalid characters.".to_string()));
+    }
     if port == 0 {
         return Err(ProtoError::Transport(
             "Refusing destination port 0.".to_string(),
@@ -222,7 +225,7 @@ where
 
     if auth.is_some() {
         stream
-            .write_all(&[0x05, 0x02, 0x00, 0x02])
+            .write_all(&[0x05, 0x01, 0x02])
             .await
             .map_err(|e| ProtoError::Transport(format!("SOCKS5 greeting write failed: {e}")))?;
     } else {
@@ -248,7 +251,8 @@ where
         )));
     }
     match method_reply[1] {
-        0x00 => {}
+        0x00 if auth.is_none() => {}
+        0x00 => return Err(ProtoError::Transport("SOCKS5 proxy selected unauthenticated access despite configured credentials.".to_string())),
         0x02 => {
             let Some((user, pass)) = auth else {
                 return Err(ProtoError::Transport(
@@ -280,7 +284,7 @@ where
                 .read_exact(&mut auth_reply)
                 .await
                 .map_err(|e| ProtoError::Transport(format!("SOCKS5 auth reply failed: {e}")))?;
-            if auth_reply[1] != 0x00 {
+            if auth_reply[0] != 0x01 || auth_reply[1] != 0x00 {
                 return Err(ProtoError::Transport(
                     "SOCKS5 proxy rejected username/password credentials.".to_string(),
                 ));
@@ -317,6 +321,9 @@ where
             "Invalid SOCKS5 reply version 0x{:02X}.",
             hdr[0]
         )));
+    }
+    if hdr[2] != 0x00 {
+        return Err(ProtoError::Transport("Invalid SOCKS5 reserved reply byte.".to_string()));
     }
     if hdr[1] != 0x00 {
         return Err(ProtoError::Transport(format!(
@@ -632,6 +639,47 @@ pub async fn connect_stream_maybe_proxied(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn socks5_requires_configured_auth_and_rejects_downgrade() {
+        let (mut client, mut server) = tokio::io::duplex(1024);
+        let peer = tokio::spawn(async move {
+            let mut greeting = [0; 3];
+            server.read_exact(&mut greeting).await.unwrap();
+            assert_eq!(greeting, [5, 1, 2]);
+            server.write_all(&[5, 0]).await.unwrap();
+            let mut byte = [0];
+            assert_eq!(server.read(&mut byte).await.unwrap(), 0);
+        });
+        let error = socks5_connect_on_stream(&mut client, "destination.test", 22, Some(("user", "pass")), true).await.unwrap_err();
+        assert!(error.to_string().contains("unauthenticated"));
+        drop(client);
+        peer.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_proxy_never_connects_directly() {
+        let target = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_port = proxy.local_addr().unwrap().port();
+        let target_port = target.local_addr().unwrap().port();
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = proxy.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut byte = [0];
+            while !request.ends_with(b"\r\n\r\n") {
+                socket.read_exact(&mut byte).await.unwrap();
+                request.push(byte[0]);
+            }
+            assert!(String::from_utf8_lossy(&request).starts_with("CONNECT 127.0.0.1:"));
+            socket.write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\n\r\n").await.unwrap();
+        });
+        let config = ProxyConfig { kind: ProxyKind::HttpConnect, host: "127.0.0.1".into(), port: proxy_port, username: Some("user".into()), password: Some("wrong".into()), ..Default::default() };
+        let error = connect_tcp_maybe_proxied("127.0.0.1", target_port, Some(&config), Duration::from_secs(3)).await.unwrap_err();
+        assert!(error.to_string().contains("407"));
+        peer.await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(150), target.accept()).await.is_err());
+    }
+
     #[test]
     fn socks5_packet_round_trips_ipv4_domain_ipv6_and_rejects_wildcard() {
         let v4 = build_socks5_connect_request("192.0.2.10", 22, true).unwrap();
@@ -652,6 +700,8 @@ mod tests {
             ("2001:db8::1".to_string(), 443)
         );
 
+        assert!(build_socks5_connect_request("bad host", 22, true).is_err());
+        assert!(build_socks5_connect_request("example.test\r\nInjected: yes", 22, true).is_err());
         assert!(build_socks5_connect_request("*", 22, true).is_err());
         assert!(build_socks5_connect_request("", 22, true).is_err());
         assert!(build_socks5_connect_request("example.com", 0, true).is_err());

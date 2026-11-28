@@ -1056,3 +1056,66 @@ async fn scp_copy_file_refuses_self_copy_and_signals_unsupported_when_cp_missing
     scp.close().await.unwrap();
 }
 
+
+#[tokio::test]
+async fn jump_socks_relay_requires_secret_and_supports_reqwest() {
+    let user = common::generate_ed25519_ssh_key(0x76, "relay-user");
+    let (port, fingerprint, _, _) = start_mock_ssh_server(0x32, user.private_key.public_key().clone(), true).await;
+    let config = SshConnectConfig {
+        host: "127.0.0.1".into(), port, username: "tester".into(),
+        private_key_pem: Some(Zeroizing::new(user.openssh_pem.clone())),
+        pinned_host_key: Some(fingerprint), ..Default::default()
+    };
+    let jump = linscp_proto::tunnel::SshJumpTunnel::connect(config).await.unwrap();
+    let relay = jump.start_socks5_relay(0).await.unwrap();
+    let mut unauth = TcpStream::connect(("127.0.0.1", relay.local_port())).await.unwrap();
+    unauth.write_all(&[5, 1, 0]).await.unwrap();
+    let mut reply = [0; 2];
+    unauth.read_exact(&mut reply).await.unwrap();
+    assert_eq!(reply, [5, 255]);
+
+    let mut wrong = relay.proxy_config();
+    wrong.password = Some("incorrect".into());
+    assert!(linscp_proto::proxy::connect_tcp_maybe_proxied("127.0.0.1", 22, Some(&wrong), Duration::from_secs(3)).await.is_err());
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let http_port = listener.local_addr().unwrap().port();
+    let http = tokio::spawn(async move {
+        let (mut stream, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut byte = [0; 1];
+        while !request.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).await.unwrap();
+            request.push(byte[0]);
+        }
+        stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok").await.unwrap();
+    });
+    let credentials = relay.proxy_config();
+    let proxy = reqwest::Proxy::all(format!("socks5h://127.0.0.1:{}", relay.local_port())).unwrap()
+        .basic_auth(credentials.username.as_deref().unwrap(), credentials.password.as_deref().unwrap());
+    let client = reqwest::Client::builder().proxy(proxy).build().unwrap();
+    let text = client.get(format!("http://127.0.0.1:{http_port}/")).send().await.unwrap().text().await.unwrap();
+    assert_eq!(text, "ok");
+    http.await.unwrap();
+
+    // Explicit local-port mode still reaches only the intended destination.
+    let echo = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let echo_port = echo.local_addr().unwrap().port();
+    let echo_task = tokio::spawn(async move {
+        let (mut stream, _) = echo.accept().await.unwrap();
+        let mut byte = [0; 1];
+        stream.read_exact(&mut byte).await.unwrap();
+        stream.write_all(&byte).await.unwrap();
+    });
+    let reservation = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let local_port = reservation.local_addr().unwrap().port();
+    drop(reservation);
+    let mut forwarded = jump.open_destination_stream("127.0.0.1", echo_port, local_port).await.unwrap();
+    forwarded.write_all(b"x").await.unwrap();
+    let mut echoed = [0; 1];
+    forwarded.read_exact(&mut echoed).await.unwrap();
+    assert_eq!(&echoed, b"x");
+    echo_task.await.unwrap();
+    relay.stop().await;
+    jump.close().await.unwrap();
+}

@@ -153,8 +153,8 @@ pub fn host_can_spawn_gui_viewer() -> bool {
 /// Resolves the viewer binary for `ticket.viewer`, trying ordered fallbacks per OS:
 ///
 /// * RDP on Linux: `xfreerdp3`, `xfreerdp`, `wlfreerdp`, `sdl-freerdp`; Windows: `mstsc` (`System32\\mstsc.exe`); macOS: `open`
-/// * VNC: `vncviewer` (includes tigervnc), `xtigervncviewer`, `remmina`
-/// * SPICE: `remote-viewer`, `virt-viewer`, `spicy`
+/// * VNC: `vncviewer` or its TigerVNC executable names
+/// * SPICE: `remote-viewer`
 /// * X2Go: no external viewer; the built-in KDrive viewer is not yet available
 /// * X11: `waypipe` (Wayland) or `ssh -X` fallback
 pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
@@ -203,8 +203,6 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
                 "vncviewer",
                 "tigervnc-viewer",
                 "xtigervncviewer",
-                "remmina",
-                "gvncviewer",
             ] {
                 if let Some(p) = find_executable_on_path(cand) {
                     return Some(p);
@@ -216,9 +214,6 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
             for cand in [
                 &ticket.viewer,
                 "remote-viewer",
-                "virt-viewer",
-                "spicy",
-                "spicec",
             ] {
                 if let Some(p) = find_executable_on_path(cand) {
                     return Some(p);
@@ -228,20 +223,13 @@ pub fn resolve_viewer_binary(ticket: &DesktopTicket) -> Option<PathBuf> {
         }
         DesktopViewerKind::X2Go => None,
         DesktopViewerKind::X11 => {
-            // Wayland needs `waypipe`; on Windows/macOS/Android the session is not a
-            // Linux one, so the `ssh -X` fallback below is the only answer.
-            #[cfg(target_os = "linux")]
-            let wayland = crate::linux::detect_desktop_session()
-                == crate::linux::DesktopSessionKind::Wayland;
-            #[cfg(not(target_os = "linux"))]
-            let wayland = false;
-            if wayland {
-                if let Some(p) = find_executable_on_path("waypipe") {
-                    return Some(p);
-                }
+            // The arguments differ between `ssh -X` and `waypipe ssh`.
+            // Never substitute one binary while retaining the other's argv.
+            match ticket.argv.first().map(String::as_str) {
+                Some("ssh") => find_executable_on_path("ssh"),
+                Some("waypipe") => find_executable_on_path("waypipe"),
+                _ => None,
             }
-            // Fallback: `ssh -X` is always present when SSH transport is available.
-            find_executable_on_path("ssh").or_else(|| find_executable_on_path("waypipe"))
         }
     }
 }
@@ -303,6 +291,17 @@ pub fn launch_remote_desktop(
     // built-in viewer, even for old or manually constructed tickets.
     if matches!(ticket.kind.trim().to_ascii_lowercase().as_str(), "x2go" | "nx" | "nx3") {
         return Err("X2Go is not supported by the ticket launcher; use the experimental built-in KDrive viewer. NX is not supported.".to_string());
+    }
+    if ticket.tunneled {
+        if matches!(ticket.viewer_kind(), Some(DesktopViewerKind::Rdp | DesktopViewerKind::Vnc | DesktopViewerKind::Spice)) {
+            let loopback_forward = ticket.local_endpoint.parse::<std::net::SocketAddr>()
+                .ok().is_some_and(|addr| addr.ip().is_loopback() && addr.port() != 0);
+            if !loopback_forward || ticket.local_endpoint == ticket.target {
+                return Err("A requested SSH desktop tunnel has no distinct local forward; refusing a direct connection.".to_string());
+            }
+        } else {
+            return Err("SSH jump forwarding is not supported by this external desktop launcher.".to_string());
+        }
     }
     let viewer_bin = resolve_viewer_binary(ticket);
     let spawn_allowed = !force_file_ticket && host_can_spawn_gui_viewer();
@@ -432,8 +431,8 @@ pub fn launch_remote_desktop(
 ///
 /// Callers (CLI `--help`, Tauri updater) can surface this verbatim.
 pub fn desktop_recommendations() -> &'static str {
-    "Remote desktop (dual-mode: native viewer when a display is present, .rdp/.vv file or HTML5 gateway in headless HTTP mode):\n\
-     \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). Embedded fallback: Devolutions/ironrdp WASM (HTML5/WebSocket) when no native viewer is installed.\n\
+    "Remote desktop (native viewer when available; otherwise a ticket file or guidance to use an external viewer):\n\
+     \x20 RDP  — Linux: xfreerdp3 / xfreerdp / wlfreerdp (FreeRDP 3.x, recommended), sdl-freerdp (Wayland). Windows: mstsc.exe (built-in). macOS: open rdp:// / Microsoft Remote Desktop. Android: aFreeRDP / aRDP (intent rdp://). No embedded RDP viewer is provided.\n\
      \x20 VNC  — Linux: tigervnc-viewer / remmina / gvncviewer (TigerVNC, recommended for 5900-5999). Windows: TightVNC / RealVNC viewer. Android: androidVNC / VNC Viewer (443).\n\
      \x20 SPICE — Linux/Windows: remote-viewer / virt-viewer (virt-viewer, recommended for QEMU/KVM). Fallback: spicy (spice-gtk). Uses spice://host:port?tls-port=... and .vv virt-viewer files.\n\
      \x20 X2Go KDrive — experimental built-in viewer; a KDrive server is required. NX is not supported.\n\
@@ -536,11 +535,40 @@ mod tests {
     }
 
     #[test]
+    fn requested_desktop_tunnel_requires_distinct_loopback_forward() {
+        let dir = std::env::temp_dir();
+        let mut ticket = rdp_ticket(None);
+        ticket.tunneled = true;
+        ticket.target = "private.example:3389".into();
+        ticket.local_endpoint = ticket.target.clone();
+        assert!(launch_remote_desktop(&ticket, &dir, true).unwrap_err().contains("refusing a direct connection"));
+        ticket.local_endpoint = "192.0.2.1:3333".into();
+        assert!(launch_remote_desktop(&ticket, &dir, true).is_err());
+        ticket.local_endpoint = "127.0.0.1:3333".into();
+        assert!(launch_remote_desktop(&ticket, &dir, true).is_ok());
+        ticket.kind = "x11".into();
+        assert!(launch_remote_desktop(&ticket, &dir, true).is_err());
+    }
+
+    #[test]
+    fn x11_viewer_resolution_uses_the_program_the_arguments_belong_to() {
+        let mut ticket = rdp_ticket(None);
+        ticket.kind = "x11".into();
+        ticket.viewer = "waypipe".into();
+        ticket.argv = vec!["not-a-valid-viewer".into(), "-X".into()];
+        assert!(resolve_viewer_binary(&ticket).is_none());
+        ticket.argv = vec!["ssh".into(), "-X".into()];
+        assert_eq!(resolve_viewer_binary(&ticket), find_executable_on_path("ssh"));
+    }
+
+    #[test]
     fn recommendations_mention_all_protocols() {
         let rec = desktop_recommendations();
-        for proto in ["RDP", "VNC", "SPICE", "X2Go", "X11", "XDMCP", "ironrdp"] {
+        for proto in ["RDP", "VNC", "SPICE", "X2Go", "X11", "XDMCP"] {
             assert!(rec.contains(proto), "missing {proto}");
         }
+        assert!(rec.contains("No embedded RDP viewer is provided"));
+        assert!(!rec.contains("ironrdp"));
     }
 
     #[test]

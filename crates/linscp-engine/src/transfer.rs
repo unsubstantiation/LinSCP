@@ -335,7 +335,10 @@ pub async fn download_verified_resume(
         Err(error) => return Err(format!("Cannot inspect resume partial: {error}")),
     };
     let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
-    let temp = tempfile::Builder::new().prefix(".linscp-download-").rand_bytes(16).tempfile_in(parent)
+    let stage_dir = tempfile::Builder::new().prefix(".linscp-resume-").rand_bytes(16).tempdir_in(parent)
+        .map_err(|e| format!("Cannot create private resume directory: {e}"))?;
+    linscp_platform::create_private_dir(stage_dir.path()).map_err(|e| format!("Cannot secure resume directory: {e}"))?;
+    let temp = tempfile::Builder::new().prefix("download-").rand_bytes(16).tempfile_in(stage_dir.path())
         .map_err(|e| format!("Cannot create temporary download: {e}"))?;
     let (std_file, mut stage) = temp.into_parts();
     let mut file = tokio::fs::File::from_std(std_file);
@@ -346,6 +349,7 @@ pub async fn download_verified_resume(
         let reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
         let mut reader = reader.take(info.size.saturating_add(1));
         offset = tokio::io::copy(&mut reader, &mut file).await.map_err(|e| format!("Cannot copy resume partial: {e}"))?;
+        drop(reader);
         if offset > info.size { return Err("Resume partial is larger than the remote file.".to_string()); }
         file.flush().await.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
         if offset > 0 {
@@ -380,8 +384,8 @@ pub async fn download_verified_resume(
     flush.map_err(|e| format!("Cannot flush resume staging file: {e}"))?;
     if offset.checked_add(received) != Some(info.size) { return Err("Remote file length changed during verified resume.".to_string()); }
     if flags.cancel_flag.as_ref().is_some_and(|f| f.load(Ordering::SeqCst)) { return Err("Transfer cancelled before publication.".to_string()); }
+    apply_downloaded_attrs(stage.as_ref(), info, flags);
     publish_owned_stage_no_replace(&mut stage, local_dest).map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
-    apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
     Ok(())
 }
@@ -431,6 +435,134 @@ fn publish_download_stage(
     }
 }
 
+/// Copy an ordinary checkpoint into an isolated stage before verifying it.
+/// The checkpoint is never appended to, renamed, or deleted by this routine.
+async fn download_ordinary_resume(
+    session: &dyn RemoteSession, remote_path: &str, info: &FileEntry, local_dest: &Path,
+    flags: &TransferFlags, use_stage: bool, logger: &mut SessionLogger, progress: Option<&ProgressCallback>,
+) -> Result<bool, String> {
+    if flags.no_clobber {
+        return Err("Safe no-overwrite downloads require verified resume.".to_string());
+    }
+    let checkpoint = if use_stage { local_stage_path(local_dest, flags.version_id.as_deref()) } else { None };
+    if use_stage && checkpoint.is_none() {
+        return Err("Cannot construct a safe partial-file name.".to_string());
+    }
+    let stage_info = checkpoint.as_ref().map(|p| stat_local_path(p));
+    let dest_info = stat_local_path(local_dest);
+    let partial = if let (Some(path), Some(meta)) = (checkpoint.as_ref(), stage_info.as_ref()) {
+        if meta.exists {
+            if meta.is_symlink || !meta.is_regular || meta.size >= info.size {
+                return Err(format!("Cannot safely resume from existing staging file '{}'.", path.display()));
+            }
+            Some((path.as_path(), meta.size))
+        } else if dest_info.exists && !dest_info.is_symlink && dest_info.is_regular && dest_info.size < info.size {
+            Some((local_dest, dest_info.size))
+        } else { None }
+    } else if dest_info.exists {
+        if dest_info.is_symlink || !dest_info.is_regular || dest_info.size >= info.size {
+            return Err(format!("Cannot safely resume from existing local file '{}'.", local_dest.display()));
+        }
+        Some((local_dest, dest_info.size))
+    } else { None };
+
+    let parent = local_dest.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    let dir = tempfile::Builder::new().prefix(".linscp-resume-").rand_bytes(16).tempdir_in(parent)
+        .map_err(|e| format!("Cannot create private resume directory: {e}"))?;
+    linscp_platform::create_private_dir(dir.path()).map_err(|e| format!("Cannot secure resume directory: {e}"))?;
+    let stage = dir.path().join("download");
+    let std_file = std::fs::OpenOptions::new().read(true).write(true).create_new(true).open(&stage)
+        .map_err(|e| format!("Cannot create resume stage: {e}"))?;
+    let mut file = tokio::fs::File::from_std(std_file);
+    let mut offset = 0u64;
+    let mut resume_identity = None;
+    if let Some((partial_path, expected_size)) = partial {
+        let input = linscp_platform::open_private_file_no_follow(partial_path)
+            .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial_path.display()))?;
+        if input.metadata().map_err(|e| format!("Cannot inspect resume partial: {e}"))?.len() != expected_size {
+            return Err("Resume partial changed before copying; retry the transfer.".to_string());
+        }
+        let input = tokio::fs::File::from_std(input);
+        let reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
+        let mut limited = reader.take(expected_size.saturating_add(1));
+        offset = tokio::io::copy(&mut limited, &mut file).await.map_err(|e| format!("Cannot copy resume partial: {e}"))?;
+        drop(limited);
+        if offset != expected_size {
+            return Err("Resume partial changed while copying; retry the transfer.".to_string());
+        }
+        if offset > 0 {
+            if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && !flags.allow_best_effort_resume {
+                return Err("FTP/SFTP resume cannot pin the source; explicit best-effort resume approval is required.".to_string());
+            }
+            let token = if is_webdav_scheme(session.scheme()) {
+                let (current, etag) = session.dav_stat_with_etag(remote_path).await.map_err(|e| e.to_string())?;
+                if current.as_ref().map_or(true, |entry| entry.is_dir || entry.size != info.size) {
+                    return Err("Cannot resume: remote source metadata changed.".to_string());
+                }
+                etag.ok_or("Cannot resume without a strong source ETag.")?
+            } else if session.scheme() == ProtocolScheme::S3 {
+                let etag = if let Some(version) = flags.version_id.as_deref() {
+                    session.s3_get_version_etag(remote_path, version).await
+                } else { session.s3_get_etag(remote_path).await };
+                etag.map_err(|e| e.to_string())?.ok_or("Cannot resume without a strong source ETag.")?
+            } else {
+                let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
+                format!("\"{protocol}:{}:{}\"", info.size, info.mtime)
+            };
+            file.flush().await.map_err(|e| format!("Cannot flush resume stage: {e}"))?;
+            file.seek(std::io::SeekFrom::Start(0)).await.map_err(|e| format!("Cannot seek resume stage: {e}"))?;
+            let mut reader = InterruptibleReader { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
+            session.verify_prefix_if_match(remote_path, &token, offset, info.size, &mut reader, flags.version_id.as_deref(), speed_u32(flags.speed_kbytes_per_sec)).await
+                .map_err(|e| format!("Cannot resume '{}': {e}", partial_path.display()))?;
+            file.seek(std::io::SeekFrom::Start(offset)).await.map_err(|e| format!("Cannot seek resume stage: {e}"))?;
+            resume_identity = Some(token);
+        }
+    }
+    let request = TransferRequest { resume_offset: offset, append: false, preserve_time: false, mtime: None, permissions: None,
+        speed_kbytes_per_sec: speed_u32(flags.speed_kbytes_per_sec), version_id: flags.version_id.clone() };
+    let result = {
+        let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
+        if let Some(token) = resume_identity.as_deref() {
+            session.download_if_match(remote_path, token, request, &mut writer, progress).await
+        } else { session.download(remote_path, request, &mut writer, progress).await }
+    };
+    let flushed = file.flush().await;
+    drop(file);
+    let received = match result {
+        Ok(received) => received,
+        Err(error) => {
+            let cancelled = flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst));
+            if partial.is_none() && !cancelled && flushed.is_ok()
+                && std::fs::metadata(&stage).is_ok_and(|m| m.len() > 0 && m.len() < info.size)
+            {
+                if let Some(ref path) = checkpoint {
+                    if linscp_platform::publish_no_replace(&stage, path).is_ok() {
+                        return Err(format!("{error}; a partial file was saved at '{}'.", path.display()));
+                    }
+                }
+            }
+            return Err(error.to_string());
+        }
+    };
+    flushed.map_err(|e| format!("Cannot flush resume stage: {e}"))?;
+    if offset.checked_add(received) != Some(info.size) {
+        return Err("Resumed download length does not match the source metadata; the source was not deleted.".to_string());
+    }
+    if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
+        return Err("Transfer cancelled before publication.".to_string());
+    }
+    apply_downloaded_attrs(&stage, info, flags);
+    std::fs::rename(&stage, local_dest)
+        .map_err(|e| format!("Cannot publish resumed file '{}': {e}", local_dest.display()))?;
+    logger.record_transfer(false, remote_path, &local_dest.display().to_string(), Some(info.size), Ok(()));
+    if flags.delete_source {
+        if let Some(token) = resume_identity.as_deref().filter(|_| is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
+            session.remove_if_match(remote_path, token).await.map_err(|e| e.to_string())?;
+        } else { session.remove_file(remote_path).await.map_err(|e| e.to_string())?; }
+    }
+    Ok(true)
+}
+
 /// Downloads a single remote file (or streams to stdout when `local_dest == Path::new("-")`).
 pub async fn download_single_file(
     session: &dyn RemoteSession,
@@ -441,6 +573,13 @@ pub async fn download_single_file(
     logger: &mut SessionLogger,
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
+    if flags.resume && local_dest == Path::new("-") {
+        return Err("Resume requires a local file, not standard output.".to_string());
+    }
+    let source_leaf = remote_path.rsplit('/').next().unwrap_or(remote_path);
+    if flags.resume && wants_ascii_conversion(flags.transfer_mode, source_leaf) {
+        return Err("Resume requires binary transfer mode; ASCII conversion cannot safely resume.".to_string());
+    }
     if flags.version_id.is_some() && flags.delete_source {
         return Err("Cannot delete a versioned download source without a conditional version delete.".to_string());
     }
@@ -618,8 +757,16 @@ pub async fn download_single_file(
     }
 
     let use_stage = should_use_filepart(flags, session.scheme(), false, false, info.size);
+    if flags.resume && !use_stage && local_stat.exists
+        && (local_stat.is_symlink || !local_stat.is_regular || local_stat.size >= info.size)
+    {
+        return Err(format!("Cannot safely resume from existing local file '{}'.", local_dest.display()));
+    }
     if flags.cleanup_download_stage && (flags.resume || flags.append) {
         return Err("Automatic cleanup requires a fresh staged download.".to_string());
+    }
+    if flags.resume {
+        return download_ordinary_resume(session, remote_path, info, local_dest, flags, use_stage, logger, progress).await;
     }
     // The private temp file is created exclusively in the destination directory
     // so publication stays on the same filesystem. TempPath cleans up the
@@ -645,114 +792,12 @@ pub async fn download_single_file(
     if flags.no_clobber && (stage_opt.is_none() || flags.resume || flags.append) {
         return Err("Safe no-overwrite downloads require a fresh staging file.".to_string());
     }
-    let can_resume_proto = !matches!(session.scheme(), ProtocolScheme::Scp | ProtocolScheme::Ssh);
-    // Compare resume prefixes before moving or opening local paths for writing.
-    // FTP/SFTP size/mtime identities remain best-effort, not atomic snapshots.
-    // WebDAV/S3 use a strong ETag for both the comparison and the remaining GET.
-    let mut resume_identity = None;
-    let mut verified_partial = None;
-    if flags.resume && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())
-        || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
-        let candidate = if let Some(stage) = stage_opt.as_ref() {
-            let stage_info = stat_local_path(stage);
-            if stage_info.exists {
-                if stage_info.is_symlink || !stage_info.is_regular || stage_info.size >= info.size {
-                    return Err(format!("Cannot safely resume from existing staging file '{}'.", stage.display()));
-                }
-                Some((stage.as_path(), stage_info.size))
-            } else if local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
-                Some((local_dest, local_stat.size))
-            } else {
-                None
-            }
-        } else if local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
-            Some((local_dest, local_stat.size))
-        } else {
-            None
-        };
-        if let Some((partial, size)) = candidate {
-            let input = linscp_platform::open_private_file_no_follow(partial)
-                .map_err(|e| format!("Cannot safely open resume partial '{}': {e}", partial.display()))?;
-            if size > 0 {
-                if (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme())) && !flags.allow_best_effort_resume {
-                    return Err("FTP/SFTP resume cannot pin the source; explicit best-effort resume approval is required.".to_string());
-                }
-                let token = if is_webdav_scheme(session.scheme()) {
-                    let (current, etag) = session.dav_stat_with_etag(remote_path).await.map_err(|e| e.to_string())?;
-                    if current.as_ref().map_or(true, |entry| entry.is_dir || entry.size != info.size) {
-                        return Err("Cannot resume: remote source metadata changed.".to_string());
-                    }
-                    etag.ok_or("Cannot resume without a strong source ETag.")?
-                } else if session.scheme() == ProtocolScheme::S3 {
-                    let etag = if let Some(version) = flags.version_id.as_deref() {
-                        session.s3_get_version_etag(remote_path, version).await
-                    } else {
-                        session.s3_get_etag(remote_path).await
-                    };
-                    etag.map_err(|e| e.to_string())?.ok_or("Cannot resume without a strong source ETag.")?
-                } else {
-                    let protocol = if session.scheme() == ProtocolScheme::Sftp { "sftp" } else { "ftp" };
-                    format!("\"{protocol}:{}:{}\"", info.size, info.mtime)
-                };
-                let input = tokio::fs::File::from_std(input);
-                let mut reader = InterruptibleReader { inner: input, cancel_flag: flags.cancel_flag.clone() };
-                session.verify_prefix_if_match(remote_path, &token, size, info.size, &mut reader, flags.version_id.as_deref(), speed_u32(flags.speed_kbytes_per_sec)).await
-                    .map_err(|e| format!("Cannot resume '{}': {e}", partial.display()))?;
-                resume_identity = Some(token);
-                verified_partial = Some((partial.to_path_buf(), size));
-            }
-        }
-    }
-    let (write_path, resume_offset) = if flags.no_clobber {
-        (stage_opt.as_ref().expect("checked above").clone(), 0u64)
-    } else if let Some(ref sp) = stage_opt {
-        if !flags.resume && !flags.append {
-            // A fresh transfer must never adopt, truncate or remove somebody
-            // else's staging file, even if it appeared after preflight.
-            (sp.clone(), 0u64)
-        } else {
-            let sp_meta = stat_local_path(sp);
-            if can_resume_proto && sp_meta.exists && sp_meta.is_regular {
-                if sp_meta.size < info.size {
-                    if flags.resume && sp_meta.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((sp.as_path(), sp_meta.size)) {
-                        return Err("Resume partial changed after verification; retry the transfer.".to_string());
-                    }
-                    (sp.clone(), sp_meta.size)
-                } else {
-                    let _ = std::fs::remove_file(sp);
-                    (sp.clone(), 0u64)
-                }
-            } else if can_resume_proto
-                && flags.resume
-                && local_stat.exists
-                && local_stat.is_regular
-                && local_stat.size < info.size
-            {
-                // Do not adopt a partial that appeared after the verification pass.
-                if local_stat.size > 0 && (session.scheme() == ProtocolScheme::Sftp || is_ftp_scheme(session.scheme()) || is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) && verified_partial.as_ref().map(|(path, len)| (path.as_path(), *len)) != Some((local_dest, local_stat.size)) {
-                    return Err("Resume partial changed after verification; retry the transfer.".to_string());
-                }
-                // Adopt existing partial target into stage path or resume directly
-                let _ = std::fs::rename(local_dest, sp);
-                let moved = stat_local_path(sp);
-                (sp.clone(), if moved.exists { moved.size } else { 0 })
-            } else {
-                let _ = std::fs::remove_file(sp);
-                (sp.clone(), 0u64)
-            }
-        }
-    } else if flags.append && local_stat.exists && local_stat.is_regular {
-        (local_dest.to_path_buf(), 0u64)
-    } else if flags.resume && local_stat.exists && local_stat.is_regular && local_stat.size < info.size {
-        (local_dest.to_path_buf(), local_stat.size)
-    } else {
-        (local_dest.to_path_buf(), 0u64)
-    };
-
+    let write_path = stage_opt.clone().unwrap_or_else(|| local_dest.to_path_buf());
+    let resume_offset = 0u64;
     let fresh_stage = stage_opt.is_some() && !flags.resume && !flags.append;
     let open_res = if let Some(file) = private_file.take() {
         Ok(file)
-    } else if flags.no_clobber || fresh_stage {
+    } else if flags.no_clobber || fresh_stage || flags.resume {
         tokio::fs::OpenOptions::new().write(true).create_new(true).open(&write_path).await
     } else if resume_offset > 0 || flags.append {
         tokio::fs::OpenOptions::new()
@@ -780,7 +825,7 @@ pub async fn download_single_file(
     };
     let dl_res = {
         let mut writer = InterruptibleWriter { inner: &mut file, cancel_flag: flags.cancel_flag.clone() };
-        if let Some(etag) = flags.source_etag.as_deref().or(resume_identity.as_deref()) {
+        if let Some(etag) = flags.source_etag.as_deref() {
             session.download_if_match(remote_path, etag, req, &mut writer, progress).await
         } else {
             session.download(remote_path, req, &mut writer, progress).await
@@ -803,7 +848,7 @@ pub async fn download_single_file(
         logger.record_transfer(false, remote_path, &dest_label, None, Err(&msg));
         return Err(msg);
     }
-    if (flags.source_etag.is_some() || resume_identity.is_some()) && bytes != info.size {
+    if flags.source_etag.is_some() && bytes != info.size {
         return Err("Conditional download length does not match the source metadata; the source was not deleted.".to_string());
     }
     if flags.cancel_flag.as_ref().is_some_and(|flag| flag.load(Ordering::SeqCst)) {
@@ -827,11 +872,7 @@ pub async fn download_single_file(
     apply_downloaded_attrs(local_dest, info, flags);
     logger.record_transfer(false, remote_path, &dest_label, Some(bytes), Ok(()));
     if flags.delete_source {
-        if let Some(etag) = resume_identity.as_deref().filter(|_| is_webdav_scheme(session.scheme()) || session.scheme() == ProtocolScheme::S3) {
-            session.remove_if_match(remote_path, etag).await.map_err(|e| e.to_string())?;
-        } else {
-            session.remove_file(remote_path).await.map_err(|e| e.to_string())?;
-        }
+        session.remove_file(remote_path).await.map_err(|e| e.to_string())?;
     }
     Ok(true)
 }
@@ -885,6 +926,14 @@ pub async fn upload_single_file(
     progress: Option<&ProgressCallback>,
 ) -> Result<bool, String> {
     validate_protocol_transfer_flags(flags, session.scheme(), true)?;
+    let source_leaf = if local_src == Path::new("-") {
+        remote_dest.rsplit('/').next().unwrap_or(remote_dest).into()
+    } else {
+        local_src.file_name().map(|name| name.to_string_lossy()).unwrap_or_default()
+    };
+    if flags.resume && wants_ascii_conversion(flags.transfer_mode, &source_leaf) {
+        return Err("Resume requires binary transfer mode; ASCII conversion cannot safely resume.".to_string());
+    }
 
     // The legacy unguarded staging path can unlink or replace a pathname
     // another client has substituted. It is not an ownership proof and must

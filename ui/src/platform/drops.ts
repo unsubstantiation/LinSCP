@@ -3,10 +3,9 @@
  *
  * A native window receives the operating system's answer to a drop as
  * *paths* - a string per item, no bytes - and the shell has to read them
- * itself. The Android app gets paths the same way from the share sheet, which
- * stages each URI and records the same manifest. Both go through the ordinary
- * `TransferClient` instead of a private IPC call, so `/api/transfer/drop`
- * handles either form with one set of conflict and overwrite rules.
+ * itself. The Android share sheet instead stages URI contents and records a
+ * shell-upload manifest; its consumer queues each item through the normal
+ * transfer queue, not this path-drop endpoint.
  */
 
 import type { TransportClient } from '../transport/client.js';

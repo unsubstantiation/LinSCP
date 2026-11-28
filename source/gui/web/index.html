@@ -763,6 +763,7 @@
                   <option value="">Automatic (decide per file)</option>
                   <option value="binary">Binary</option>
                   <option value="ascii">ASCII (convert line ends)</option>
+                  <option value="automatic">Automatic by mask</option>
                 </select>
               </div>
               <div class="field-stack"><label for="prefSpeed">Speed limit (KiB/s):</label>
@@ -1960,6 +1961,21 @@
         <button class="btn btn-primary" id="editorSaveBtn" onclick="saveEditorFile()">Save (Ctrl+S)</button>
         <button class="btn" onclick="closeEditor()">Close</button>
       </div>
+    </div>
+  </div>
+
+  <!-- Retry an undecodable file without discarding an already-open editor. -->
+  <div class="modal-overlay" id="editorEncodingRetryModal" role="dialog" aria-modal="true" aria-labelledby="editorEncodingRetryTitle">
+    <div class="modal-box" style="width:480px; max-width:96vw;">
+      <div class="modal-header"><span id="editorEncodingRetryTitle">Cannot open the file.</span>
+        <button type="button" class="modal-close" onclick="cancelEditorEncodingRetry()" aria-label="Close">&#10005;</button></div>
+      <div class="modal-body">
+        <p id="editorEncodingRetryError" role="alert"></p>
+        <label for="editorRetryEncoding">Text encoding:</label>
+        <select id="editorRetryEncoding" class="select-field"><option value="UTF-8">UTF-8</option></select>
+      </div>
+      <div class="modal-footer"><button class="btn btn-primary" onclick="retryEditorEncoding()">Open</button>
+        <button class="btn" onclick="cancelEditorEncodingRetry()">Cancel</button></div>
     </div>
   </div>
 
@@ -4362,9 +4378,8 @@
     };
   }
 
-  /* Native paths land in the panel the user dropped on. The event names one
-   * side; a drop with no side goes to the remote panel, which is what the
-   * desktop window has always meant by "drop to upload". */
+  /* Native paths land in the pane under the pointer; if no position is
+   * available, use the last focused pane. */
   async function handleNativeDrop(payload) {
     if (nativeDropBusy) return;
     if (!window.LinSCPCore || typeof window.LinSCPCore.dropPaths !== 'function') return;
@@ -4374,7 +4389,15 @@
     // under the cursor, the page can, so the focused pane is the destination
     // unless the event names one.
     const requested = payload && payload.side === 'local' ? 'local' : payload && payload.side === 'remote' ? 'remote' : null;
-    const side = requested || (state.focusPane === 'local' ? 'local' : 'remote');
+    // Native positions are physical window pixels; DOM hit testing uses CSS
+    // pixels. A drop outside both panes keeps the existing focused-pane fallback.
+    let hitSide = null;
+    if (!requested && payload && payload.position &&
+        Number.isFinite(payload.position.x) && Number.isFinite(payload.position.y)) {
+      const scale = Number.isFinite(window.devicePixelRatio) && window.devicePixelRatio > 0 ? window.devicePixelRatio : 1;
+      hitSide = pointerPaneAt({ clientX: payload.position.x / scale, clientY: payload.position.y / scale });
+    }
+    const side = requested || hitSide || (state.focusPane === 'local' ? 'local' : 'remote');
     const tab = activeTab();
     if (side === 'remote' && (!tab || !tab.connected)) {
       toast(t("Not connected."), true);
@@ -4429,38 +4452,25 @@
     if (caps && !caps.nativeFileDrop) return;
     const internals = window.__TAURI_INTERNALS__;
     if (!internals || typeof internals.invoke !== 'function') return;
-    // A Tauri v2 window delivers events through the `plugin:event|listen`
-    // command and calls the handler by id; v1 passed the handler function
-    // itself. Both are tried, so a newer or older shell still works.
-    const call = (cmd, args) => internals.invoke(cmd, args || {});
-    const handler = event => handleNativeDrop(event && event.payload ? event.payload : event);
-    const deliver = payload => {
-      try {
-        handler(payload);
-      } catch (error) {
-        /* a drop that cannot be handled must not stop the next one */
-      }
-    };
-    window.__LSCP_DROP_HANDLER__ = deliver;
-    Promise.resolve()
-      .then(() => call('plugin:event|listen', {
+    // Tauri v2 requires the numeric callback ID registered by
+    // transformCallback, not the name of a global JavaScript function.
+    const deliver = event => Promise.resolve()
+      .then(() => handleNativeDrop(event && event.payload ? event.payload : event))
+      .catch(() => { /* A rejected drop must not stop later events. */ });
+    if (typeof internals.transformCallback === 'function') {
+      const handler = internals.transformCallback(deliver);
+      Promise.resolve(internals.invoke('plugin:event|listen', {
         event: NATIVE_DROP_EVENT,
         target: { kind: 'Any' },
-        handler: '__LSCP_DROP_HANDLER__'
-      }))
-      .catch(error => {
-        // A shell that takes a handler function instead (or an older one that
-        // has no event channel at all) falls back or stays silent.
-        void error;
-        try {
-          const manager = internals.event || internals;
-          if (manager && typeof manager.listen === 'function') {
-            Promise.resolve(manager.listen(NATIVE_DROP_EVENT, deliver)).catch(() => {});
-          }
-        } catch (error) {
-          /* the page's own HTML5 drop stays the only path */
-        }
-      });
+        handler,
+      })).catch(() => {});
+      return;
+    }
+    // Compatibility with a host that exposes a direct listen function.
+    const manager = internals.event || internals;
+    if (manager && typeof manager.listen === 'function') {
+      Promise.resolve(manager.listen(NATIVE_DROP_EVENT, deliver)).catch(() => {});
+    }
   }
 
   function focusPane(side) {
@@ -6947,11 +6957,21 @@
     'Windows-1250', 'Windows-1251', 'Shift_JIS', 'EUC-JP', 'GBK', 'Big5', 'EUC-KR'
   ];
 
+  function selectEncoding(id, desired) {
+    const select = $(id);
+    if (!select) return;
+    const options = [...select.options];
+    const wanted = String(desired || 'utf-8').toLowerCase();
+    const option = options.find(item => item.value.toLowerCase() === wanted)
+      || options.find(item => item.value.toLowerCase() === 'utf-8') || options[0];
+    if (option) select.value = option.value;
+  }
+
   function populateEncodingSelects() {
     const list = Array.isArray(state.supportedEncodings) && state.supportedEncodings.length
       ? state.supportedEncodings
       : DEFAULT_TEXT_ENCODINGS;
-    for (const id of ['editorEncoding', 'searchEncoding']) {
+    for (const id of ['editorEncoding', 'searchEncoding', 'editorRetryEncoding']) {
       const sel = $(id);
       if (!sel) continue;
       const current = sel.value || 'UTF-8';
@@ -6962,7 +6982,7 @@
         opt.textContent = enc;
         sel.appendChild(opt);
       }
-      sel.value = list.includes(current) ? current : 'UTF-8';
+      selectEncoding(id, current);
     }
   }
 
@@ -7104,7 +7124,7 @@
   async function changeEditorEncoding() {
     if (!state.editor || !state.editor.path) return;
     const chosen = ($('editorEncoding') && $('editorEncoding').value) || 'UTF-8';
-    if (!state.editor.dirty) {
+    if (!state.editor.dirty && !state.editor.isNew) {
       await openEditor(state.editor.path, state.editor.side, state.editor.readOnly, chosen);
     } else {
       markDirty();
@@ -7123,7 +7143,7 @@
       original: '',
       baseMtime: null,
       baseMtimeNs: null,
-      initialEncoding: 'UTF-8',
+      initialEncoding: 'utf-8',
       initialEol: 'lf',
       initialBom: false,
       hasFormatMetadata: false,
@@ -7131,7 +7151,7 @@
       externalUploadCount: 0,
       dirty: true
     };
-    if ($('editorEncoding')) $('editorEncoding').value = 'UTF-8';
+    selectEncoding('editorEncoding', 'UTF-8');
     if ($('editorEol')) { $('editorEol').value = 'lf'; $('editorEol').disabled = false; }
     if ($('editorBom')) { $('editorBom').checked = false; $('editorBom').disabled = false; }
     updateExternalEditorControls();
@@ -7145,6 +7165,20 @@
     setTimeout(() => { if (editorInstance) editorInstance.focus(); }, 50);
   }
 
+  let pendingEditorEncodingRetry = null;
+  function cancelEditorEncodingRetry() {
+    const retry = pendingEditorEncodingRetry;
+    pendingEditorEncodingRetry = null;
+    closeModal('editorEncodingRetryModal');
+    if (state.editor && retry && retry.restoreEncoding) selectEncoding('editorEncoding', retry.restoreEncoding);
+  }
+  async function retryEditorEncoding() {
+    const retry = pendingEditorEncodingRetry;
+    if (!retry) return;
+    await openEditor(retry.path, retry.side, retry.readOnly,
+      $('editorRetryEncoding').value, retry.initialLine);
+  }
+
   async function openEditor(path, side, readOnly, requestedEncoding, initialLine) {
     side = side || 'remote';
     readOnly = !!readOnly;
@@ -7152,7 +7186,26 @@
     const endpoint = side === 'local' ? '/api/local/edit' : '/api/remote/edit';
     const encQuery = requestedEncoding ? '&encoding=' + encodeURIComponent(requestedEncoding) : '';
     const data = await apiGet(endpoint + '?tab=' + tabId() + '&path=' + encodePath(path) + encQuery);
-    if (!data || !data.success) { toast(errorMessage(data && data.error, t("Cannot open the file.")), true); return; }
+    if (!data || !data.success) {
+      const error = String((data && data.error) || '');
+      if (/invalid byte sequence|not valid utf-8|binary file containing nul/i.test(error)) {
+        const sameEditor = state.editor && state.editor.path === path && state.editor.side === side;
+        const restoreEncoding = pendingEditorEncodingRetry?.restoreEncoding || (state.editor
+          ? (sameEditor && !state.editor.dirty ? state.editor.initialEncoding : $('editorEncoding').value)
+          : null);
+        pendingEditorEncodingRetry = {path, side, readOnly, initialLine, restoreEncoding};
+        $('editorEncodingRetryError').textContent = error;
+        selectEncoding('editorRetryEncoding', requestedEncoding || 'utf-8');
+        openModal('editorEncodingRetryModal');
+      } else {
+        toast(errorMessage(error, t("Cannot open the file.")), true);
+      }
+      return;
+    }
+    if (pendingEditorEncodingRetry) {
+      pendingEditorEncodingRetry = null;
+      closeModal('editorEncodingRetryModal');
+    }
     const detectedEncoding = (data.info && data.info.encoding) || requestedEncoding || 'UTF-8';
     const detectedEol = (data.info && data.info.eol) || 'lf';
     const detectedBom = !!(data.info && data.info.bom);
@@ -7176,7 +7229,7 @@
       externalUploadCount: preservedUploadCount,
       dirty: false
     };
-    if ($('editorEncoding')) $('editorEncoding').value = detectedEncoding;
+    selectEncoding('editorEncoding', detectedEncoding);
     if ($('editorEol')) { $('editorEol').value = detectedEol; $('editorEol').disabled = readOnly; }
     if ($('editorBom')) { $('editorBom').checked = detectedBom; $('editorBom').disabled = readOnly; }
     updateExternalEditorControls();
@@ -7269,14 +7322,14 @@
     const enc = ($('editorEncoding') && $('editorEncoding').value) || 'UTF-8';
     const eol = ($('editorEol') && $('editorEol').value) || 'lf';
     const bom = !!($('editorBom') && $('editorBom').checked);
-    return enc !== (state.editor.initialEncoding || 'UTF-8')
+    return enc.toLowerCase() !== (state.editor.initialEncoding || 'UTF-8').toLowerCase()
       || eol !== (state.editor.initialEol || 'lf')
       || bom !== !!state.editor.initialBom;
   }
 
   function markDirty() {
     if (state.editor.readOnly) return;
-    state.editor.dirty = getEditorValue() !== state.editor.original || editorFormatChanged();
+    state.editor.dirty = state.editor.isNew || getEditorValue() !== state.editor.original || editorFormatChanged();
     $('editorStatus').textContent = state.editor.dirty
       ? t("Modified - not saved")
       : t("No changes");
@@ -7419,7 +7472,7 @@
     if ($('searchMaxSizeUnit')) $('searchMaxSizeUnit').value = '1024';
     if ($('searchModifiedAfter')) $('searchModifiedAfter').value = '';
     if ($('searchModifiedBefore')) $('searchModifiedBefore').value = '';
-    if ($('searchEncoding')) $('searchEncoding').value = 'UTF-8';
+    selectEncoding('searchEncoding', 'UTF-8');
     toggleSearchContents();
     openModal('searchModal');
   }
@@ -9228,6 +9281,7 @@
       event.target.isContentEditable === true ||
       (event.target.closest && !!event.target.closest('.cm-editor'));
     if (event.key === 'Escape') {
+      if ($('editorEncodingRetryModal').classList.contains('open')) { cancelEditorEncodingRetry(); return; }
       if ($('hostKeyModal').classList.contains('open')) { await cancelHostKey(); return; }
       if ($('terminalHelpModal') && $('terminalHelpModal').classList.contains('open')) { closeTerminalHelp(); return; }
       if ($('terminalModal').classList.contains('open')) { if (!embeddedTerminal) closeTerminal(); return; }
@@ -10078,7 +10132,7 @@
     updateRemoteDesktopScriptToolbarState();
     $('remoteDesktopStatus').textContent = t('Checking…');
     try {
-      const data = await apiPost('/api/desktop/check', { tab: tabId, kind: kind, host: host, port: port });
+      const data = await apiPost('/api/desktop/check', { tab: tabId, kind: kind, host: host, port: port, tunnel_via_ssh: !!($('remoteDesktopTunnel') && $('remoteDesktopTunnel').checked) });
       if (generation !== remoteDesktopState.generation) return;
       remoteDesktopState.lastCheck = {data, tabId, kind, host, port};
       const desktopMissing = kind === 'x2go' && data && data.success && data.desktop_checked === true && !data.desktop;
@@ -10619,6 +10673,42 @@
   };
 
   let transferSettings = Object.assign({}, TRANSFER_DEFAULTS);
+  let pendingPresetOverrides = new Set();
+  let pendingPresetInherits = new Set();
+  const PRESET_OVERRIDE_FIELDS = {
+    transferMode: 'transfer', prefTransfer: 'transfer',
+    transferSpeed: 'speed', prefSpeed: 'speed',
+    transferPreserveTime: 'preserve_time', prefPreserveTime: 'preserve_time',
+    transferNewerOnly: 'newer_only', prefNewerOnly: 'newer_only',
+    transferNoPermissions: 'no_permissions', prefNoPermissions: 'no_permissions'
+  };
+  document.addEventListener('change', event => {
+    const field = PRESET_OVERRIDE_FIELDS[event.target && event.target.id];
+    if (!field) return;
+    if (field === 'transfer' && !event.target.value) {
+      pendingPresetOverrides.delete(field);
+      pendingPresetInherits.add(field);
+    } else {
+      pendingPresetInherits.delete(field);
+      pendingPresetOverrides.add(field);
+    }
+  });
+  function presetOverrides(prefs) {
+    if (Array.isArray(prefs.preset_overrides)) return prefs.preset_overrides.slice();
+    // Old preferences did not record whether default-valued controls were touched.
+    // Preserve non-default choices; defaults inherit the selected preset.
+    const result = [];
+    if (prefs.transfer && prefs.transfer !== 'binary') result.push('transfer');
+    if (prefs.speed) result.push('speed');
+    if (prefs.preserve_time === false) result.push('preserve_time');
+    if (prefs.newer_only) result.push('newer_only');
+    if (prefs.no_permissions) result.push('no_permissions');
+    return result;
+  }
+  function mergedPresetOverrides(existing) {
+    return Array.from(new Set([...(existing || []), ...pendingPresetOverrides]))
+      .filter(field => !pendingPresetInherits.has(field));
+  }
   // The stored preferences, as the backend holds them. Every transfer and
   // confirmation reads its defaults from here, so a second browser on the
   // same account starts from the same values instead of its own storage.
@@ -10627,6 +10717,7 @@
   function preferencesToSettings(prefs) {
     return {
       preset: prefs.preset || '',
+      presetOverrides: presetOverrides(prefs),
       transfer: prefs.transfer || '',
       filemask: prefs.filemask || '',
       speed: prefs.speed || 0,
@@ -10646,7 +10737,8 @@
   function settingsToPreferences(settings) {
     return Object.assign({}, preferences || {}, {
       preset: settings.preset || '',
-      transfer: settings.transfer || '',
+      preset_overrides: settings.presetOverrides || [],
+      transfer: settings.transfer || 'binary',
       filemask: settings.filemask || '',
       speed: settings.speed || 0,
       resumesupport: settings.resumesupport || '',
@@ -10967,6 +11059,8 @@
   }
 
   function openTransferSettings() {
+    pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     clearTransferPresetRuleFields();
     if (transferSettings.permissions && $('transferPresetPermissions')) {
       const p = String(transferSettings.permissions).trim();
@@ -10988,7 +11082,8 @@
     });
     selectStoredTransferPreset($('transferPresetSelect'), transferSettings.preset);
     if ($('transferPresetName')) $('transferPresetName').value = transferSettings.preset === 'off' ? '' : (transferSettings.preset || '');
-    $('transferMode').value = transferSettings.transfer || '';
+    $('transferMode').value = (transferSettings.presetOverrides || []).includes('transfer')
+      ? (transferSettings.transfer || 'binary') : '';
     $('transferMask').value = transferSettings.filemask || '';
     $('transferSpeed').value = transferSettings.speed || 0;
     // The threshold is stored as a number of KiB, but the select has no
@@ -11047,6 +11142,7 @@
     const preserveTime = $('transferPreserveTime').checked;
     transferSettings = {
       preset: selectedPreset,
+      presetOverrides: mergedPresetOverrides(transferSettings.presetOverrides),
       transfer: $('transferMode').value,
       filemask: $('transferMask').value.trim(),
       speed: speed,
@@ -11067,7 +11163,9 @@
   }
 
   async function resetTransferSettings() {
-    transferSettings = Object.assign({}, TRANSFER_DEFAULTS);
+    pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
+    transferSettings = Object.assign({}, TRANSFER_DEFAULTS, {presetOverrides: []});
     if (!await persistTransferSettings()) return;
     openTransferSettings();
     toast(t('Transfer settings restored to their defaults.'));
@@ -11079,18 +11177,19 @@
     const opts = {
       resume: !!transferSettings.resume,
       recursive: true,
-      newer_only: !!transferSettings.newerOnly,
-      preserve_time: transferSettings.preserveTime !== false,
-      transfer: transferSettings.transfer || '',
       filemask: transferSettings.filemask || '',
-      speed: transferSettings.speed || 0,
       append: !!transferSettings.append,
-      no_permissions: !!transferSettings.noPermissions,
       resumesupport: transferSettings.resumesupport || '',
       priority: !!transferSettings.priority
     };
+    const overrides = transferSettings.presetOverrides || [];
+    if (overrides.includes('transfer')) opts.transfer = transferSettings.transfer || 'binary';
+    if (overrides.includes('speed')) opts.speed = transferSettings.speed || 0;
+    if (overrides.includes('preserve_time')) opts.preserve_time = transferSettings.preserveTime !== false;
+    if (overrides.includes('newer_only')) opts.newer_only = !!transferSettings.newerOnly;
+    if (overrides.includes('no_permissions')) opts.no_permissions = !!transferSettings.noPermissions;
     if (transferSettings.permissions) opts.permissions = transferSettings.permissions;
-    if (transferSettings.preserveTimeDirs && opts.preserve_time) opts.preserve_time_dirs = true;
+    if (transferSettings.preserveTimeDirs && transferSettings.preserveTime !== false) opts.preserve_time_dirs = true;
     if (transferSettings.preset) opts.preset = transferSettings.preset;
     return opts;
   }
@@ -11107,7 +11206,7 @@
   }
 
   function fillPreferencesForm(prefs) {
-    $('prefTransfer').value = prefs.transfer || '';
+    $('prefTransfer').value = presetOverrides(prefs).includes('transfer') ? (prefs.transfer || 'binary') : '';
     $('prefFilemask').value = prefs.filemask || '';
     $('prefSpeed').value = prefs.speed || 0;
     if ($('prefResumeSupport') && $('prefResumeSize')) {
@@ -11139,7 +11238,8 @@
       resumesupport = sup === 'size' ? String(sz) : sup;
     }
     return Object.assign({}, preferences || {}, {
-      transfer: $('prefTransfer').value,
+      preset_overrides: mergedPresetOverrides(presetOverrides(preferences || {})),
+      transfer: $('prefTransfer').value || 'binary',
       filemask: $('prefFilemask').value.trim(),
       speed: parseInt($('prefSpeed').value, 10) || 0,
       resumesupport: resumesupport,
@@ -11320,6 +11420,8 @@
   }
 
   async function openPreferences() {
+    pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     if (!preferences) await loadTransferSettings();
     fillPreferencesForm(preferences || {});
     $('preferencesStatus').textContent = '';
@@ -11343,6 +11445,8 @@
   }
 
   async function resetPreferences() {
+    pendingPresetOverrides = new Set();
+    pendingPresetInherits = new Set();
     const result = await apiPost('/api/preferences', { action: 'reset' });
     if (!result.success) {
       $('preferencesStatus').textContent = errorMessage(result.error,
@@ -12826,12 +12930,19 @@
 
   let shellOffer = null;
   const shellOfferedOnTab = {};
+  let shellPendingError = false;
 
   async function checkShellPending() {
     if (handlingShare) return;
     if ($('shellUploadModal').classList.contains('open')) return;
     const data = await apiGet('/api/shell/pending');
-    const pending = (data && data.pending) || [];
+    if (!data || !data.success) {
+      if (!shellPendingError) toast(errorMessage(data && data.error, t('Cannot queue the transfer.')), true);
+      shellPendingError = true;
+      return;
+    }
+    shellPendingError = false;
+    const pending = data.pending || [];
     for (const item of pending) {
       // Offered once per tab: "Later" defers without nagging, but moving
       // to another tab offers the files against that one instead.
@@ -12839,8 +12950,8 @@
       // One file set, two hosts: the desktop's `--shell-upload` selection and
       // Android's share hand-off both arrive as this manifest. The desktop
       // confirms against a tab because the user may have no connection yet;
-      // Android's share already happened, so it goes through the drop path,
-      // which asks the same overwrite questions and reports the same way.
+      // Android's share already happened, so it is sent to the transfer queue;
+      // the consume endpoint reports any per-item refusal.
       if (await queueSharedFiles(item)) return;
       shellOffer = item;
       shellOfferedOnTab[item.id] = state.activeTab;
@@ -12860,8 +12971,8 @@
 
   /* Android's share sheet stages what another app sent and records the same
    * manifest the desktop's `--shell-upload` selection does. A share is a drop
-   * the user already made, so it is queued at once through the same request
-   * the drop path uses instead of waiting behind a dialog; the desktop's
+   * the user already made, so it is queued at once through the same
+   * shell-selection endpoint instead of waiting behind a dialog; the desktop's
    * selection keeps its confirmation because there the user may not be
    * connected yet. */
   async function queueSharedFiles(item) {
@@ -12888,8 +12999,9 @@
         refreshQueue();
       }
       if (refused) {
-        toast(tn("{count} shared file could not be queued.",
-          "{count} shared files could not be queued.", refused), true);
+        const reasons = (result.refused || []).map(entry => entry.name + ': ' + entry.error);
+        if (reasons.length) toast(t("These files could not be queued: {reasons}", {reasons: reasons.join('; ')}), true);
+        if ((result.missing || []).length) toast(t("Some files are no longer there: {names}", {names: result.missing.join(', ')}), true);
       }
       return true;
     } finally {

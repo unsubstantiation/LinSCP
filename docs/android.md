@@ -22,8 +22,10 @@ upload). Android support is incomplete:
   or other process termination; this is not a durable job queue. When the native
   Android Keystore bridge is registered, `PasswordVault` double-wraps the
   Argon2id-sealed master-key envelope inside an `AndroidKeyStore` AES-256-GCM
-  hardware-bound key (`LSCPKST1`), transparently upgrading existing `LSCPVLT1`
-  vault envelopes when unlocked; biometric unlock prompts remain unwired.
+  Android Keystore key (`LSCPKST1`), transparently upgrading existing `LSCPVLT1`
+  vault envelopes when unlocked. Optional biometric unlock is available on
+  supported devices; see [biometric vault unlock](android-biometric-unlock.md).
+  Hardware-backed protection depends on the device and configuration.
 - One `hostCapabilities()` description drives host-dependent controls. SAF,
   incoming share intents, foreground transfers, and external viewer intents are
   reported for the registered native Android build; a browser running on Android
@@ -33,7 +35,8 @@ upload). Android support is incomplete:
   or the site's standalone SSH jump-tunnel settings). X2Go/X11 external Android
   intents are not supported (X2Go uses the built-in experimental KDrive viewer).
   Debian/Windows use native desktop viewers and OS file-drop events; Android
-  uses document grants and the Share Sheet instead. `hostDifferenceReason()`
+  uses document grants and share intents instead. Emulator tests use explicit
+  intents; real share-sheet selection and other providers remain unverified. `hostDifferenceReason()`
   explains unavailable integrations. `linscp-gui --install-shell-integration` is
   one of those differences: it writes per-user file-manager menus into an XDG
   data directory, which Android has neither of, so the command refuses by name

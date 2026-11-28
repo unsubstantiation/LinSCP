@@ -25,6 +25,29 @@ pub mod gui_os;
 pub mod terminal;
 pub mod watcher;
 
+/// Whether synchronization must conservatively detect case aliases on the
+/// host filesystem. This is not a complete model of filesystem-specific rules.
+pub fn sync_paths_case_insensitive() -> bool {
+    cfg!(windows)
+}
+
+/// Refuse names that Win32 can alias or cannot safely open. Other platforms
+/// still enforce common single-component validation in the synchronization engine.
+pub fn is_sync_filename_supported(name: &str) -> bool {
+    if !cfg!(windows) { return true; }
+    if name.ends_with(['.', ' ']) || name.contains(['<', '>', '"', '|', '?', '*']) {
+        return false;
+    }
+    let stem = name.split('.').next().unwrap_or("").trim_end_matches(' ').to_ascii_uppercase();
+    if matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+        | "COM¹" | "COM²" | "COM³" | "LPT¹" | "LPT²" | "LPT³")
+        || (stem.len() == 4 && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && matches!(stem.as_bytes()[3], b'1'..=b'9')) {
+        return false;
+    }
+    true
+}
+
 #[cfg(target_os = "linux")]
 pub mod linux;
 #[cfg(target_os = "linux")]

@@ -1,6 +1,12 @@
 # Native feature audit follow-up — 2026-11-20
 
-**Implementation follow-up:** This branch now contains fixes for the findings below and for stale monitor candidates. Treat this report as the pre-fix audit, not a statement that every issue remains unfixed. The Rust changes and live protocol behavior still require a full build and acceptance testing. The new synchronization baseline is keyed by protocol and username as well as endpoint and directories. If an older baseline exists, synchronization refuses to proceed until the user reviews and backs up/removes it; it is not silently reused across accounts.
+**Historical pre-fix audit:** The findings and test status below describe this
+review at the time it was written, not the current implementation. Subsequent
+fixes and cross-platform CI evidence are summarized in the
+[final parity review](final-parity-review.md); that evidence is scoped and does
+not certify the application for production. The synchronization baseline is now
+keyed by protocol and username as well as endpoint and directories. Older
+baselines require user review and backup/removal rather than silent reuse.
 
 Scope: source trace of the shared GUI, Tauri's asynchronous service dispatch, session persistence, synchronization and import. This is a prioritized review, not an exhaustive feature certification. The earlier `feature-audit-2026-11-20.md` is a historical baseline; its import, folder-delete and session-file read-error findings were addressed in merged PR #126, not re-reported here. Findings below are confirmed by code paths unless marked as requiring reproduction. No application fixes were made in this audit.
 

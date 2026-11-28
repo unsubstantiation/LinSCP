@@ -1,152 +1,43 @@
 # SSH jump hosts
 
-LinSCP supports one authenticated SSH jump host for an SFTP, SCP or SSH
-session. It opens an SSH `direct-tcpip` channel to the destination and connects
-the destination's independent SSH transport through a private socket pair.
-No local TCP listener is opened unless `TunnelLocalPortNumber` selects a
-loopback port for this session's own connection.
+LinSCP supports one SSH jump host for SSH, SFTP and SCP sessions, and for
+FTP/FTPS, WebDAV and S3 through a loopback SOCKS relay. Configure **Use SSH
+tunnel** and the jump host's connection details in the Site Manager. Verify
+both jump and destination host keys through an independent trusted source;
+they are checked and remembered separately. A configured parent proxy is used
+to reach the jump. Forwarding failure is reported, not silently retried direct.
 
-FTP, FTPS, WebDAV and S3 sessions use the jump host too. The session starts a
-SOCKS5 relay on 127.0.0.1, and the relay opens a separate `direct-tcpip`
-channel through the jump for each connection; FTP data connections are
-passive. TLS SNI and S3 request signing keep the original host name.
+The jump resolves the destination. For SFTP/SCP/SSH the destination transport uses
+its own SSH connection and credentials. FTP/FTPS uses passive data connections;
+TLS and S3 signing retain the target hostname. The loopback relay uses a fresh
+per-relay SOCKS credential. An explicitly selected local tunnel port is reserved
+for the client's own connection. These controls do not defend against a
+privileged process or one able to inspect the application's memory; a local
+attacker may still cause denial of service.
 
-In every case, the jump host resolves the destination name, and the
-destination keeps its own username, credentials and host-key identity. Any
-configured parent proxy is used to reach the **jump host**, not to bypass it
-and reach the destination directly. If the jump refuses a forward, the session
-fails; it never falls back to a direct connection.
+External RDP/VNC/SPICE viewers use a separate unauthenticated loopback forward
+and require a trusted local environment. If a requested forward cannot be
+established, the desktop launch fails rather than falling back to direct.
+Tunneled SPICE with a separate TLS port is refused. X11/Waypipe jump forwarding
+is not supported. See [authentication and IPC boundaries](authentication-ipc-security.md).
 
-This is a supported subset, **not full upstream tunnel or authentication parity**.
-Kerberos/GSSAPI authentication uses libssh when its public GSSAPI capability is
-present; GSSAPI key exchange is probed separately and `AuthGSSAPIKEX` is refused
-if the loaded libssh cannot honor it or a host-key pin is configured, rather
-than falling back to an ordinary exchange or silently skipping the pin.
+## Kerberos
 
-The live SFTP suite provisions an isolated loopback Kerberos realm, a second
-directly trusted realm, and an OpenSSH server. It tests:
+The current Rust SSH implementation uses system GSSAPI on Linux or SSPI on
+Windows. Delegation is off by default; explicitly enabling it can expose
+credentials to the destination server. Destination GSSAPI settings do **not**
+enable GSSAPI or delegation to the jump host. Android system GSSAPI and GSSAPI
+key exchange are unsupported. The isolated Linux MIT KDC/OpenSSH fixture tests
+missing credentials, wrong service identity, mutual authentication and opt-in
+delegation; production KDCs, Windows AD, cross-realm behavior and an independent
+security review remain open. See the [delegation review brief](gssapi-delegation-review.md).
 
-- principal selection;
-- missing and expired tickets;
-- the server identity;
-- cross-realm login;
-- opt-in TGT delegation.
+## Verification
 
-The jump session uses the destination's Kerberos settings except
-`LogicalHostName`, as upstream does. So with `GSSAPIFwdTGT=1`, the **jump host
-receives the delegated ticket too**.
-
-Production-KDC validation and an independent security review of delegation
-remain open; the [review brief](gssapi-delegation-review.md) lists what a
-reviewer should check. Unsupported or malformed settings fail rather than
-silently make a direct connection. See the
-[remaining parity plan](remaining-parity-plan.md).
-
-## Command line
-
-Verify **both** fingerprints through an independent trusted source before
-connecting. Replace the example fingerprints and key paths below:
-
-```sh
-linscp -batch \
-  -privatekey="$HOME/.ssh/destination_key" \
-  -hostkey='SHA256:DESTINATION_FINGERPRINT' \
-  -rawsettings=5 Tunnel=1 TunnelHostName=jump.example.com \
-  TunnelUserName=jumper "TunnelPublicKeyFile=$HOME/.ssh/jump_key" \
-  'TunnelHostKey=SHA256:JUMP_FINGERPRINT' \
-  '-command=open sftp://user@private.internal/; ls; exit'
-```
-
-Global `-rawsettings=N` consumes exactly `N` assignments. The uncounted form
-consumes the following recognized `name=value` settings. These defaults also
-apply to `-shell`. An `open` or `savesession` command can specify its own
-`-rawsettings` values, including overrides of a stored site.
-
-| Setting | Meaning / default |
-| --- | --- |
-| `Tunnel` | `0` (disabled) or `1` (enabled) |
-| `TunnelHostName` | Required jump hostname when enabled |
-| `TunnelPortNumber` | Jump SSH port; default `22` |
-| `TunnelUserName` | Jump username; empty uses the local account name |
-| `TunnelPassword` | Jump password, independent of the destination password |
-| `TunnelPublicKeyFile` | Jump private key file |
-| `TunnelPassphrase` | Passphrase for that private key |
-| `TunnelHostKey` | Jump fingerprint; empty uses the host-key cache/confirmation policy |
-| `TunnelLocalPortNumber` | `0` (default) uses a private socket pair; `1`–`65535` binds that loopback port for this session's own connection and fails if it is taken |
-
-Use `LINSCP_TUNNEL_PASSWORD` and `LINSCP_TUNNEL_PASSPHRASE` when supplying jump
-secrets to a process. `LINSCP_PASSWORD` still belongs to the **destination**.
-Avoid secrets in shell history, process arguments or scripts readable by
-others. Environment variables avoid the argument list but are not a vault:
-the same OS user and privileged processes may be able to read them.
-
-The upstream `TunnelPasswordPlain` and `TunnelPassphrasePlain` spellings are
-also accepted as aliases for the corresponding plaintext inputs and are masked
-in logs. This does not import the upstream client's encrypted password format.
-
-Passwords and passphrases are not saved merely by connecting. To store jump
-secrets explicitly, supply `TunnelPassword`/`TunnelPassphrase` to
-`savesession -rawsettings` using a private script or the GUI's save controls.
-They are encrypted in `sessions.ini` using the existing per-user
-`sessions.key`, with restrictive permissions. A missing/unreadable key fails a
-stored tunnel closed and does not discard its ciphertext on an unrelated edit.
-Disabling a stored tunnel clears its saved jump secrets.
-
-The CLI reports `TUNNELHOSTKEY` for a refused jump key and `HOSTKEY` for a
-refused destination key. `HOSTKEYSTATE <role> changed` distinguishes a mismatch
-from an unknown key. Never solve a mismatch by automatically trusting `*`.
-
-## Graphical client
-
-Enable **Use SSH tunnel** in the site manager and supply the jump settings.
-The password/passphrase storage checkbox is separate from the destination's
-password storage choice. The site manager keeps two separate destination
-entries, both encrypted under the per-user `sessions.key` when the storage
-checkbox is ticked: **User Password** (the server login password) and
-**Key Password** (the passphrase decrypting an encrypted private key). The
-tunnel section likewise stores its jump password and the **Tunnel key
-passphrase**, which is honoured for encrypted jump keys at connect time.
-Background operations, queued transfers and the
-embedded SSH terminal use the same tunnel policy.
-
-An untrusted jump key is presented first, followed by an independent challenge
-for the destination. Changed keys show a warning instead of being described as
-new/uncached, and do not default to being remembered. Each hop's **Remember**
-choice is independent: accepting the jump does not approve the destination.
-A stale key or role confirmation is rejected.
-
-Remembering a fingerprint stores that hop's pin in the selected site, even if
-later authentication or the other hop fails. It does **not** implicitly store
-the connection's passwords/passphrases or the other hop's transient pin.
-Unchecked keys remain pinned only for that tab and its child operations.
-The GUI sets `LINSCP_CACHE_PINNED_HOSTKEYS=0` in its core processes to prevent
-implicit global caching; ordinary CLI fingerprint caching remains unchanged.
-Existing host-key cache entries are still consulted.
-
-## Reproducing the tests
-
-With the native build dependencies (including libssh 0.10 or newer), Python
-`paramiko`, and the OpenSSH `scp` executable installed:
-
-```sh
-cmake -S . -B build
-cmake --build build -j
-ctest --test-dir build -R live-tunnel-tests --output-on-failure
-# Or, after a Makefile build:
-python3 source/linux/tests/LiveTunnelTest.py source/linux/build/linscp
-```
-
-`make -C source/linux check-live` and the native CI jobs include this suite.
-The fixtures use independent keys and a destination name resolvable only by the
-jump server. They test SFTP/SCP bytes, exec and repeated shell exit behavior (including nonzero exits,
-full stdout/stderr delivery and rejection of a status without EOF), password and
-encrypted-key authentication, independent pin failures, inherited proxy routing,
-slow/backpressured transfers, forwarding timeout, cancellation/interruption,
-repeated socket/thread cleanup, encrypted storage and the actual GUI HTTP
-challenge/remember flow. They also cover the SOCKS relay: WebDAV, FTP and S3
-transfers through the jump, no direct connection when the jump refuses a
-forward, and a reported local-port collision. Offline unit, script, GUI security and jsdom tests
-cover validation, credential handling and form behavior too.
-
-These local fixtures are reproducible evidence for that scope, not certification
-against every SSH implementation, authentication policy or network condition.
+Linux and Windows Rust tests cover mock SSH jump routing, host-key checks,
+authenticated SOCKS relay and proxy failure behavior. The Linux KDC fixture is
+run by `bash tools/live_kerberos_ci.sh` in an isolated CI environment with its
+required MIT Kerberos, OpenSSH and sudo dependencies. The older
+`source/linux/tests/LiveTunnelTest.py` targets the retired `linscp` executable
+and is not evidence for the current GUI. See the
+[final parity review](final-parity-review.md) for run links and limitations.

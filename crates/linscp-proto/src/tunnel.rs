@@ -4,6 +4,8 @@
 
 use std::sync::Arc;
 
+use rand::RngCore;
+use subtle::ConstantTimeEq;
 use russh::client;
 use russh::ChannelStream;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -197,6 +199,7 @@ pub fn tunnel_ssh_flags(spec: &SshTunnelSpec) -> String {
 /// fresh `direct-tcpip` channel on an authenticated bastion `SshConnection`.
 pub struct Socks5JumpRelay {
     local_port: u16,
+    password: String,
     shutdown_tx: watch::Sender<bool>,
     accept_task: JoinHandle<()>,
 }
@@ -204,6 +207,14 @@ pub struct Socks5JumpRelay {
 impl Socks5JumpRelay {
     pub fn local_port(&self) -> u16 {
         self.local_port
+    }
+
+    /// Credentials are generated per relay and stay in the client process.
+    pub fn proxy_config(&self) -> crate::proxy::ProxyConfig {
+        let mut proxy = crate::proxy::ProxyConfig::socks5_loopback(self.local_port);
+        proxy.username = Some("linscp".to_string());
+        proxy.password = Some(self.password.clone());
+        proxy
     }
 
     pub async fn stop(self) {
@@ -299,18 +310,29 @@ impl SshJumpTunnel {
         let bound_addr = listener.local_addr().map_err(|e| {
             ProtoError::Transport(format!("Failed to read local tunnel address: {e}"))
         })?;
+        // Reserve the client's source port before accepting. A different local
+        // process must not win the accept race and receive the SSH stream.
+        let socket = tokio::net::TcpSocket::new_v4().map_err(|e| ProtoError::Transport(e.to_string()))?;
+        socket.bind("127.0.0.1:0".parse().expect("loopback address"))
+            .map_err(|e| ProtoError::Transport(e.to_string()))?;
+        let expected_peer = socket.local_addr().map_err(|e| ProtoError::Transport(e.to_string()))?;
         let ssh = Arc::clone(&self.ssh);
         let target_host = dest_host.to_string();
         tokio::spawn(async move {
-            if let Ok((mut accepted, _)) = listener.accept().await {
+            let accept_client = async {
+                loop {
+                    let (accepted, peer) = listener.accept().await?;
+                    if peer == expected_peer { return Ok::<_, std::io::Error>(accepted); }
+                }
+            };
+            if let Ok(Ok(mut accepted)) = tokio::time::timeout(std::time::Duration::from_secs(10), accept_client).await {
                 drop(listener);
-                if let Ok(mut remote) = ssh.open_direct_tcpip_stream(&target_host, dest_port).await
-                {
+                if let Ok(mut remote) = ssh.open_direct_tcpip_stream(&target_host, dest_port).await {
                     let _ = tokio::io::copy_bidirectional(&mut accepted, &mut remote).await;
                 }
             }
         });
-        let client_sock = TcpStream::connect(bound_addr).await.map_err(|e| {
+        let client_sock = socket.connect(bound_addr).await.map_err(|e| {
             ProtoError::Transport(format!("Failed to connect local jump port: {e}"))
         })?;
         let _ = client_sock.set_nodelay(true);
@@ -332,10 +354,15 @@ impl SshJumpTunnel {
             .map_err(|e| ProtoError::Transport(format!("SOCKS5 local_addr failed: {e}")))?
             .port();
 
+        let mut random = [0u8; 32];
+        rand::rngs::OsRng.fill_bytes(&mut random);
+        let password = random.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
+        let relay_password = Arc::new(password.clone());
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let ssh = Arc::clone(&self.ssh);
 
         let accept_task = tokio::spawn(async move {
+            let mut clients = tokio::task::JoinSet::new();
             loop {
                 tokio::select! {
                     changed = shutdown_rx.changed() => {
@@ -343,22 +370,29 @@ impl SshJumpTunnel {
                             break;
                         }
                     }
+                    Some(_) = clients.join_next(), if !clients.is_empty() => {},
                     accepted = listener.accept() => {
                         let Ok((stream, _peer)) = accepted else {
                             break;
                         };
                         let _ = stream.set_nodelay(true);
+                        // Bound unauthenticated clients and handshake lifetime.
+                        if clients.len() >= 128 { continue; }
                         let ssh_conn = Arc::clone(&ssh);
-                        tokio::spawn(async move {
-                            let _ = handle_socks5_jump_client(stream, ssh_conn).await;
+                        let password = Arc::clone(&relay_password);
+                        clients.spawn(async move {
+                            let _ = handle_socks5_jump_client(stream, ssh_conn, &password).await;
                         });
                     }
                 }
             }
+            clients.abort_all();
+            while clients.join_next().await.is_some() {}
         });
 
         Ok(Socks5JumpRelay {
             local_port: actual_port,
+            password,
             shutdown_tx,
             accept_task,
         })
@@ -484,9 +518,9 @@ where
     })
 }
 
-async fn handle_socks5_jump_client(
-    mut stream: TcpStream,
-    ssh: Arc<SshConnection>,
+async fn authenticate_jump_client<S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin>(
+    stream: &mut S,
+    password: &str,
 ) -> Result<(), ProtoError> {
     let mut greet = [0u8; 2];
     stream
@@ -501,17 +535,34 @@ async fn handle_socks5_jump_client(
         .read_exact(&mut methods)
         .await
         .map_err(|e| ProtoError::Transport(e.to_string()))?;
-    if !methods.contains(&0x00) {
+    if !methods.contains(&0x02) {
         let _ = stream.write_all(&[0x05, 0xff]).await;
-        return Err(ProtoError::Transport(
-            "SOCKS5 client did not offer No-Auth.".to_string(),
-        ));
+        return Err(ProtoError::Transport("Jump relay requires authentication.".to_string()));
     }
-    stream
-        .write_all(&[0x05, 0x00])
-        .await
-        .map_err(|e| ProtoError::Transport(e.to_string()))?;
+    stream.write_all(&[0x05, 0x02]).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    let mut header = [0u8; 2];
+    stream.read_exact(&mut header).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    if header[0] != 1 || header[1] == 0 { return Err(ProtoError::Transport("Invalid jump relay authentication.".into())); }
+    let mut user = vec![0u8; header[1] as usize];
+    stream.read_exact(&mut user).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    let mut len = [0u8; 1];
+    stream.read_exact(&mut len).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    let mut supplied = zeroize::Zeroizing::new(vec![0u8; len[0] as usize]);
+    stream.read_exact(&mut supplied).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    let accepted = user.as_slice().ct_eq(b"linscp").unwrap_u8() == 1
+        && supplied.as_slice().ct_eq(password.as_bytes()).unwrap_u8() == 1;
+    stream.write_all(&[1, if accepted { 0 } else { 1 }]).await.map_err(|e| ProtoError::Transport(e.to_string()))?;
+    if !accepted { return Err(ProtoError::Transport("Jump relay authentication failed.".into())); }
+    Ok(())
+}
 
+async fn handle_socks5_jump_client(
+    mut stream: TcpStream,
+    ssh: Arc<SshConnection>,
+    password: &str,
+) -> Result<(), ProtoError> {
+    tokio::time::timeout(std::time::Duration::from_secs(10), authenticate_jump_client(&mut stream, password))
+        .await.map_err(|_| ProtoError::Transport("Jump relay authentication timed out.".into()))??;
     let mut hdr = [0u8; 4];
     stream
         .read_exact(&mut hdr)

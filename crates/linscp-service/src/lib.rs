@@ -239,6 +239,7 @@ impl CommanderService {
             UserPreferences::default()
         };
         let queue = queue::QueueManager::new(tokio::sync::broadcast::channel(64).0, local_fs.clone());
+        let xml_log_lock = queue.xml_log_lock();
         let initial_xml = Self::resolve_xml_log_path(&config_root, &preferences).ok().flatten();
         queue.set_xml_log_path(initial_xml);
         Self {
@@ -276,7 +277,7 @@ impl CommanderService {
             recovery_gate: Arc::new(std::sync::atomic::AtomicBool::new(recovery_needed)),
             config_activity: Arc::new(tokio::sync::RwLock::new(())),
             queue,
-            xml_log_lock: Arc::new(Mutex::new(())),
+            xml_log_lock,
             share_export_status: Arc::new(Mutex::new(share_export::ShareExportStatus::default())),
             share_export_cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             desktop_spawn_allowed: false,
@@ -4316,8 +4317,7 @@ impl CommanderService {
                 "File is too large for the built-in editor ({} bytes; maximum {} bytes).",
                 entry.size, ops::MAX_GUI_EDIT_BYTES));
         }
-        let bytes = match linscp_proto::download_bytes(session.as_ref(), &path,
-            linscp_proto::TransferRequest::default()).await
+        let bytes = match ops::download_bounded(session.as_ref(), &path, ops::MAX_GUI_EDIT_BYTES as usize).await
         {
             Ok(bytes) => bytes,
             Err(error) => return api_error(400, error.to_string()),
@@ -4872,117 +4872,6 @@ impl CommanderService {
                 Err(error) => return api_error(500, format!("Cannot load transfer presets: {error}")),
             }
         };
-        let matched_preset: Option<linscp_engine::presets::TransferPreset> = if presets_disabled {
-            None
-        } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
-            match preset_store.find(requested_preset_raw).cloned() {
-                Some(p) => Some(p),
-                None => return api_error(400, format!("There is no transfer preset named '{requested_preset_raw}'.")),
-            }
-        } else {
-            let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
-            if site_preset_name.eq_ignore_ascii_case("off") || site_preset_name.eq_ignore_ascii_case("none") {
-                None
-            } else if !site_preset_name.is_empty() {
-                match preset_store.find(site_preset_name).cloned() {
-                    Some(preset) => Some(preset),
-                    None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
-                }
-            } else {
-                let first_name = names.first().and_then(Value::as_str).unwrap_or("");
-                let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
-                let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
-                let rdir = body.get("remote_dir").and_then(Value::as_str).unwrap_or(&tab.remote_dir);
-                let ldir = body.get("local_dir").and_then(Value::as_str).unwrap_or(&tab.local_dir);
-                preset_store
-                    .match_mask(first_name)
-                    .or_else(|| preset_store.match_session(host, user, rdir, ldir))
-                    .cloned()
-            }
-        };
-        let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
-        let newer_only = body
-            .get("newer_only")
-            .and_then(Value::as_bool)
-            .or_else(|| {
-                if move_item {
-                    None
-                } else {
-                    matched_preset.as_ref().and_then(|p| p.newer_only)
-                }
-            })
-            .unwrap_or(false);
-        let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
-        let has_explicit_no_permissions = body.get("no_permissions").is_some();
-        let explicit_permissions = match body
-            .get("permissions")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            None => None,
-            Some(raw) => {
-                let mut tmp = linscp_engine::presets::TransferPreset::default();
-                if let Err(error) = tmp.parse_setting("permissions", raw) {
-                    return api_error(400, error);
-                }
-                tmp.permissions
-            }
-        };
-        let speed_kb = match body.get("speed") {
-            None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
-            Some(v) => match v.as_u64() {
-                Some(n) if n <= 100_000_000 => n,
-                _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
-            },
-        };
-        let transfer_raw = body.get("transfer").and_then(Value::as_str).unwrap_or("").trim();
-        let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
-            "" => matched_preset.as_ref().and_then(|p| p.transfer_mode).unwrap_or(linscp_types::TransferMode::Binary),
-            "binary" => linscp_types::TransferMode::Binary,
-            "ascii" => linscp_types::TransferMode::Ascii,
-            "automatic" | "auto" => linscp_types::TransferMode::Automatic,
-            _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
-        };
-        let mask_raw = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim();
-        if !mask_raw.is_empty() && move_item {
-            return api_error(400, "File masks are not supported for moves.");
-        }
-        let parsed_mask = if mask_raw.is_empty() {
-            if !move_item {
-                match matched_preset.as_ref().filter(|p| !p.mask.is_empty()) {
-                    Some(preset) => match linscp_engine::filemask::FileMask::parse(&preset.mask) {
-                        Ok(mask) => mask,
-                        Err(error) => return api_error(400, format!("Invalid transfer preset mask: {error}")),
-                    },
-                    None => linscp_engine::filemask::FileMask::default(),
-                }
-            } else {
-                linscp_engine::filemask::FileMask::default()
-            }
-        } else {
-            match linscp_engine::filemask::FileMask::parse(mask_raw) {
-                Ok(mask) => mask,
-                Err(error) => return api_error(400, error),
-            }
-        };
-        let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
-        let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
-            "" => match matched_preset.as_ref().and_then(|p| p.resume_support) {
-                Some(rs) => (rs, false),
-                None => (linscp_engine::presets::ResumeSupportMode::On, false),
-            },
-            "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
-            "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
-            "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
-            other => match other.parse::<u64>() {
-                Ok(kb) => (linscp_engine::presets::ResumeSupportMode::Smart(kb.saturating_mul(1024)), true),
-                Err(_) => return api_error(400, "Invalid resumesupport value (expected on, off, default, or size in KiB)."),
-            },
-        };
-        if move_item && (append || newer_only) {
-            return api_error(400, "Moves cannot be combined with append or newer-only filtering.");
-        }
         let local_dir = match body.get("local_dir").and_then(Value::as_str) {
             Some(path) => match check_local_pane_directory(path, "local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) },
             None => return api_error(400, "Missing local directory"),
@@ -4991,45 +4880,6 @@ impl CommanderService {
         if other_dir.is_empty() || other_dir.chars().any(char::is_control) { return api_error(400, "Missing remote directory"); }
         let session = tab.remote.clone();
         if !tab.is_local && session.is_none() { return api_error(400, "Not connected"); }
-        if !tab.is_local {
-            let scheme = session.as_ref().unwrap().scheme();
-            if matches!(scheme, linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
-                && explicit_resume_support
-                && !matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off)
-            {
-                return api_error(400, "The SCP protocol cannot resume transfers.");
-            }
-        }
-        let is_ftp_upload = upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
-        let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
-        if is_ftp_upload && !append && !ftp_risk_accepted {
-            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
-        }
-        let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
-        if resume && append {
-            return api_error(400, "Cannot combine resume and append.");
-        }
-        if resume && transfer_mode != linscp_types::TransferMode::Binary {
-            return api_error(400, "Verified resume requires binary transfer mode.");
-        }
-        if resume && matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off) && explicit_resume_support {
-            return api_error(400, "Cannot request resume when resume support is disabled.");
-        }
-        if append {
-            if tab.is_local {
-                return api_error(400, "Append is supported only on remote transfers.");
-            }
-            if upload && !session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) {
-                return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
-            }
-        }
-        if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
-            return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
-        }
-        let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
-        if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
-            return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
-        }
         let overwrite = body.get("overwrite").and_then(Value::as_str).unwrap_or("ask");
         if overwrite != "ask" && overwrite != "overwrite" { return api_error(400, "Unsupported overwrite policy"); }
         let mut jobs = Vec::new();
@@ -5045,6 +4895,152 @@ impl CommanderService {
         for value in names {
             let name = match value.as_str() { Some(name) => name, None => return api_error(400, "Invalid file name") };
             if !seen.insert(name) { return api_error(400, "Duplicate file name") };
+            let matched_preset: Option<linscp_engine::presets::TransferPreset> = if presets_disabled {
+                None
+            } else if !requested_preset_raw.is_empty() && !requested_preset_raw.eq_ignore_ascii_case("auto") {
+                match preset_store.find(requested_preset_raw).cloned() {
+                    Some(p) => Some(p),
+                    None => return api_error(400, format!("There is no transfer preset named '{requested_preset_raw}'.")),
+                }
+            } else {
+                let site_preset_name = tab.spec.as_ref().map(|s| s.preset_name.trim()).unwrap_or("");
+                if site_preset_name.eq_ignore_ascii_case("off") || site_preset_name.eq_ignore_ascii_case("none") {
+                    None
+                } else if !site_preset_name.is_empty() {
+                    match preset_store.find(site_preset_name).cloned() {
+                        Some(preset) => Some(preset),
+                        None => return api_error(400, format!("The site's transfer preset '{site_preset_name}' does not exist; choose a preset or explicitly disable presets.")),
+                    }
+                } else {
+                    let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
+                    let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
+                    let rdir = body.get("remote_dir").and_then(Value::as_str).unwrap_or(&tab.remote_dir);
+                    let ldir = body.get("local_dir").and_then(Value::as_str).unwrap_or(&tab.local_dir);
+                    preset_store.match_transfer(host, user, rdir, ldir, name).cloned()
+                }
+            };
+            let append = body.get("append").and_then(Value::as_bool).unwrap_or(false);
+            let newer_only = body
+                .get("newer_only")
+                .and_then(Value::as_bool)
+                .or_else(|| {
+                    if move_item {
+                        None
+                    } else {
+                        matched_preset.as_ref().and_then(|p| p.newer_only)
+                    }
+                })
+                .unwrap_or(false);
+            let no_permissions = body.get("no_permissions").and_then(Value::as_bool).unwrap_or(false);
+            let has_explicit_no_permissions = body.get("no_permissions").is_some();
+            let explicit_permissions = match body
+                .get("permissions")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                None => None,
+                Some(raw) => {
+                    let mut tmp = linscp_engine::presets::TransferPreset::default();
+                    if let Err(error) = tmp.parse_setting("permissions", raw) {
+                        return api_error(400, error);
+                    }
+                    tmp.permissions
+                }
+            };
+            let speed_kb = match body.get("speed") {
+                None => matched_preset.as_ref().and_then(|p| p.speed_kbytes_per_sec).unwrap_or(0u64),
+                Some(v) => match v.as_u64() {
+                    Some(n) if n <= 100_000_000 => n,
+                    _ => return api_error(400, "Speed limit must be an integer between 0 and 100000000 KiB/s."),
+                },
+            };
+            let transfer_raw = body.get("transfer").and_then(Value::as_str).unwrap_or("").trim();
+            let transfer_mode = match transfer_raw.to_ascii_lowercase().as_str() {
+                "" => matched_preset.as_ref().and_then(|p| p.transfer_mode).unwrap_or(linscp_types::TransferMode::Binary),
+                "binary" => linscp_types::TransferMode::Binary,
+                "ascii" => linscp_types::TransferMode::Ascii,
+                "automatic" | "auto" => linscp_types::TransferMode::Automatic,
+                _ => return api_error(400, "Unsupported transfer mode (expected binary, ascii, or automatic)."),
+            };
+            let mask_raw = body.get("filemask").and_then(Value::as_str).unwrap_or("").trim();
+            if !mask_raw.is_empty() && move_item {
+                return api_error(400, "File masks are not supported for moves.");
+            }
+            let parsed_mask = if mask_raw.is_empty() {
+                if !move_item {
+                    match matched_preset.as_ref().filter(|p| !p.mask.is_empty()) {
+                        Some(preset) => match linscp_engine::filemask::FileMask::parse(&preset.mask) {
+                            Ok(mask) => mask,
+                            Err(error) => return api_error(400, format!("Invalid transfer preset mask: {error}")),
+                        },
+                        None => linscp_engine::filemask::FileMask::default(),
+                    }
+                } else {
+                    linscp_engine::filemask::FileMask::default()
+                }
+            } else {
+                match linscp_engine::filemask::FileMask::parse(mask_raw) {
+                    Ok(mask) => mask,
+                    Err(error) => return api_error(400, error),
+                }
+            };
+            let resume_support_raw = body.get("resumesupport").and_then(Value::as_str).unwrap_or("").trim();
+            let (parsed_resume_support, explicit_resume_support) = match resume_support_raw.to_ascii_lowercase().as_str() {
+                "" => match matched_preset.as_ref().and_then(|p| p.resume_support) {
+                    Some(rs) => (rs, false),
+                    None => (linscp_engine::presets::ResumeSupportMode::On, false),
+                },
+                "on" => (linscp_engine::presets::ResumeSupportMode::On, true),
+                "off" => (linscp_engine::presets::ResumeSupportMode::Off, true),
+                "default" => (linscp_engine::presets::ResumeSupportMode::Smart(100 * 1024), true),
+                other => match other.parse::<u64>() {
+                    Ok(kb) => (linscp_engine::presets::ResumeSupportMode::Smart(kb.saturating_mul(1024)), true),
+                    Err(_) => return api_error(400, "Invalid resumesupport value (expected on, off, default, or size in KiB)."),
+                },
+            };
+            if move_item && (append || newer_only) {
+                return api_error(400, "Moves cannot be combined with append or newer-only filtering.");
+            }
+            if !tab.is_local {
+                let scheme = session.as_ref().unwrap().scheme();
+                if matches!(scheme, linscp_types::ProtocolScheme::Scp | linscp_types::ProtocolScheme::Ssh)
+                    && explicit_resume_support
+                    && !matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off)
+                {
+                    return api_error(400, "The SCP protocol cannot resume transfers.");
+                }
+            }
+            let is_ftp_upload = upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes));
+            let ftp_risk_accepted = body.get("accept_ftp_rename_risk").and_then(Value::as_bool).unwrap_or(false);
+            if is_ftp_upload && !append && !ftp_risk_accepted {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP upload requires confirmation of rename risks", "ftp_rename_risk": true}) };
+            }
+            let resume = body.get("resume").and_then(Value::as_bool).unwrap_or(false);
+            if resume && append {
+                return api_error(400, "Cannot combine resume and append.");
+            }
+            if resume && transfer_mode != linscp_types::TransferMode::Binary {
+                return api_error(400, "Verified resume requires binary transfer mode.");
+            }
+            if resume && matches!(parsed_resume_support, linscp_engine::presets::ResumeSupportMode::Off) && explicit_resume_support {
+                return api_error(400, "Cannot request resume when resume support is disabled.");
+            }
+            if append {
+                if tab.is_local {
+                    return api_error(400, "Append is supported only on remote transfers.");
+                }
+                if upload && !session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) {
+                    return api_error(400, "Upload append is supported only for SFTP and FTP/FTPS sessions.");
+                }
+            }
+            if resume && (upload || tab.is_local || session.as_ref().is_none_or(|s| !matches!(s.scheme(), linscp_types::ProtocolScheme::Dav | linscp_types::ProtocolScheme::Davs | linscp_types::ProtocolScheme::Webdav | linscp_types::ProtocolScheme::Webdavs | linscp_types::ProtocolScheme::S3 | linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes))) {
+                return api_error(400, "Verified resume is supported only for SFTP, FTP/FTPS, WebDAV, and S3 file downloads and remote-to-local moves.");
+            }
+            let best_effort_resume = body.get("accept_best_effort_resume_risk").and_then(Value::as_bool).unwrap_or(false);
+            if resume && !upload && !tab.is_local && session.as_ref().is_some_and(|s| matches!(s.scheme(), linscp_types::ProtocolScheme::Sftp | linscp_types::ProtocolScheme::Ftp | linscp_types::ProtocolScheme::Ftps | linscp_types::ProtocolScheme::Ftpes)) && !best_effort_resume {
+                return ApiReply { status: 409, payload: json!({"success": false, "error": "FTP/SFTP resume requires confirmation of source-change risk", "best_effort_resume_risk": true}) };
+            }
             let local = match resolve_contained(&local_dir, name) { Ok(path) => PathBuf::from(path), Err(error) => return api_error(400, error) };
             let other = if tab.is_local {
                 let directory = match check_local_pane_directory(other_dir, "other_local_dir") { Ok(path) => path, Err(error) => return api_error(400, error) };
@@ -5779,6 +5775,8 @@ impl CommanderService {
             let has_custom_scripts_field = prefs_val
                 .as_object()
                 .is_some_and(|m| m.contains_key("custom_install_scripts"));
+            let has_preset_overrides_field = prefs_val
+                .as_object().is_some_and(|m| m.contains_key("preset_overrides"));
             let parsed: Result<UserPreferences, _> = serde_json::from_value(prefs_val);
             let mut parsed = match parsed {
                 Ok(p) => p,
@@ -5789,6 +5787,9 @@ impl CommanderService {
                     }
                 }
             };
+            if !has_preset_overrides_field {
+                parsed.preset_overrides = self.state.lock().expect("m").preferences.preset_overrides.clone();
+            }
             if has_custom_scripts_field {
                 match linscp_engine::sanitize_custom_install_scripts_map(
                     &parsed.custom_install_scripts,
@@ -7771,9 +7772,7 @@ impl CommanderService {
                     let filename = query.get("filename").map(String::as_str).unwrap_or("");
                     let host = tab.spec.as_ref().map(|s| s.session.host.as_str()).unwrap_or("");
                     let user = tab.spec.as_ref().map(|s| s.session.username.as_str()).unwrap_or("");
-                    matched = store
-                        .match_mask(filename)
-                        .or_else(|| store.match_session(host, user, &tab.remote_dir, &tab.local_dir))
+                    matched = store.match_transfer(host, user, &tab.remote_dir, &tab.local_dir, filename)
                         .map(|p| p.name.clone());
                 }
             }
@@ -7902,22 +7901,25 @@ impl CommanderService {
             default_path
         };
         let _guard = self.xml_log_lock.lock().expect("xml log lock");
-        match std::fs::read(&target) {
-            Ok(bytes) => {
-                let max = 512 * 1024usize;
-                let truncated = bytes.len() > max;
-                let slice = if truncated { &bytes[bytes.len() - max..] } else { &bytes[..] };
-                ApiReply {
-                    status: 200,
-                    payload: json!({
-                        "success": true,
-                        "enabled": prefs.xml_log_enabled,
-                        "path": target.to_string_lossy(),
-                        "exists": true,
-                        "size": bytes.len(),
-                        "truncated": truncated,
-                        "content": String::from_utf8_lossy(slice),
-                    }),
+        use std::io::{Read, Seek, SeekFrom};
+        match std::fs::File::open(&target) {
+            Ok(mut file) => {
+                let result = (|| -> std::io::Result<(u64, Vec<u8>)> {
+                    let size = file.metadata()?.len();
+                    let max = 512 * 1024u64;
+                    file.seek(SeekFrom::Start(size.saturating_sub(max)))?;
+                    let mut bytes = Vec::new();
+                    file.take(max).read_to_end(&mut bytes)?;
+                    Ok((size, bytes))
+                })();
+                match result {
+                    Ok((size, bytes)) => ApiReply { status: 200, payload: json!({
+                        "success": true, "enabled": prefs.xml_log_enabled,
+                        "path": target.to_string_lossy(), "exists": true,
+                        "size": size, "truncated": size > 512 * 1024,
+                        "content": String::from_utf8_lossy(&bytes),
+                    }) },
+                    Err(e) => api_error(500, format!("Cannot read XML log '{}': {e}", target.display())),
                 }
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => ApiReply {
@@ -8082,11 +8084,7 @@ impl CommanderService {
         if entry.size > 16 * 1024 * 1024 {
             return api_error(400, "File exceeds the 16 MiB external editor staging limit.");
         }
-        let bytes = match linscp_proto::download_bytes(
-            session.as_ref(),
-            &remote_path,
-            linscp_proto::TransferRequest::default(),
-        )
+        let bytes = match ops::download_bounded(session.as_ref(), &remote_path, 16 * 1024 * 1024)
         .await
         {
             Ok(b) => b,
@@ -8417,14 +8415,13 @@ impl CommanderService {
         let mut paths = Vec::new();
         if let Some(list) = body.get("source_paths").and_then(Value::as_array) {
             paths.extend(list.iter().filter_map(Value::as_str).map(str::to_string));
-        }
-        if let Some(single) = body.get("source_path").and_then(Value::as_str) {
+        } else if let Some(single) = body.get("source_path").and_then(Value::as_str) {
             paths.push(single.to_string());
         }
         paths
             .into_iter()
-            .map(|path| path.trim().to_string())
-            .filter(|path| !path.is_empty() && !path.chars().any(char::is_control))
+            // Spaces are valid filename bytes; trimming changes the source.
+            .filter(|path| !path.trim().is_empty() && !path.chars().any(char::is_control))
             .collect()
     }
 
@@ -8514,7 +8511,11 @@ impl CommanderService {
                     "The dropped SAF URI must name a document, not a tree root.".to_string(),
                 );
             }
-            return Ok((parsed.parent_uri(), parsed.leaf_name()));
+            let leaf = parsed.leaf_name();
+            if leaf != leaf.trim() {
+                return Err("Dropped names with leading or trailing whitespace are not supported.".to_string());
+            }
+            return Ok((parsed.parent_uri(), leaf));
         }
         let path = Path::new(path);
         let leaf = path
@@ -8522,6 +8523,11 @@ impl CommanderService {
             .and_then(|name| name.to_str())
             .ok_or_else(|| "The dropped item has no usable name.".to_string())?
             .to_string();
+        // Transfer name validation currently normalizes surrounding whitespace.
+        // Reject rather than silently copying/uploading under a different name.
+        if leaf != leaf.trim() {
+            return Err("Dropped names with leading or trailing whitespace are not supported.".to_string());
+        }
         let parent = path
             .parent()
             .map(|parent| parent.to_string_lossy().into_owned())
@@ -8810,31 +8816,22 @@ impl CommanderService {
         // over one path per item, and the page only names them. Each item is
         // staged under its own leaf name and the queue is asked once, so one
         // drop is one queue entry, one conflict answer and the same overwrite
-        // rules a transfer out of the local pane obeys. A lone plain file is
-        // left to the byte path below, which has staged files since before
-        // paths existed.
+        // rules a transfer out of the local pane obeys. Even one native file
+        // uses bounded streaming rather than being read wholly into memory.
         let source_paths = Self::drop_source_paths(&body);
-        let single_plain_file = source_paths.len() == 1
-            && matches!(Self::dropped_path_kind(&source_paths[0]), Ok(DroppedKind::File));
-        if !source_paths.is_empty() && !single_plain_file {
+        for path in &source_paths {
+            if let Err(error) = Self::dropped_path_split(path) { return api_error(400, error); }
+        }
+        if !source_paths.is_empty() {
             let staging = match self.drop_staging_dir() {
                 Ok(path) => path,
                 Err(error) => return api_error(500, error),
             };
             let mut names: Vec<String> = Vec::new();
-            let mut staged_paths: Vec<PathBuf> = Vec::new();
-            // A failed drop removes what it already staged: the queue never saw
-            // those names, so nothing else will.
-            let tidy = |staged: &[PathBuf], batch_dir: &Path| {
-                for path in staged {
-                    if std::fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir()) {
-                        let _ = std::fs::remove_dir_all(path);
-                    } else {
-                        let _ = std::fs::remove_file(path);
-                    }
-                }
-                let _ = std::fs::remove_dir(batch_dir);
-            };
+            // The private batch may also contain the current partially copied
+            // file when a read or write fails. Remove the entire batch, not
+            // just the names that completed successfully.
+            let tidy = || { let _ = std::fs::remove_dir_all(&staging); };
             let mut staged_files = 0usize;
             let mut staged_bytes = 0u64;
             for path in &source_paths {
@@ -8846,21 +8843,20 @@ impl CommanderService {
                 ) {
                     Ok(relative) => relative,
                     Err(error) => {
-                        tidy(&staged_paths, &staging);
+                        tidy();
                         return api_error(400, error);
                     }
                 };
                 if names.contains(&relative) {
                     // Two items of one drop cannot share a name: the queue
                     // would upload the same staging path twice.
-                    tidy(&staged_paths, &staging);
+                    tidy();
                     return api_error(400, "Two dropped items have the same name.");
                 }
-                staged_paths.push(staging.join(&relative));
                 names.push(relative);
             }
             if names.is_empty() {
-                tidy(&staged_paths, &staging);
+                tidy();
                 return api_error(400, "The drop contained nothing that can be uploaded.");
             }
             let mut request = json!({
@@ -8886,7 +8882,7 @@ impl CommanderService {
                 // refusal), so the staged copy is ours again. It has to go now:
                 // the page retries the same drop with the decision, and a
                 // staging entry that already exists would refuse that retry.
-                tidy(&staged_paths, &staging);
+                tidy();
             }
             return reply;
         }
@@ -9930,6 +9926,9 @@ impl CommanderService {
         let desktop_opts = linscp_proto::remote_desktop::DesktopOptions::from_raw_fields(&spec.raw_fields);
         let tunneled = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false)
             || spec.session.tunnel.as_ref().map(|t| t.enabled && !t.host.trim().is_empty()).unwrap_or(false);
+        if tunneled {
+            return api_error(400, "A downloadable ticket cannot create an SSH forward. Launch through a connected SSH session instead.");
+        }
         let cfg = linscp_proto::remote_desktop::RemoteDesktopConnectConfig {
             scheme,
             kind,
@@ -9963,6 +9962,9 @@ impl CommanderService {
     }
 
     fn handle_desktop_launch(&self, body: Value) -> ApiReply {
+        if body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false) {
+            return api_error(400, "SSH desktop tunneling requires async launch with a connected SSH session.");
+        }
         let tab_id = tabs::parse_tab_id_value(body.get("tab"))
             .or_else(|| body.get("tabId").and_then(|v| v.as_u64()))
             .or_else(|| body.get("tab_id").and_then(|v| v.as_u64()));
@@ -10241,11 +10243,13 @@ impl CommanderService {
         // Prefer desktop tab spec if provided
         let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
         let mut via_tab_id: Option<u64> = None;
+        let mut configured_jump = false;
         if let Some(tid) = tab_id {
             let state = self.state.lock().expect("state mutex");
             if let Some(tab) = state.tabs.get(&tid) {
                 if let Some(spec) = tab.spec.as_ref() {
                     if spec.session.protocol.is_remote_desktop() {
+                        configured_jump = spec.session.tunnel.as_ref().is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
                         kind = RemoteDesktopKind::from_scheme(spec.session.protocol).unwrap_or(kind);
                         if target_host.is_empty() { target_host = spec.session.host.clone(); }
                         if target_port == 0 { target_port = if spec.session.port == 0 { spec.session.protocol.default_port() } else { spec.session.port }; }
@@ -10400,6 +10404,10 @@ impl CommanderService {
         if kind == RemoteDesktopKind::X2Go {
             return api_error(400, "Connect an SSH session to this server to check X2Go before installing.");
         }
+        // A direct probe would leak the target when an SSH route was requested.
+        if configured_jump || body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false) {
+            return api_error(400, "Cannot probe the desktop directly when an SSH tunnel is requested. Connect an SSH session first.");
+        }
         // No SSH session: try TCP probe if direct desktop port
         let tcp_ok = linscp_proto::remote_desktop::check_tcp_availability(&target_host, target_port).await;
         if tcp_ok {
@@ -10538,7 +10546,14 @@ impl CommanderService {
         let mut target_host = body.get("host").and_then(|v| v.as_str()).unwrap_or("").to_string();
         let tab_id = tabs::parse_tab_id_value(body.get("tab")).or_else(|| tabs::parse_tab_id_value(body.get("via_tab"))).or_else(|| body.get("tabId").and_then(|v| v.as_u64()));
         let mut kind = match Self::parse_desktop_kind_str(kind_str) { Ok(kind) => kind, Err(error) => return api_error(400, error) };
-        let mut target_port: u16 = body.get("port").and_then(|v| v.as_u64()).unwrap_or(0) as u16;
+        let mut target_port: u16 = match body.get("port") {
+            None | Some(Value::Null) => 0,
+            Some(value) => match value.as_u64().and_then(|n| u16::try_from(n).ok()) {
+                Some(port) => port,
+                None => return api_error(400, "Invalid desktop port."),
+            },
+        };
+        if target_host.chars().any(char::is_control) { return api_error(400, "Invalid desktop host."); }
         let mut desktop_tab_spec: Option<tabs::TabRuntime> = None;
         let mut via_session: Option<std::sync::Arc<dyn linscp_proto::RemoteSession>> = None;
         let mut via_tab_id: Option<u64> = None;
@@ -10593,6 +10608,16 @@ impl CommanderService {
             if let Some(tab) = desktop_tab_spec.as_ref() { if let Some(spec) = tab.spec.as_ref() { target_host = spec.session.host.clone(); } }
         }
         if target_port == 0 { target_port = match kind { RemoteDesktopKind::Rdp => 3389, RemoteDesktopKind::Vnc => 5900, RemoteDesktopKind::Spice => 5900, _ => 22 }; }
+        let want_ssh_tunnel = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false);
+        let configured_jump = desktop_tab_spec.as_ref().and_then(|tab| tab.spec.as_ref())
+            .and_then(|spec| spec.session.tunnel.as_ref())
+            .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
+        if (want_ssh_tunnel || configured_jump) && kind == RemoteDesktopKind::X11 {
+            return api_error(400, "SSH jump forwarding is not supported for external X11 or Waypipe viewers.");
+        }
+        if want_ssh_tunnel && via_session.is_none() && !configured_jump {
+            return api_error(400, "SSH desktop tunnel requested but no connected SSH session or configured jump is available.");
+        }
         let pkg = server_package_name(kind);
         let descr = server_description(kind);
         let (script, default_script, is_custom) = self
@@ -10645,11 +10670,7 @@ impl CommanderService {
                 Err(e) => return api_error(400, format!("Could not verify the remote desktop server: {e}")),
             }
         } else if !target_host.is_empty() && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
-            let has_jump_tunnel = desktop_tab_spec
-                .as_ref()
-                .and_then(|t| t.spec.as_ref())
-                .and_then(|s| s.session.tunnel.as_ref())
-                .is_some_and(|tun| tun.enabled && !tun.host.trim().is_empty());
+            let has_jump_tunnel = configured_jump || want_ssh_tunnel;
             // When no SSH jump tunnel is configured, probe direct TCP reachability;
             // when a jump tunnel is configured, the desktop port is reached via SSH forwarding below.
             let tcp_ok = if has_jump_tunnel {
@@ -10695,7 +10716,6 @@ impl CommanderService {
             (target_host.clone(), target_port, match kind { RemoteDesktopKind::Rdp => linscp_types::ProtocolScheme::Rdp, RemoteDesktopKind::Vnc => linscp_types::ProtocolScheme::Vnc, RemoteDesktopKind::Spice => linscp_types::ProtocolScheme::Spice, RemoteDesktopKind::X2Go => linscp_types::ProtocolScheme::X2Go, RemoteDesktopKind::X11 => linscp_types::ProtocolScheme::X11 })
         };
         // Try to find the desktop tab to get full spec (including raw_fields, tunnel)
-        let want_ssh_tunnel = body.get("tunnel_via_ssh").and_then(Value::as_bool).unwrap_or(false);
         let tab_for_launch = if let Some(tid) = tab_id { self.state.lock().expect("m").tabs.get(&tid).cloned() } else { None };
         let (cfg, target, mut tunneled) = if let Some(tab) = tab_for_launch.as_ref() {
             if let Some(spec) = tab.spec.as_ref() {
@@ -10722,6 +10742,10 @@ impl CommanderService {
             let t = format!("{}:{}", spec_host, spec_port);
             (c, t, want_ssh_tunnel)
         };
+        if tunneled && kind == RemoteDesktopKind::Spice && cfg.desktop_opts.spice_tls_port.is_some() {
+            return api_error(400, "SPICE with a separate TLS port cannot use this single-port SSH forward.");
+        }
+        let target = cfg.target();
         let mut tunnel_port_opt = None;
         let mut tunnel_id_opt: Option<u64> = None;
         if (tunneled || want_ssh_tunnel) && matches!(kind, RemoteDesktopKind::Rdp | RemoteDesktopKind::Vnc | RemoteDesktopKind::Spice) {
@@ -10797,6 +10821,8 @@ impl CommanderService {
                     }
                     Err(e) => return api_error(500, format!("Could not open local SSH forwarder: {e}")),
                 }
+            } else {
+                return api_error(400, "SSH desktop tunnel requested but no connected SSH session or configured jump is available.");
             }
         }
         let proto_ticket = ticket_from_config(
@@ -11377,12 +11403,9 @@ fn read_ca_bundle_for_export(
                 )
             })?;
             let path = entry.path();
-            if path
-                .extension()
-                .and_then(|ext| ext.to_str())
-                .is_some_and(|ext| matches!(ext.to_ascii_lowercase().as_str(), "pem" | "crt" | "cer"))
-                && std::fs::metadata(&path).is_ok_and(|meta| meta.is_file())
-            {
+            // The TLS connection loader accepts PEM files regardless of their
+            // suffix (including OpenSSL hashed .0 names). Match it here.
+            if std::fs::metadata(&path).is_ok_and(|meta| meta.is_file()) {
                 cert_paths.push(path);
             }
         }
@@ -11394,6 +11417,9 @@ fn read_ca_bundle_for_export(
                 secret_vault,
                 "CA certificate file",
             )?;
+            if !bytes.windows(11).any(|window| window == b"-----BEGIN ") {
+                continue;
+            }
             if !combined.is_empty() && !combined.ends_with(b"\n") {
                 combined.push(b'\n');
             }
@@ -12078,6 +12104,7 @@ fn import_offlineotp_entries(
     replace_same_names: bool,
 ) -> Result<(usize, usize, usize), String> {
     let mut created_files = Vec::<PathBuf>::new();
+    let mut sessions_published = false;
     let result = (|| {
         let OfflineOtpImportPlan { sites, vault_keys, ignored } = plan_offlineotp_import(imported, selection)?;
         // Stage standalone keys first, so referenced keys deduplicate against
@@ -12167,15 +12194,28 @@ fn import_offlineotp_entries(
                 let Some((hk_host, hk_port_str)) = hk.host_port.rsplit_once('@') else { continue; };
                 let Ok(hk_port) = hk_port_str.parse::<u16>() else { continue; };
                 let existing_fp = hostkey_cache.lookup(hk_host, hk_port, &hk.key_type);
-                if existing_fp.is_none() || replace_same_names {
-                    if existing_fp != Some(hk.key.as_str()) {
+                match existing_fp {
+                    Some(existing) if existing != hk.key.as_str() => return Err(format!(
+                        "Cannot import '{}': cached SSH host key for {} conflicts with an existing key. Resolve the conflict first.",
+                        candidate.site.name, hk.host_port
+                    )),
+                    Some(_) => {},
+                    None => {
                         hostkey_cache.upsert(hk_host, hk_port, &hk.key_type, &hk.key)?;
                         hostkeys_changed = true;
                     }
                 }
             }
             if let Some(preset) = candidate.transfer_preset.take() {
-                if preset_store.find(&preset.name).is_none() || replace_same_names {
+                if let Some(existing) = preset_store.find(&preset.name) {
+                    // Presets are shared with other sessions. Even an explicit
+                    // session replacement must not silently change those sessions.
+                    let mut comparable = preset.clone();
+                    comparable.name = existing.name.clone();
+                    if existing != &comparable {
+                        return Err(format!("Cannot import '{}': transfer preset '{}' conflicts with an existing preset. Resolve the conflict first.", candidate.site.name, preset.name));
+                    }
+                } else {
                     preset_store.add_or_update(preset)?;
                     presets_changed = true;
                 }
@@ -12187,6 +12227,9 @@ fn import_offlineotp_entries(
         if staged_site_names.is_empty() {
             return Ok((0, skipped, ignored));
         }
+        // An atomic write can report an error after publishing (for example,
+        // if its durability barrier fails). Do not delete keys at that point.
+        sessions_published = true;
         store.save_to_dir(config_root, secret_vault)
             .map_err(|error| format!("Cannot save imported sessions: {error}"))?;
         if hostkeys_changed {
@@ -12211,7 +12254,7 @@ fn import_offlineotp_entries(
         Ok((staged_site_names.len(), skipped, ignored))
     })();
 
-    if result.is_err() {
+    if result.is_err() && !sessions_published {
         for path in created_files {
             let _ = std::fs::remove_file(path);
         }
@@ -13382,6 +13425,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn desktop_requested_tunnels_do_not_fall_back_to_direct_connections() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let request = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        for path in ["/api/desktop/check", "/api/desktop/launch"] {
+            let reply = svc.dispatch_async(request(path, json!({"kind":"rdp", "host":"192.0.2.1", "tunnel_via_ssh":true}))).await;
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+        for port in [json!(65536), json!(-1), json!("3389")] {
+            let reply = svc.dispatch_async(request("/api/desktop/launch", json!({"kind":"rdp", "host":"example.test", "port":port}))).await;
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session, &tmp.path().to_string_lossy());
+        let (spec, _) = tabs::parse_gui_session_spec(&json!({"protocol":"sftp", "host":"example.test"}), None, tmp.path(), svc.secret_vault.as_ref()).unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().spec = Some(spec);
+        for path in ["/api/desktop/ticket", "/api/desktop/launch"] {
+            let reply = svc.dispatch(request(path, json!({"tab":id, "kind":"rdp", "tunnel_via_ssh":true})));
+            assert_eq!(reply.status, 400, "{}", reply.payload);
+        }
+    }
+
+    #[tokio::test]
     async fn x2go_does_not_assume_ssh_port_means_server_installed() {
         let tmp = tempfile::tempdir().unwrap();
         let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
@@ -13592,6 +13658,46 @@ mod tests {
     }
 
     #[test]
+    fn key_session_import_refuses_shared_preset_and_hostkey_conflicts() {
+        let src = tempfile::tempdir().unwrap();
+        let dst = tempfile::tempdir().unwrap();
+        let source_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        let dest_vault = linscp_platform::password_vault::PasswordSecretVault::new();
+        source_vault.unlock_or_setup(src.path(), "source passphrase", &NativeSecretVault::new()).unwrap();
+        dest_vault.unlock_or_setup(dst.path(), "destination passphrase", &NativeSecretVault::new()).unwrap();
+        let mut source = SessionStore::new();
+        let mut site = StoredSite::new("imported", ProtocolScheme::Sftp, "example.test");
+        site.preset = "shared".into();
+        source.upsert(site);
+        let mut presets = linscp_engine::presets::TransferPresetStore::default();
+        presets.add_or_update(linscp_engine::presets::TransferPreset { name: "shared".into(), newer_only: Some(true), ..Default::default() }).unwrap();
+        presets.save_to_dir(src.path()).unwrap();
+        let mut hostkeys = linscp_engine::hostkeys::HostKeyCache::new();
+        hostkeys.upsert("example.test", 22, "ssh-ed25519", "SHA256:source").unwrap();
+        hostkeys.save_protected(&src.path().join("sshhostkeys"), &source_vault).unwrap();
+        let entries = offlineotp_entries_from_sessions(&source, src.path(), &source_vault, None, false).unwrap();
+        let backup = offlineotp_vault::seal(&entries, "backup passphrase").unwrap();
+        let opened = || offlineotp_vault::open(&backup, "backup passphrase").unwrap();
+        let mut other = linscp_engine::presets::TransferPresetStore::default();
+        other.add_or_update(linscp_engine::presets::TransferPreset { name: "SHARED".into(), newer_only: Some(false), ..Default::default() }).unwrap();
+        other.save_to_dir(dst.path()).unwrap();
+        for replace in [false, true] {
+            let err = import_offlineotp_entries(dst.path(), SessionStore::new(), opened(), &dest_vault, None, replace).unwrap_err();
+            assert!(err.contains("preset") || err.contains("host key"), "{err}");
+            assert!(SessionStore::load_from_dir(dst.path(), &dest_vault).unwrap().find("imported").is_none());
+        }
+        presets.save_to_dir(dst.path()).unwrap();
+        let mut conflicting = linscp_engine::hostkeys::HostKeyCache::new();
+        conflicting.upsert("example.test", 22, "ssh-ed25519", "SHA256:other").unwrap();
+        conflicting.save_protected(&dst.path().join("sshhostkeys"), &dest_vault).unwrap();
+        for replace in [false, true] {
+            let err = import_offlineotp_entries(dst.path(), SessionStore::new(), opened(), &dest_vault, None, replace).unwrap_err();
+            assert!(err.contains("host key"), "{err}");
+            assert!(SessionStore::load_from_dir(dst.path(), &dest_vault).unwrap().find("imported").is_none());
+        }
+    }
+
+    #[test]
     fn offlineotp_vault_round_trip_restores_login_and_ssh_key_without_source_paths() {
         let temp = tempfile::tempdir().unwrap();
         let source_key = temp.path().join("original-id_ed25519");
@@ -13682,7 +13788,7 @@ mod tests {
         let ca_file = src_dir.path().join("root-ca.pem");
         let ca_dir = src_dir.path().join("ca-dir");
         std::fs::create_dir_all(&ca_dir).unwrap();
-        let ca_extra = ca_dir.join("intermediate.crt");
+        let ca_extra = ca_dir.join("01234567.0");
         let tls_cert = src_dir.path().join("client.crt");
         let tls_key = src_dir.path().join("client.key");
         let pin_pub = src_dir.path().join("server-spki.pub");
@@ -14733,6 +14839,72 @@ mod tests {
         assert!(done, "site opt-out transfers did not complete");
         assert_eq!(std::fs::read(other.join("allowed.txt")).unwrap(), b"allowed");
         assert_eq!(std::fs::read(other.join("excluded.bin")).unwrap(), b"excluded");
+    }
+
+    #[tokio::test]
+    async fn automatic_transfer_presets_match_each_file_and_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::create_dir_all(&dst).unwrap();
+        std::fs::write(src.join("a.txt"), b"text").unwrap();
+        std::fs::write(src.join("b.bin"), b"binary").unwrap();
+        let svc = CommanderService::new(temp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        for preset in [
+            json!({"name":"wrong-host", "host":"other.example", "mask":"*.txt", "permissions":"0700"}),
+            json!({"name":"text", "host":"prod.example", "mask":"*.txt", "permissions":"0600"}),
+            json!({"name":"binary", "host":"prod.example", "mask":"*.bin", "permissions":"0640"}),
+        ] {
+            let saved = svc.dispatch(ApiEnvelope { method: "POST".into(), path: "/api/presets/save".into(), body: preset });
+            assert_eq!(saved.status, 200, "{}", saved.payload);
+        }
+        let id = svc.create_local_tab(src.to_string_lossy().into_owned(), dst.to_string_lossy().into_owned()).payload["tab"]["id"].as_u64().unwrap();
+        {
+            let mut state = svc.state.lock().unwrap();
+            let mut spec = linscp_engine::url_and_raw::ParsedSiteSpec::default();
+            spec.session.host = "prod.example".into();
+            state.tabs.get_mut(&id).unwrap().spec = Some(spec);
+        }
+        let preview = svc.dispatch(ApiEnvelope { method: "GET".into(), path: format!("/api/presets?tab={id}&filename=a.txt"), body: json!({}) });
+        assert_eq!(preview.payload["matched"], "text");
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab":id,"local_dir":src,"remote_dir":dst,"names":["a.txt","b.bin"]}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            assert!(!tasks.iter().any(|task| task["status"] == "Failed"), "{tasks:?}");
+            if tasks.len() == 2 && tasks.iter().all(|task| task["status"] == "Completed") { done = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"text");
+        assert_eq!(std::fs::read(dst.join("b.bin")).unwrap(), b"binary");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(dst.join("a.txt")).unwrap().permissions().mode() & 0o777, 0o600);
+            assert_eq!(std::fs::metadata(dst.join("b.bin")).unwrap().permissions().mode() & 0o777, 0o640);
+        }
+        // An explicit preset wins over the site's selection, and an explicit
+        // permission value wins over that preset.
+        let other = temp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        svc.state.lock().unwrap().tabs.get_mut(&id).unwrap().spec.as_mut().unwrap().preset_name = "text".into();
+        let queued = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/transfer/upload".into(), body: json!({"tab":id,"local_dir":src,"remote_dir":other,"names":["b.bin"],"preset":"binary","permissions":"0604"}) }).await;
+        assert_eq!(queued.status, 200, "{}", queued.payload);
+        let mut done = false;
+        for _ in 0..200 {
+            let (tasks, _) = svc.queue.snapshot();
+            assert!(!tasks.iter().any(|task| task["status"] == "Failed"), "{tasks:?}");
+            if tasks.len() == 3 && tasks.iter().all(|task| task["status"] == "Completed") { done = true; break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(done);
+        assert_eq!(std::fs::read(other.join("b.bin")).unwrap(), b"binary");
+        #[cfg(unix)] {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(std::fs::metadata(other.join("b.bin")).unwrap().permissions().mode() & 0o777, 0o604);
+        }
     }
 
     #[tokio::test]
@@ -16391,6 +16563,92 @@ mod tests {
         let id = open.payload["tab"]["id"].as_u64().unwrap();
         Box::pin(exercise_cross_move_destination(&svc, id, "/", &tmp)).await;
         drop(server); let _ = std::fs::remove_dir_all(tmp);
+    }
+
+    /// Service routes against an actual loopback WebDAV server: one-way
+    /// synchronization, encoded editing/search, and a broken TCP delete.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_webdav_sync_encoding_and_interrupted_delete() {
+        if std::env::var_os("LSCP_LIVE_WEBDAV").is_none() { return; }
+        use std::io::{BufRead, BufReader};
+        use std::process::{Command, Stdio};
+        struct Server(std::process::Child);
+        impl Drop for Server { fn drop(&mut self) { let _ = self.0.kill(); let _ = self.0.wait(); } }
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(local.join("nested")).unwrap();
+        std::fs::write(local.join("nested/file.txt"), b"sync contents").unwrap();
+        let server_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../source/linux/tests/TestDavServer.py");
+        let child = Command::new("/usr/bin/python3").arg(server_path)
+            .env("LSCP_TEST_PORT", "0").env("LSCP_TEST_DROP_DELETE", "/partial/b.txt")
+            .stdout(Stdio::piped()).stderr(Stdio::null()).spawn().unwrap();
+        let mut server = Server(child);
+        let mut line = String::new();
+        BufReader::new(server.0.stdout.take().unwrap()).read_line(&mut line).unwrap();
+        let port: u16 = line.trim().strip_prefix("READY ").expect("WebDAV server did not start").parse().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let post = |path: &str, body: Value| ApiEnvelope { method: "POST".into(), path: path.into(), body };
+        let open = svc.dispatch_async(post("/api/tabs/open", json!({"session": {"protocol": "dav", "host": "127.0.0.1", "port": port, "username": "testuser", "password": "testpass", "local_dir": local, "initial_dir": "/"}}))).await;
+        assert_eq!(open.status, 200, "{}", open.payload);
+        let id = open.payload["tab"]["id"].as_u64().unwrap();
+        let session = svc.state.lock().unwrap().tabs.get(&id).unwrap().remote.as_ref().unwrap().clone();
+        session.mkdir("/sync").await.unwrap();
+        let sync_body = || json!({"tab": id, "local_dir": local, "remote_dir": "/sync", "mode": "remote", "preserve_time": false});
+        let preview = svc.dispatch_async(post("/api/sync/preview", sync_body())).await;
+        assert_eq!(preview.status, 200, "{}", preview.payload);
+        let run = svc.dispatch_async(post("/api/sync/run", sync_body())).await;
+        assert_eq!(run.status, 200, "{}", run.payload);
+        wait_for_task(&svc, "Completed").await;
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/sync/nested/file.txt", Default::default()).await.unwrap(), b"sync contents");
+
+        session.mkdir("/text").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/text/legacy.txt", b"caf\xe9\r\n", Default::default()).await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/text/binary.txt", b"caf\xe9\0binary", Default::default()).await.unwrap();
+        let get = |suffix: &str| ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=%2Ftext%2Flegacy.txt{suffix}"), body: json!({}) };
+        let invalid = svc.dispatch_async(get("")).await;
+        assert_eq!(invalid.status, 400, "{}", invalid.payload);
+        let edit = svc.dispatch_async(get("&encoding=windows-1252")).await;
+        assert_eq!(edit.status, 200, "{}", edit.payload);
+        assert_eq!(edit.payload["content"], "café\r\n");
+        assert_eq!(edit.payload["info"]["eol"], "crlf");
+        let search = svc.dispatch_async(post("/api/remote/search", json!({"tab": id, "path": "/text", "pattern": "*.txt", "search_contents": true, "content_query": "café", "encoding": "windows-1252"}))).await;
+        assert_eq!(search.status, 200, "{}", search.payload);
+        assert_eq!(search.payload["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search.payload["matches"][0]["name"], "legacy.txt");
+        assert_eq!(search.payload["skipped"], 1);
+        let save = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/text/legacy.txt", "content": "naïve\n", "encoding": "windows-1252", "eol": "crlf", "base_mtime": edit.payload["info"]["mtime"]}))).await;
+        assert_eq!(save.status, 200, "{}", save.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/text/legacy.txt", Default::default()).await.unwrap(), b"na\xefve\r\n");
+        let rejected = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/text/legacy.txt", "content": "snowman ☃", "encoding": "windows-1252"}))).await;
+        assert_eq!(rejected.status, 400, "{}", rejected.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/text/legacy.txt", Default::default()).await.unwrap(), b"na\xefve\r\n");
+
+        session.mkdir("/utf16").await.unwrap();
+        linscp_proto::upload_bytes(session.as_ref(), "/utf16/bom.txt", b"\xff\xfeC\0a\0f\0\xe9\0\r\0\n\0", Default::default()).await.unwrap();
+        let utf16 = svc.dispatch_async(ApiEnvelope { method: "GET".into(), path: format!("/api/remote/edit?tab={id}&path=%2Futf16%2Fbom.txt&encoding=utf-16le"), body: json!({}) }).await;
+        assert_eq!(utf16.status, 200, "{}", utf16.payload);
+        assert_eq!(utf16.payload["content"], "Café\r\n");
+        assert_eq!(utf16.payload["info"]["bom"], true);
+        let utf16_search = svc.dispatch_async(post("/api/remote/search", json!({"tab": id, "path": "/utf16", "pattern": "*.txt", "search_contents": true, "content_query": "Café", "encoding": "utf-16le"}))).await;
+        assert_eq!(utf16_search.status, 200, "{}", utf16_search.payload);
+        assert_eq!(utf16_search.payload["matches"].as_array().unwrap().len(), 1);
+        let utf16_save = svc.dispatch_async(post("/api/remote/save", json!({"tab": id, "path": "/utf16/bom.txt", "content": "ok\n", "encoding": "utf-16le", "eol": "crlf", "bom": true, "base_mtime": utf16.payload["info"]["mtime"]}))).await;
+        assert_eq!(utf16_save.status, 200, "{}", utf16_save.payload);
+        assert_eq!(linscp_proto::download_bytes(session.as_ref(), "/utf16/bom.txt", Default::default()).await.unwrap(), b"\xff\xfeo\0k\0\r\0\n\0");
+
+        session.mkdir("/partial").await.unwrap();
+        for (path, data) in [("/partial/a.txt", b"a".as_slice()), ("/partial/b.txt", b"b".as_slice()), ("/other.txt", b"other".as_slice())] {
+            linscp_proto::upload_bytes(session.as_ref(), path, data, Default::default()).await.unwrap();
+        }
+        let deleted = svc.dispatch_async(post("/api/remote/delete", json!({"tab": id, "names": ["other.txt", "partial"]}))).await;
+        assert_eq!(deleted.status, 200, "{}", deleted.payload);
+        assert_eq!(deleted.payload["deleted"], json!(["other.txt"]));
+        assert_eq!(deleted.payload["failed"][0]["name"], "partial");
+        assert!(deleted.payload["failed"][0]["error"].as_str().unwrap().contains("partially deleted"));
+        assert!(session.stat("/partial/a.txt").await.unwrap().is_none());
+        assert!(session.stat("/partial/b.txt").await.unwrap().is_some());
+        assert!(session.stat("/partial").await.unwrap().is_some());
     }
 
     #[cfg(target_os = "linux")]
@@ -18571,11 +18829,21 @@ mod tests {
         let both = drop_local(json!({
             "local_dir": local.to_string_lossy(),
             "name": "report.txt",
+            "source_path": dropped.to_string_lossy(),
             "source_paths": [dropped.to_string_lossy(), second.to_string_lossy()],
         }));
         assert_eq!(both.status, 409, "{}", both.payload);
         assert_eq!(both.payload["conflicts"], json!(["report.txt"]));
         assert_eq!(std::fs::read(local.join("notes.txt")).unwrap(), b"notes");
+        #[cfg(not(windows))]
+        {
+            let trailing = outside.join("trailing-space ");
+            std::fs::write(&trailing, b"preserve whitespace").unwrap();
+            let spaced = drop_local(json!({"local_dir": local.to_string_lossy(), "source_paths": [trailing.to_string_lossy()]}));
+            assert_eq!(spaced.status, 400, "{}", spaced.payload);
+            assert!(!local.join("trailing-space").exists());
+        }
+
 
         // The page's approval is what turns a conflict into a replacement, and
         // the retry is the same request plus that decision.
@@ -18921,6 +19189,7 @@ mod tests {
         assert!(prefs.is_object(), "the preferences document is readable");
         prefs["permissions"] = json!("0644");
         prefs["preset"] = json!("off");
+        prefs["preset_overrides"] = json!(["transfer", "preserve_time"]);
         prefs["preserve_time_dirs"] = json!(true);
         let saved = svc.dispatch(ApiEnvelope {
             method: "POST".into(),
@@ -18939,6 +19208,11 @@ mod tests {
         drop(svc);
         let reopened = CommanderService::new(temp.path().join("cfg"), Arc::new(NativeLocalFs::new()));
         assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset"], "off");
+        assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset_overrides"], json!(["transfer", "preserve_time"]));
+        let mut old_client = reopened.handle_get_preferences().payload["preferences"].clone();
+        old_client.as_object_mut().unwrap().remove("preset_overrides");
+        assert_eq!(reopened.handle_save_preferences(json!({"preferences": old_client})).status, 200);
+        assert_eq!(reopened.handle_get_preferences().payload["preferences"]["preset_overrides"], json!(["transfer", "preserve_time"]));
     }
 
     /// `copyid` and keep-up-to-date both need a live server; with no tab they
@@ -19074,6 +19348,8 @@ mod tests {
     struct MockBridge {
         docs: Mutex<HashMap<String, MockDoc>>,
         mtime: i64,
+        listing_injection: Mutex<Option<String>>,
+        reported_sizes: Mutex<HashMap<String, u64>>,
     }
 
     /// A second granted tree, so cross-tree copies and moves have somewhere
@@ -19082,7 +19358,7 @@ mod tests {
 
     impl MockBridge {
         fn with_file(name: &str, content: &[u8]) -> Self {
-            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271 };
+            let bridge = MockBridge { docs: Mutex::new(HashMap::new()), mtime: 1_791_875_271, listing_injection: Mutex::new(None), reported_sizes: Mutex::new(HashMap::new()) };
             bridge.add_file(&Self::doc_uri(name), content);
             bridge
         }
@@ -19113,7 +19389,9 @@ mod tests {
         }
 
         fn entry_for_uri(&self, uri: &str, doc: &MockDoc) -> FileEntry {
-            FileEntry { name: Self::leaf_of(uri), size: doc.bytes.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0), is_dir: doc.bytes.is_none(), is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
+            let size = self.reported_sizes.lock().expect("m").get(uri).copied()
+                .unwrap_or_else(|| doc.bytes.as_ref().map(|bytes| bytes.len() as u64).unwrap_or(0));
+            FileEntry { name: Self::leaf_of(uri), size, is_dir: doc.bytes.is_none(), is_symlink: false, broken_link: false, date: String::new(), mtime: self.mtime, permissions: String::new(), owner: None, group: None }
         }
 
         fn bytes_of(&self, name: &str) -> Option<Vec<u8>> {
@@ -19132,7 +19410,13 @@ mod tests {
             let docs = self.docs.lock().expect("m");
             let mut uris: Vec<String> = docs.keys().filter(|uri| Self::parent_of(uri) == tree_uri).cloned().collect();
             uris.sort();
-            Ok(uris.iter().map(|uri| self.entry_for_uri(uri, &docs[uri])).collect())
+            let mut entries: Vec<FileEntry> = uris.iter().map(|uri| self.entry_for_uri(uri, &docs[uri])).collect();
+            if let Some(name) = self.listing_injection.lock().expect("m").as_ref() {
+                let mut injected = self.entry_for_uri(tree_uri, &MockDoc { bytes: Some(Vec::new()) });
+                injected.name = name.clone();
+                entries.push(injected);
+            }
+            Ok(entries)
         }
         fn stat_uri(&self, uri: &str) -> Result<FileEntry, PlatformError> {
             let docs = self.docs.lock().expect("m");
@@ -19505,6 +19789,7 @@ mod tests {
         copy_unsupported: Mutex<bool>,
         fail_remove: Mutex<Option<String>>,
         listing_injection: Mutex<Option<(String, String)>>,
+        reported_sizes: Mutex<HashMap<String, u64>>,
         perms: Mutex<HashMap<String, String>>,
         modes: Mutex<HashMap<String, u32>>,
         symlinks: Mutex<Vec<(String, String)>>,
@@ -19525,6 +19810,7 @@ mod tests {
                 copy_unsupported: Mutex::new(false),
                 fail_remove: Mutex::new(None),
                 listing_injection: Mutex::new(None),
+                reported_sizes: Mutex::new(HashMap::new()),
                 perms: Mutex::new(HashMap::new()),
                 modes: Mutex::new(HashMap::new()),
                 symlinks: Mutex::new(Vec::new()),
@@ -19635,6 +19921,7 @@ mod tests {
             let perms = self.perms.lock().expect("m");
             Ok(docs.get(remote_path).map(|doc| {
                 let mut entry = Self::entry_for(remote_path, doc);
+                if let Some(size) = self.reported_sizes.lock().unwrap().get(remote_path) { entry.size = *size; }
                 if let Some(p) = perms.get(remote_path) {
                     entry.permissions = p.clone();
                 }
@@ -19653,6 +19940,7 @@ mod tests {
                 .iter()
                 .map(|path| {
                     let mut entry = Self::entry_for(path, &docs[path]);
+                    if let Some(size) = self.reported_sizes.lock().unwrap().get(path) { entry.size = *size; }
                     if let Some(p) = perms.get(path) {
                         entry.permissions = p.clone();
                     }
@@ -19884,6 +20172,81 @@ mod tests {
         let tab = TabRuntime { id: 7, name: "mock".to_string(), site_name: None, is_local: false, connected: true, local_dir: local_dir.to_string(), remote_dir: "/".to_string(), other_local_dir: String::new(), observed_hostkey: String::new(), hostkey_role: "destination".to_string(), hostkey_changed: false, error: String::new(), spec: None, session_json: json!({"protocol": "dav"}), remote: Some(session) };
         service.state.lock().expect("state mutex").tabs.insert(tab.id, tab);
         7
+    }
+
+    #[tokio::test]
+    async fn search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), &tmp.path().to_string_lossy());
+        session.add_file("/normal.txt", b"hello world");
+        session.add_file("/large.txt", &vec![b'x'; ops::MAX_GUI_EDIT_BYTES as usize + 1]);
+        session.reported_sizes.lock().unwrap().insert("/large.txt".into(), 1);
+        *session.listing_injection.lock().unwrap() = Some(("/".into(), "../outside.txt".into()));
+        let req = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let search = svc.dispatch_async(req("POST", "/api/remote/search", json!({
+            "tab": id, "path": "/", "pattern": "*", "search_contents": true, "content_query": "hello"}))).await;
+        assert_eq!(search.status, 200, "{}", search.payload);
+        assert_eq!(search.payload["matches"].as_array().unwrap().len(), 1);
+        assert_eq!(search.payload["matches"][0]["name"], "normal.txt");
+        assert_eq!(search.payload["skipped"], 2);
+        let edit = svc.dispatch_async(req("GET", &format!("/api/remote/edit?tab={id}&path=%2Flarge.txt"), json!({}))).await;
+        assert_eq!(edit.status, 400, "{}", edit.payload);
+        assert!(edit.payload["error"].as_str().unwrap().contains("download limit"));
+        let preview = svc.dispatch_async(req("POST", "/api/sync/preview", json!({
+            "tab": id, "local_dir": tmp.path().to_string_lossy(), "remote_dir": "/", "mode": "local"}))).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap().contains("Invalid remote directory entry name"));
+        for name in ["../escape.filepart", "drive:stream"] {
+            *session.listing_injection.lock().unwrap() = Some(("/".into(), name.into()));
+            let preview = svc.dispatch_async(req("POST", "/api/sync/preview", json!({
+                "tab": id, "local_dir": tmp.path().to_string_lossy(), "remote_dir": "/", "mode": "local"}))).await;
+            assert_eq!(preview.status, 400, "{name}: {}", preview.payload);
+        }
+        assert_eq!(session.bytes_of("/normal.txt"), Some(b"hello world".to_vec()));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn sync_preview_refuses_windows_case_aliases_before_deletion() {
+        let tmp = tempfile::tempdir().unwrap();
+        let local = tmp.path().join("local");
+        std::fs::create_dir_all(&local).unwrap();
+        std::fs::write(local.join("Case.txt"), b"keep").unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        session.add_file("/case.txt", b"remote");
+        let id = insert_remote_tab(&svc, session.clone(), &local.to_string_lossy());
+        let preview = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body: json!({
+            "tab": id, "local_dir": local, "remote_dir": "/", "mode": "local", "delete": true
+        }) }).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap_or("").contains("differ only by case"));
+        assert_eq!(std::fs::read(local.join("Case.txt")).unwrap(), b"keep");
+        assert_eq!(session.bytes_of("/case.txt"), Some(b"remote".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn remote_search_charges_failed_oversized_reads_to_total_budget() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().join("config"), Arc::new(NativeLocalFs::new()));
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session.clone(), &tmp.path().to_string_lossy());
+        let oversized = vec![b'x'; ops::MAX_SEARCH_FILE_BYTES as usize + 1];
+        for index in 0..9 {
+            let path = format!("/{index:02}.txt");
+            session.add_file(&path, &oversized);
+            session.reported_sizes.lock().unwrap().insert(path, 1);
+        }
+        let result = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/remote/search".into(), body: json!({
+            "tab": id, "path": "/", "pattern": "*", "search_contents": true, "content_query": "needle"
+        }) }).await;
+        assert_eq!(result.status, 200, "{}", result.payload);
+        assert_eq!(result.payload["scanned"], 8);
+        assert_eq!(result.payload["skipped"], 8);
+        assert_eq!(result.payload["bytes_scanned"], ops::MAX_SEARCH_TOTAL_BYTES);
+        assert_eq!(result.payload["truncated"], true);
     }
 
     #[tokio::test]
@@ -20216,6 +20579,44 @@ mod tests {
     /// files need no action without delete; a run with delete downloads the
     /// remote-only file and removes the deleted ones; an upload run carries
     /// a granted-only file up.
+    #[tokio::test]
+    async fn saf_search_and_sync_reject_provider_path_components() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bridge = Arc::new(MockBridge::with_file("safe.txt", b"safe"));
+        *bridge.listing_injection.lock().unwrap() = Some("../outside.filepart".to_string());
+        let fs = Arc::new(NativeLocalFs::with_saf(bridge.clone()));
+        let search = ops::search_saf_bounded_with_encoding(fs.as_ref(), SAF_GRANTED_DIR, &FileMask::default(), None, false, None, 500).unwrap();
+        assert_eq!(search.skipped, 1);
+        assert_eq!(search.matches.len(), 1);
+        assert_eq!(search.matches[0]["name"], "safe.txt");
+        let svc = CommanderService::new(tmp.path().join("config"), fs);
+        let session = Arc::new(MockSession::new());
+        let id = insert_remote_tab(&svc, session, SAF_GRANTED_DIR);
+        let preview = svc.dispatch_async(ApiEnvelope { method: "POST".into(), path: "/api/sync/preview".into(), body: json!({
+            "tab": id, "local_dir": SAF_GRANTED_DIR, "remote_dir": "/", "mode": "remote"
+        }) }).await;
+        assert_eq!(preview.status, 400, "{}", preview.payload);
+        assert!(preview.payload["error"].as_str().unwrap_or("").contains("Invalid directory entry name"));
+        assert_eq!(bridge.bytes_of("safe.txt").as_deref(), Some(b"safe".as_slice()));
+    }
+
+    #[test]
+    fn saf_search_charges_underreported_oversized_documents() {
+        let oversized = vec![b'x'; ops::MAX_SEARCH_FILE_BYTES as usize + 1];
+        let bridge = Arc::new(MockBridge::with_file("00.txt", &oversized));
+        for index in 0..9 {
+            let uri = MockBridge::doc_uri(&format!("{index:02}.txt"));
+            if index > 0 { bridge.add_file(&uri, &oversized); }
+            bridge.reported_sizes.lock().unwrap().insert(uri, 1);
+        }
+        let fs = NativeLocalFs::with_saf(bridge);
+        let stats = ops::search_saf_bounded_with_encoding(&fs, SAF_GRANTED_DIR, &FileMask::default(), Some("needle"), false, None, 500).unwrap();
+        assert_eq!(stats.scanned, 8);
+        assert_eq!(stats.skipped, 8);
+        assert_eq!(stats.bytes_scanned, ops::MAX_SEARCH_TOTAL_BYTES);
+        assert!(stats.truncated);
+    }
+
     #[tokio::test]
     async fn saf_sync_preview_and_run_moves_bytes_both_ways() {
         // The shared check keeps its plain rules and accepts a granted root.
@@ -21133,6 +21534,53 @@ mod tests {
             reset_mosh.payload["install_script"],
             reset_mosh.payload["default_install_script"]
         );
+    }
+
+    #[test]
+    fn queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let request = |method: &str, path: &str, body: Value| ApiEnvelope { method: method.into(), path: path.into(), body };
+        let mut prefs = svc.dispatch(request("GET", "/api/preferences", json!({}))).payload["preferences"].clone();
+        prefs["xml_log_enabled"] = json!(true);
+        prefs["xml_log_path"] = json!("actions.xml");
+        assert_eq!(svc.dispatch(request("POST", "/api/preferences", json!({"action":"save", "preferences":prefs}))).status, 200);
+        // Keep a queue logger alive across a direct operation, as happens while
+        // a network transfer is pending. Each record must survive both writes.
+        let mut task_logger = svc.queue.open_task_logger();
+        svc.record_gui_xml_action("gui", |l| l.record_mkdir("/direct", Ok(())));
+        task_logger.record_transfer(true, "/local", "/remote", Some(5), Ok(()));
+        svc.record_gui_xml_action("gui", |l| l.record_rm("/old", false, Ok(())));
+        drop(task_logger);
+        let reply = svc.dispatch(request("GET", "/api/logs/xml", json!({})));
+        let xml = reply.payload["content"].as_str().unwrap();
+        assert_eq!(xml.matches("<mkdir>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<upload>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("<rm>").count(), 1, "{xml}");
+        assert_eq!(xml.matches("</session>").count(), 1, "{xml}");
+        assert!(xml.ends_with("</session>\n"), "{xml}");
+        if let Some(path) = std::env::var_os("LINSCP_XML_SERVICE_OUTPUT") {
+            std::fs::write(path, xml).expect("write GUI XML schema sample");
+        }
+        // An unfinished existing log is never erased by a subsequent operation.
+        let path = tmp.path().join("actions.xml");
+        std::fs::write(&path, b"<session>unfinished").unwrap();
+        svc.record_gui_xml_action("gui", |l| l.record_mkdir("/lost", Ok(())));
+        assert_eq!(std::fs::read(path).unwrap(), b"<session>unfinished");
+    }
+
+    #[test]
+    fn xml_log_preview_reads_only_bounded_tail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let svc = CommanderService::new(tmp.path().to_path_buf(), Arc::new(NativeLocalFs::new()));
+        let path = tmp.path().join("session-actions.xml");
+        let bytes = vec![b'x'; 600_000];
+        std::fs::write(path, &bytes).unwrap();
+        let reply = svc.dispatch(ApiEnvelope { method: "GET".into(), path: "/api/logs/xml".into(), body: json!({}) });
+        assert_eq!(reply.status, 200);
+        assert_eq!(reply.payload["size"], 600_000);
+        assert_eq!(reply.payload["truncated"], true);
+        assert_eq!(reply.payload["content"].as_str().unwrap().len(), 512 * 1024);
     }
 
     #[tokio::test]
@@ -23486,6 +23934,29 @@ mod tests {
             .map(|rd| rd.filter_map(Result::ok).collect())
             .unwrap_or_default();
         assert!(leftover.is_empty(), "refused drops must clean up batch staging directories");
+
+        // A single native file must take the same bounded streaming path.
+        let single = drop_src.join("single.txt");
+        std::fs::write(&single, b"native single").unwrap();
+        let single_drop = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(), path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/srv", "name": "single.txt",
+                "source_path": single.to_string_lossy(), "source_paths": [single.to_string_lossy()]}),
+        }).await;
+        assert_eq!(single_drop.status, 200, "{}", single_drop.payload);
+        for _ in 0..80 {
+            if !svc.queue.has_unfinished_work() { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert_eq!(session.bytes_of("/srv/single.txt").as_deref(), Some(b"native single".as_slice()));
+        let oversized_single = drop_src.join("single-too-large");
+        std::fs::write(&oversized_single, vec![0; 1025]).unwrap();
+        let refused_single = svc.dispatch_async(ApiEnvelope {
+            method: "POST".into(), path: "/api/transfer/drop".into(),
+            body: json!({"tab": tab_id, "remote_dir": "/srv", "source_paths": [oversized_single.to_string_lossy()]}),
+        }).await;
+        assert_eq!(refused_single.status, 400, "{}", refused_single.payload);
+        assert!(std::fs::read_dir(&staging_root).unwrap().next().is_none());
 
         let ok_dir = drop_src.join("validpkg");
         std::fs::create_dir_all(ok_dir.join("sub")).unwrap();

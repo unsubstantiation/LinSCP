@@ -157,7 +157,7 @@
         }
       },
       "android": {
-        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, the emulator smoke separately exercises Keystore-backed vault restart and a real DocumentsUI-granted folder, but not the share-sheet flow. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
+        "how": "android-build.yml: `npm --prefix ui test` (gui, gui-localization, ui-transport); the Rust workspace suites the APK is built from - `cargo test -p linscp-platform -p linscp-proto -p linscp-engine` (vault-password, proto-ssh, proto-scp, proto-ftp, proto-dav-s3, proto-webdav, engine-sftp, engine-scp, engine-script, engine-editor, backup) and `cargo test -p linscp-service` (service-commands, service-tabs), which include the SAF, Keystore and share-export cases; tools/tests/test_android_application_id.py and test_android_release_signing.py; the Tauri APK build, which compiles the service; tools/verify_android_apk.py; the android-emulator WebView/IPC smoke, which drives the dispatch path and a real WebDAV transfer inside the installed app. Those Rust suites run on the job's Linux host, so they prove the code the APK carries behaves correctly; they do not prove the Android runtime behaves like it, the emulator smoke separately exercises Keystore-backed vault restart, a real DocumentsUI-granted folder and an explicit SEND intent with failed manifest recovery after restart. It does not exercise share-sheet resolution, SEND_MULTIPLE or a physical device. Evidence is an exit-0 run with failed=0. UnitTest.cpp has no build target, ScriptTest.py and the live-* suites need a `linscp` binary this repo does not build, and the Python GUI suites fail against the shipped service: all are flagged not runnable, and not evidence.",
         "date": "2026-11-06",
         "suites": {
           "backup": "crates/linscp-engine/src/backup.rs - distribution-compatible full app backup: single-file JSON bundle (version 1, LF UTF-8, CRLF-tolerant, no absolute paths) containing sessions.ini (LF-normalized, escaped), sessions.key (unwrapped raw base64 via SecretVault, so backups restore on every platform), workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, and explorer-commands.json. Tests verify Debian (LF) → Windows (CRLF edit) → Android restores, raw base64 key portability, LF-only INI decryptable, JSON round-trips, and fail-closed without key (backup/src/backup.rs: fn backup_is_distribution_compatible_between_linux_windows_and_android etc.).",
@@ -194,7 +194,7 @@
           "vault-password": "crates/linscp-platform/src/password_vault.rs - the password-only vault: setup/unlock/lock round-trip under Argon2id and AES-256-GCM (LSCPVLT1), local blob sealing that fails closed when locked, and rejection of the retired dpapi1$/aks1$ hardware-key prefixes. No Android step executes these Rust cases, so Android cites other suites instead.",
           "wayland-compatibility": "tools/tests/test_wayland_compatibility.py - the Wayland compatibility guard and its own regressions: it has to find a display-session decision that reads DISPLAY alone, a terminal candidate that does not say which display server it draws on, an X11-only or Wayland-only helper program, a desktop entry no compositor can complete, and the console and graphical detections disagreeing - and it has to stay quiet about the same constructs when the other half of the answer is in view. The real tree is one of its cases.",
           "platform-linux": "Host-side Linux tests of private files and directories and configuration lookup; these do not execute the Android implementation.",
-          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing, properties, WebDAV transfers and synchronization and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart and WebDAV and SFTP verified-resume refusals, real SSH agent refusal and invokes the native bridge directly to verify rejection of unsafe external viewer URIs."
+          "android-emulator": "tools/android_emulator_smoke.mjs - packaged debug APK on an Android emulator; tests granted-folder editing, properties, WebDAV transfers and synchronization and ungranted SAF refusals, WebView rendering, Android full-backup restore, Keystore-backed vault restart, WebDAV and SFTP verified-resume refusals, real SSH agent refusal and native unsafe external viewer URI refusals. It also sends an explicit SEND intent, verifies staging cleanup, failed manifest retry and restart recovery; it does not exercise the share-sheet resolver or SEND_MULTIPLE."
         },
         "not_runnable": {
           "gui-cli": "the Android job compiles the command line for its Linux host, so the Android entry point's own rules are not the ones exercised there",
@@ -673,7 +673,7 @@
     },
     "open": {
       "status": "partial",
-      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, built-in KDrive viewer not yet implemented; NX removed) and x11:// (22, waypipe/ssh -X); supported external-viewer protocols emit a viewer ticket (or .rdp/.vv file/gateway in headless HTTP) — see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
+      "notes": "URL sessions and stored-session names (including folder/site paths), -passphrase= for encrypted SSH keys, -hostkey= verification and '-rawsettings[=N] NAME=VALUE...' for proxy, FTP/TLS and S3 object settings; unknown settings and unusable proxies are refused by name before connecting, and passwords/passphrases are redacted in echo and XML logs. Covered by script, live-sftp, live-s3 and live-curl. Also parses rdp:// (3389, xfreerdp/mstsc/aFreeRDP), vnc:// (5900, tigervnc/remmina), spice:// (5900, remote-viewer/.vv), x2go:// (22, experimental built-in KDrive viewer; live-server interoperability not yet validated) and x11:// (22, waypipe/ssh -X); supported external-viewer protocols emit a viewer ticket (where supported) — see desktop.remote capability and linscp_additions remote desktop entry. (live-curl, live-s3, live-sftp, and script need a `linscp` binary this repo does not build, so no platform has runnable evidence, and this stays partial until a runnable suite covers it.)",
       "verified_on": {
         "linux": [
           "script",
@@ -907,7 +907,7 @@
     {
       "name": "SFTP",
       "status": "partial",
-      "notes": "Native libssh transport rather than a curl session: directory and file CRUD, SYMLINK, chmod (octal, symbolic and recursive), bidirectional file and directory timestamp preservation, .filepart resume, copy-data (with a streamed fallback) and check-file-name (with a local hash fallback), covered by unit and live-sftp. (live-sftp needs a `linscp` binary this repo does not build; unit has no build target and cannot be compiled; see the suite registry. This area is partial until runnable evidence exists.)",
+      "notes": "The Rust SSH/SFTP implementation covers file and directory operations, permissions and timestamps, copy-data and checksum behavior; see the granular sftp capabilities for runnable engine and protocol evidence. Historical live-sftp and legacy unit suites require the retired CLI or a missing C++ build target and are not current runtime evidence.",
       "verified_on": {
         "linux": [
           "unit",
@@ -922,7 +922,7 @@
           "live-sftp"
         ]
       },
-      "gap": "sftp.check-file-name, sftp.copy-data, sftp.directory-crud, sftp.native-session, and sftp.permissions-and-times in this area are partial: no runnable suite evidences them (see the suite registry)."
+      "gap": "The granular SFTP capabilities are verified in the ledger; the broad upstream row remains partial because the historical upstream-oriented live and C++ suites are not runnable in this GUI-only distribution."
     },
     {
       "name": "SCP",
@@ -1094,7 +1094,7 @@
     {
       "name": "Security/authentication",
       "status": "partial",
-      "notes": "Password, private-key/passphrase and ssh-agent authentication, independent host-key pinning, encrypted stored passwords, proxy isolation and GUI API tokens are covered by automated tests. Native SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations, including GUI background operations and the embedded terminal. GSSAPI authentication is enabled only when the loaded libssh exports its public ssh_gssapi_set_creds entry point; GSSAPI key exchange is probed independently, and AuthGSSAPIKEX fails closed when unsupported. The live SFTP suite now provisions a loopback-only Kerberos realm and OpenSSH server for principal selection, missing/expired tickets, server identity and opt-in delegation; CI requires the realm cases to run without skips. Broader production-realm compatibility and an independent delegation security review remain outstanding. Optional GUI sign-in hashes passwords, issues per-session CSRF tokens and isolates tabs, queues, logs, terminals, configuration and the local filesystem per account.",
+      "notes": "Password/key/agent authentication, host-key verification, SSH jump hosts and encrypted vault storage have automated coverage. Current SSH GSSAPI uses russh with Linux system GSSAPI or Windows SSPI; key exchange is unsupported. Historical CLI-dependent live Kerberos tests do not establish current GUI interoperability. The native application is single-user and does not provide multi-user server account isolation; see granular security capabilities for remaining evidence and review.",
       "verified_on": {
         "linux": [
           "unit",
@@ -1105,7 +1105,7 @@
           "live-tunnel"
         ]
       },
-      "gap": "Production/cross-realm compatibility and independent review of opt-in credential delegation remain outstanding."
+      "gap": "Runnable current-transport Kerberos/KDC evidence, independent delegation review, packaged IPC-boundary validation and the single-user deployment scope remain open."
     },
     {
       "name": "GUI",
@@ -1704,10 +1704,11 @@
       "id": "scp.curl-file-transfer",
       "area": "SCP",
       "status": "partial",
-      "notes": "The id is the row's history: an scp:// transfer is not curl's any more. The bytes go over an SSH exec channel running the server's own 'scp -f' and 'scp -t', with the rcp wire protocol spoken by the client - a timestamp header, a mode/size/name header, exactly the stated bytes and an acknowledgement per step, in both directions. A download stages through '.filepart' and is renamed onto the destination when it is whole; an interrupted one leaves the staging file and nothing under the final name. Uploads carry '-permissions' and '-preservetime'. Continuing a partial file is refused by name instead of attempted, because the protocol has no offset to continue from. ASCII conversion, masks, the speed limit, the progress meter and the interrupt behavior are the shared transfer path's and are checked here as well.",
+      "notes": "SCP single files use native SSH exec and scp -f/-t wire framing. Engine tests exercise file transfers and a tree walked file by file against a mock SSH/SCP server. The GUI adds protocol-specific safety refusals; engine tree-walk support does not imply every GUI SCP directory operation is allowed. SCP resume is refused. The historical CLI-dependent live suite does not run in the GUI-only distribution.",
       "source": [
         "crates/linscp-proto/src/scp.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "docs/remaining-parity-priorities.md"
       ],
       "checks": {
         "proto-scp": [
@@ -1737,16 +1738,11 @@
           "engine-scp",
           "proto-scp",
           "proto-ssh"
-        ],
-        "android": [
-          "engine-scp",
-          "proto-scp",
-          "proto-ssh"
         ]
       },
-      "gap": "The recursive form of the rcp protocol is not used: the client's own directory engine walks the tree and each file travels in the single-file form, so no 'E' record closes a level. Everything else the row states is checked by the cited cases.",
+      "gap": "Recursive SCP D/E wire streams are not implemented. They are deferred pending demonstrated product need and a design for untrusted records, containment, no-overwrite, symlinks, bounds, cancellation and partial-tree cleanup; no recursive stream or real-server GUI interoperability is claimed.",
       "acceptance": [
-        "A transfer of a tree that speaks the recursive rcp form, with an 'E' record closing each level, proved by a case that runs."
+        "If recursive wire SCP is prioritized, implement and test nested D/E streams with malicious-server, containment, interruption and live OpenSSH coverage without weakening GUI safety refusals."
       ]
     },
     {
@@ -2393,7 +2389,7 @@
       "id": "transfer.filepart-resume",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch. Ordinary WebDAV and S3 resumes compare the prefix under a strong ETag and use the same condition for the remaining download. Versioned S3 resumes additionally send the version ID and require the server to confirm it on HEAD and each conditional GET; versioned source deletion is refused. FTP/SFTP partial reuse is refused unless the user explicitly accepts best-effort resume for that transfer. The GUI warns that concurrent changes can corrupt the result, and the engine independently enforces the opt-in. A staged partial selected after verification must match the path and length that were checked. The S3 versions dialog offers opt-in verified resume to a new destination, with version-scoped checkpoints; the Linux S3 service fixture exercises an older version, stale partial refusal, and no-overwrite behavior. Granted-folder resume remains unsupported. WebDAV conditional prefix and download responses must return the expected ETag; missing or mismatching tags fail before bytes are written. A Linux service fixture verifies refusal when a WebDAV server ignores If-Match but reports a changed tag. A packaged Android debug APK emulator smoke checks successful WebDAV resume, stale-prefix refusal, and refusal after the source changes while a task is paused; it verifies rejected checkpoints remain intact and no destination appears. The emulator also uses a disposable Paramiko SFTP server to confirm default refusal, successful explicit best-effort resume, and stale-prefix refusal without changing the checkpoint or publishing a destination. This does not make SFTP snapshots atomic.",
+      "notes": "Downloads can stage in a `.filepart` file beside the destination and resume from that staging file. A mid-flight interruption test verifies the old destination remains untouched, the partial survives and the resumed download is published. SFTP and FTP guarded uploads do not provide this `.filepart` resume behavior; their acknowledged staged publication requires a fresh copy. The GUI verified-resume path compares the checkpoint against remote bytes before resuming and publishes without replacing an existing destination. Ordinary SFTP resume now compares an existing prefix before continuing or adopting a destination, and refuses unsafe, complete, or oversized existing stages rather than deleting them. Ordinary FTP resume also compares the saved prefix before modifying local files; FTP verification drains the full remote file with bounded memory and retains the control connection on mismatch. Ordinary WebDAV and S3 resumes compare the prefix under a strong ETag and use the same condition for the remaining download. Versioned S3 resumes additionally send the version ID and require the server to confirm it on HEAD and each conditional GET; versioned source deletion is refused. FTP/SFTP partial reuse is refused unless the user explicitly accepts best-effort resume for that transfer. The GUI warns that concurrent changes can corrupt the result, and the engine independently enforces the opt-in. Ordinary and GUI resume copy checkpoints into owner-restricted temporary directories and verify the copy; they do not mutate or publish the shared checkpoint, which remains after success or failure. Their pathname-based publication still requires a trusted destination directory and ancestors. ASCII-converted resume and complete or oversized direct partials are refused. The S3 versions dialog offers opt-in verified resume to a new destination, with version-scoped checkpoints; the Linux S3 service fixture exercises an older version, stale partial refusal, and no-overwrite behavior. Granted-folder resume remains unsupported. WebDAV conditional prefix and download responses must return the expected ETag; missing or mismatching tags fail before bytes are written. A Linux service fixture verifies refusal when a WebDAV server ignores If-Match but reports a changed tag. A packaged Android debug APK emulator smoke checks successful WebDAV resume, stale-prefix refusal, and refusal after the source changes while a task is paused; it verifies rejected checkpoints remain intact and no destination appears. The emulator also uses a disposable Paramiko SFTP server to confirm default refusal, successful explicit best-effort resume, and stale-prefix refusal without changing the checkpoint or publishing a destination. This does not make SFTP snapshots atomic. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-proto/src/sftp.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2464,7 +2460,7 @@
           "android-emulator"
         ]
       },
-      "gap": "Linux and Windows loopback CI exercise stale FTP/SFTP/WebDAV/S3 prefixes and conditional WebDAV/S3 source changes. FTP/SFTP resume is best-effort only with explicit per-transfer approval: size/mtime checks cannot pin an atomic snapshot, and concurrent remote or local modifications can still corrupt a result. WebDAV/S3 conditional behavior requires a conforming server, and WebDAV endpoints that omit ETags on conditional GETs are refused; versioned resume is not available for Android granted folders. Guarded SFTP/FTP uploads still cannot resume; Physical Android devices, Android granted-folder resume, and live third-party server behavior remain unverified; the emulator uses a disposable SFTP fixture.",
+      "gap": "Linux and Windows loopback CI exercise stale FTP/SFTP/WebDAV/S3 prefixes and conditional WebDAV/S3 source changes. FTP/SFTP resume is best-effort only with explicit per-transfer approval: size/mtime checks cannot pin an atomic snapshot, and concurrent remote or local modifications can still corrupt a result. WebDAV/S3 conditional behavior requires a conforming server, and WebDAV endpoints that omit ETags on conditional GETs are refused; versioned resume is not available for Android granted folders. Resume publication still requires a trusted local destination directory and ancestors; a process with the same account privileges can modify the private stage or destination. Guarded SFTP/FTP uploads still cannot resume; physical Android devices, Android granted-folder resume, and live third-party server behavior remain unverified; the emulator uses a disposable SFTP fixture.",
       "acceptance": [
         "Consider stronger protections for concurrent local and remote changes; FTP/SFTP cannot provide atomic snapshots and best-effort resume requires explicit consent.",
         "Implement safe resumable guarded uploads, or document protocol-specific refusals and alternatives.",
@@ -2589,7 +2585,7 @@
       "id": "transfer.presets",
       "area": "Transfers",
       "status": "partial",
-      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out, persists the selection, and keeps a missing saved preset visibly selected instead of silently switching it to automatic. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask filters uploads to a disposable WebDAV server and rejects a deleted preset. Explicit transfer settings can override preset fields.",
+      "notes": "Named, per-site and rule-selected presets change transfer settings. The queue refuses an unreadable or malformed preset store and a missing site preset rather than silently using defaults; explicit preset opt-out bypasses the store, and site-level opt-out does not fall through to matching rules. The GUI distinguishes automatic matching from explicit manual opt-out, persists the selection, and keeps a missing saved preset visibly selected instead of silently switching it to automatic. Host service tests exercise filtering and refusals, while a packaged Android emulator verifies an explicitly named mask, deleted preset refusal, and mixed per-file automatic matching against a disposable WebDAV server. Explicit transfer settings override preset fields; untouched GUI defaults inherit them. Automatic matching evaluates each selected top-level item, combines filename and session rules, and prioritizes filename rules over session-only rules. Saved override markers retain explicit default-valued settings; old preferences infer non-default overrides. See docs/transfer-presets.md for precedence and migration. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-engine/src/presets.rs",
         "crates/linscp-engine/src/script.rs",
@@ -2611,6 +2607,7 @@
         "service": [
           "transfer_presets_fail_closed_on_corrupt_store_and_missing_site_preset",
           "selected_transfer_preset_filters_queued_files",
+          "automatic_transfer_presets_match_each_file_and_session",
           "preferences_keep_the_permission_mode_and_the_directory_timestamps"
         ],
         "gui": [
@@ -2618,6 +2615,10 @@
           "manual preset opt-out survives reloading presets",
           "manual preset opt-out persists through preferences",
           "automatic preset selection leaves matching enabled",
+          "automatic preset inherits untouched GUI defaults",
+          "explicit default-valued overrides are sent and survive preferences",
+          "an explicitly toggled default-valued override is persisted",
+          "choosing default mode clears the explicit transfer override",
           "unavailable saved preset is not silently changed to automatic"
         ],
         "android-emulator": [
@@ -2643,7 +2644,7 @@
           "android-emulator"
         ]
       },
-      "gap": "The emulator verifies a named mask against the WebDAV fixture, but per-site selection and every transfer setting are not exercised on Android or third-party servers. The historical live-dav suite needs the retired CLI. GUI manual transfer settings can override preset settings, and physical devices remain unverified.",
+      "gap": "The packaged Android emulator verifies a named mask and mixed automatic-matching rules against the WebDAV fixture (run 46045911600). Per-site selection and every transfer setting are not exercised on physical Android devices or third-party servers. The historical live-dav suite needs the retired CLI. GUI manual transfer settings can override preset settings, and physical devices remain unverified.",
       "acceptance": [
         "Exercise per-site presets and transfer-mode and permission settings on Android and against relevant live servers.",
         "Clarify and test precedence between manual settings and automatic preset values."
@@ -2722,38 +2723,44 @@
       "id": "sync.one-way",
       "area": "Synchronization",
       "status": "partial",
-      "notes": "Local-to-remote keepuptodate and recursive one-way planning/upload run against the live WebDAV server; the same plan and upload run against the mock SFTP server.",
+      "notes": "One-way synchronization can preview and queue recursive uploads and downloads; host tests cover mock SFTP and loopback WebDAV. A packaged Android emulator covers synchronization in both directions through an external-storage DocumentsProvider and WebDAV.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "live-dav": [
-          "test_keepuptodate_reflects_local_files_on_the_remote_side"
-        ],
         "engine-sftp": [
           "test_synchronize_conflict_policy_and_keepuptodate",
           "test_synchronize_filemask_prunes_excluded_subtrees"
+        ],
+        "service": [
+          "live_webdav_sync_encoding_and_interrupted_delete",
+          "saf_sync_preview_and_run_moves_bytes_both_ways",
+          "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads",
+          "saf_search_and_sync_reject_provider_path_components",
+          "sync_preview_refuses_windows_case_aliases_before_deletion"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafSync",
+          "verifyAndroidGrantedSafNestedSync"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-dav",
+          "service",
           "engine-sftp"
         ],
         "windows": [
-          "live-dav",
+          "service",
           "engine-sftp"
         ],
         "android": [
-          "live-dav",
-          "engine-sftp"
+          "android-emulator"
         ]
       },
-      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which mirrors the local tree onto the remote side and prunes the excluded subtrees from the plan.",
+      "gap": "The loopback WebDAV upload and mock SFTP cases do not establish compatibility with production servers, other Android providers, or physical devices. Windows service evidence uses the mock provider; the live WebDAV case is Linux-only.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Exercise one-way synchronization on production-like servers and other Android providers and physical devices."
       ]
     },
     {
@@ -2838,37 +2845,39 @@
       "id": "sync.keepuptodate-inotify",
       "area": "Synchronization",
       "status": "partial",
-      "notes": "A file that arrives in the watched tree wakes the watcher, so the next pass runs straight away instead of waiting for the rescan interval.",
+      "notes": "Keep-up-to-date uses filesystem notifications with polling fallback for native roots and polls granted Android folders. An event received during the initial pass is retained so a subsequent pass can discover changes not in its initial snapshot.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/script.rs"
       ],
       "checks": {
-        "live-dav": [
-          "test_keepuptodate_wakes_on_a_local_change"
-        ],
         "engine-sftp": [
           "test_keepuptodate_wakes_on_a_local_change"
+        ],
+        "engine-watcher": [
+          "failed_native_watch_falls_back_to_polling_changes",
+          "changes_during_initial_sync_trigger_an_immediate_second_pass"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafNestedSync"
         ]
       },
       "verified_on": {
         "linux": [
-          "live-dav",
+          "engine-watcher",
           "engine-sftp"
         ],
         "windows": [
-          "live-dav",
+          "engine-watcher",
           "engine-sftp"
         ],
         "android": [
-          "live-dav",
-          "engine-sftp"
+          "android-emulator"
         ]
       },
-      "gap": "The live half is still unevidenced: live-dav needs a `linscp` binary this repo does not build. Runnable residue: engine-sftp, which shows the arrival waking the watcher with an interval far longer than the wait it took.",
+      "gap": "Linux and Windows host tests exercise native watcher and fallback; the packaged Android emulator exercises interval polling and cancellation with the external-storage provider. Other providers, physical devices and broader live-server behavior remain unverified.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
+        "Exercise long-running watcher and polling behavior with other providers, real servers and physical devices."
       ]
     },
     {
@@ -3323,7 +3332,7 @@
       "id": "security.proxy-isolation",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "SFTP SOCKS5 and HTTP CONNECT proxies and curl proxy routing are verified live; wrong proxy credentials and unsupported proxy modes are refused rather than bypassed. A proxy the protocol cannot run never reaches the transport.",
+      "notes": "The current Rust proxy tests reject a no-auth downgrade when SOCKS credentials are configured and confirm a refused HTTP CONNECT is not retried directly. A loopback mock SSH bastion test checks independently pinned jump authentication, rejects unauthenticated and wrong-password local SOCKS clients, and uses reqwest successfully through the authenticated relay. Linux and Windows passed GitHub Actions run 46108545284; proxy bypass is evaluated on the actual network hop and loopback detection requires a real loopback IP. User-configured localhost and exclusion bypasses are intentional. Historical live-sftp and live-dav tests below require a retired binary and do not supply current evidence.",
       "source": [
         "crates/linscp-engine/src/session_store.rs",
         "crates/linscp-proto/src/webdav.rs"
@@ -3357,7 +3366,7 @@
           "engine-script"
         ]
       },
-      "gap": "The live half is still unevidenced: live-dav and live-sftp need a `linscp` binary this repo does not build. Runnable residue: engine-script, which refuses a proxy method the protocol cannot run and a proxy without a host.",
+      "gap": "Mock SSH jump, authenticated SOCKS relay, failed HTTP CONNECT and bypass regressions now run on Linux and Windows. Broader live protocol and Android proxy coverage is still needed; the historical live-dav and live-sftp suites require a retired binary.",
       "acceptance": [
         "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
         "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures."
@@ -3367,7 +3376,7 @@
       "id": "security.gui-api-token",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView. An idle packaged Linux GUI was checked via procfs in CI: it owned only its private loopback activation listener, whose record had private permissions; an HTTP request and a wrong activation token received no reply. This is a point-in-time process-level smoke, not proof about child processes, every runtime state, same-user access or Tauri IPC isolation.",
+      "notes": "Static configuration tests verify that packaged capabilities do not grant remote origins and that CSP connect-src names only Tauri IPC; inline scripts remain permitted and this is not a runtime IPC-isolation proof. The native GUI calls the service in-process through Tauri IPC rather than a separately configured local HTTP API. The webview has access to privileged commands: content injection in it could drive the service. The page escapes tab and transfer text, binds tab-close actions without interpolating IDs, rejects malformed queue IDs, and validates numeric progress before inserting it into markup. These defenses do not establish isolation from other local processes or rule out other injection paths. A packaged Android debug APK emulator test checks a hostile-looking filename returned by the real native IPC listing, plus injected malformed tab and transfer-queue data, renders as inert text in the WebView. An idle packaged Linux GUI was checked via procfs in CI: it owned only its private loopback activation listener, whose record had private permissions; an HTTP request and a wrong activation token received no reply. This is a point-in-time process-level smoke, not proof about child processes, every runtime state, same-user access or Tauri IPC isolation.",
       "source": [
         "crates/linscp-tauri/src/lib.rs",
         "crates/linscp-service/src/lib.rs",
@@ -3408,7 +3417,7 @@
       "id": "security.ssh-jump-hosts",
       "area": "Security/authentication",
       "status": "verified",
-      "notes": "Scoped native SSH jump-host support: Tunnel=1 plus TunnelHostName/PortNumber/UserName/Password/PublicKeyFile/Passphrase/HostKey creates an authenticated direct-tcpip channel for an SFTP/SCP/SSH destination. A private close-on-exec socket pair, not a TCP listener, joins the independent transports. The jump resolves the destination, inherits the proxy and has its own credentials/key check; destination keys retain their original host/port identity. Passwords/passphrases are encrypted at rest when explicitly saved, masked in logs, absent from GUI process arguments/status and isolated per child environment. The GUI offers separate key challenges and credential-saving controls; queued operations and -shell retain the tunnel. Tests exercise exact bytes, refusals, interrupted staging and cleanup. This does not claim GSSAPI or non-SSH tunnel support. Changed keys have an explicit warning; per-hop Remember choices persist independently, without saving transient credentials or globally caching a tab-only pin. Slow/backpressured I/O, forwarding timeout and process cancellation are covered too. TunnelPasswordPlain/TunnelPassphrasePlain aliases are accepted, encrypted at rest and censored in logs; this is not encrypted upstream password import. Exec/shell callbacks retain output and exit status through coalesced channel/transport closure, but only publish a status after authenticated EOF/close; repeated direct/tunneled stdout/stderr/exit-7 and deliberately truncated-status fixtures cover this boundary. the retired GUI harness, live-tunnel, script, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
+      "notes": "Scoped native SSH jump-host support: Tunnel=1 plus TunnelHostName/PortNumber/UserName/Password/PublicKeyFile/Passphrase/HostKey creates an authenticated direct-tcpip channel for an SFTP/SCP/SSH destination. An in-memory channel joins the independent transports by default. When a local port is explicitly requested, the temporary loopback listener checks the pre-reserved client source endpoint. The jump resolves the destination, inherits the proxy and has its own credentials/key check; destination keys retain their original host/port identity. Passwords/passphrases are encrypted at rest when explicitly saved, masked in logs, absent from GUI process arguments/status and isolated per child environment. The GUI offers separate key challenges and credential-saving controls; queued operations and -shell retain the tunnel. Tests exercise exact bytes, refusals, interrupted staging and cleanup. This does not claim GSSAPI or non-SSH tunnel support. Changed keys have an explicit warning; per-hop Remember choices persist independently, without saving transient credentials or globally caching a tab-only pin. Slow/backpressured I/O, forwarding timeout and process cancellation are covered too. TunnelPasswordPlain/TunnelPassphrasePlain aliases are accepted, encrypted at rest and censored in logs; this is not encrypted upstream password import. Exec/shell callbacks retain output and exit status through coalesced channel/transport closure, but only publish a status after authenticated EOF/close; repeated direct/tunneled stdout/stderr/exit-7 and deliberately truncated-status fixtures cover this boundary. the retired GUI harness, live-tunnel, script, and unit were cited here before the B-suite triage but are not runnable (see the suite registry), so only gui is cited.",
       "source": [
         "crates/linscp-proto/src/tunnel.rs",
         "crates/linscp-engine/src/session_store.rs",
@@ -3442,12 +3451,12 @@
       "id": "security.gssapi-and-tunnels",
       "area": "Security/authentication",
       "status": "partial",
-      "notes": "Authenticated SSH jump-host connections work for SFTP/SCP/SSH and for FTP/FTPS/WebDAV/S3 destinations. SSH destinations still use a private socketpair (or TunnelLocalPortNumber on loopback); curl and native FTP/S3 sessions start a loopback SOCKS5 multiplexer on the jump so each CONNECT or data channel is a separate direct-tcpip, TLS SNI and S3 signing keep the original hostname, and a refused forward never falls back to a direct connection. Kerberos/GSSAPI settings persist and gssapi-with-mic is attempted before public-key with password fallback; credential delegation stays off unless GSSAPIFwdTGT=1. GSSAPI authentication support is detected through libssh's public ssh_gssapi_set_creds symbol, not its version string. RFC 4462 KEX support is probed independently; AuthGSSAPIKEX is refused if the loaded libssh cannot honor it or a host-key pin is configured, rather than silently skipping either policy. The live SFTP suite provisions an isolated loopback MIT KDC and OpenSSH server and tests principal selection, missing/expired tickets, the service identity, and default-off versus opt-in TGT delegation. A second realm, PARTNER.TEST, is trusted directly through krbtgt/LINSCP.TEST@PARTNER.TEST. It covers cross-realm login, refusal of an unmapped principal of the trusted realm, and default-off versus opt-in delegation of the partner realm's TGT. CI requires a GSSAPI-enabled libssh and zero skips for these cases. As upstream's CreateTunnelData does, the jump session inherits the destination's Kerberos settings except LogicalHostName, so GSSAPIFwdTGT=1 also delegates to the jump host. docs/gssapi-delegation-review.md is the brief for the independent review; that review and production-KDC validation remain open. On Linux the GUI settings now flow to a real GSSAPI attempt (the parser used to drop all four Kerberos keys); on Windows and Android the site manager labels the section Linux-only, key exchange is noted as unsupported on every build, and explicit settings fail closed naming the requirement. The Windows and Android citations below evidence that labeling and refusal, not Kerberos authentication itself. Windows loads System32\\secur32.dll SSPI (AcquireCredentialsHandleW/InitializeSecurityContextW/MakeSignature for Kerberos HOST/<host>) behind GssapiTokenProvider.",
-      "gap": "The live half is still unevidenced: live-tunnel and live-sftp need a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which keeps the jump-host and Kerberos settings a site stores and refuses a jump host that is not named.",
+      "notes": "SSH jump-host support is tracked separately under security.ssh-jump-hosts. The current Rust SSH transport uses russh's gssapi-with-mic bridge and a system Kerberos context provider: Linux dynamically loads libgssapi_krb5 and Windows loads SSPI from System32. Android has no system provider here. GSSAPI authentication can be attempted when a provider is available; delegation is opt-in. GSSAPI key exchange is not implemented and explicit requests fail closed. The historical isolated MIT KDC and cross-realm cases in LiveSftpTest.py require the retired linscp CLI and are not runnable against the shipped GUI-only distribution. Windows SSPI loader/context construction has a platform unit test, but that does not establish successful Kerberos authentication. GUI and service-tabs tests cover settings and capability/refusal policy, not a live KDC exchange.",
+      "gap": "An isolated Linux MIT KDC and OpenSSH fixture now tests the current russh path with a missing cache, wrong service principal, successful mutually authenticated login, default-off and opt-in delegated credentials, in GitHub Actions run 46108545284. Expired tickets, cross-realm trust, production KDC behavior and Windows SSPI end-to-end authentication remain unverified. Android has no provider; GSSAPI key exchange and jump-host GSSAPI are unsupported; independent delegation security review remains open.",
       "acceptance": [
-        "Run the isolated-realm GSSAPI cases in CI with a GSSAPI-enabled libssh and no skipped cases; cover principal selection, missing/expired credentials, service mutual authentication, default-off delegation and opt-in TGT delegation.",
-        "Obtain an independent security review of delegated TGT handling and validate cross-realm/production-KDC behavior before claiming general Kerberos parity.",
-        "Provide a Windows SSPI (or sspi-crate) context provider behind the GssapiTokenProvider trait, with tests against an AD or Samba KDC, before claiming Kerberos on Windows."
+        "Port isolated-realm and cross-realm GSSAPI tests to a supported service or Rust harness; exercise Linux principal selection, missing/expired credentials, mutual authentication and default-off versus opt-in delegation with no silent skips.",
+        "Exercise the existing Windows SSPI provider end to end against an AD or Samba KDC, including failures and delegation policy; address any implementation gaps before claiming Windows Kerberos interoperability.",
+        "Obtain an independent security review of delegated TGT handling and validate production KDC behavior; decide separately whether unsupported GSSAPI key exchange is in product scope."
       ],
       "source": [
         "crates/linscp-proto/src/tunnel.rs",
@@ -3468,7 +3477,7 @@
           "test_tunnel_settings_validation_is_fail_closed"
         ],
         "gui": [
-          "the Kerberos gap names Linux-only builds",
+          "the Kerberos gap names Linux and Windows runtime options",
           "the key-exchange gap applies on every build",
           "the Kerberos hint shows the gap reason"
         ],
@@ -3713,16 +3722,20 @@
       "id": "gui.native-path-drop",
       "area": "GUI",
       "status": "partial",
-      "notes": "An operating-system drop in a native window arrives as paths, not as a File: `dragDropEnabled` makes the Tauri window consume the drop before the page sees it. The shell emits `native:file-drop` with those paths, the shared bundle turns them into one request (the first path plus the list, with the folders named), and the service stages and queues exactly what the browser's byte drop would - the same endpoints, the same queue, the same conflict answer, so one set of overwrite rules answers for all three apps. Dropped files and folders are streamed in 64 KiB chunks into private per-drop staging with cumulative file-count (`MAX_DROP_STAGING_FILES`), byte-size (`MAX_DROP_STAGING_BYTES`), and directory-depth (`MAX_DROP_STAGING_DEPTH`) bounds, cleaning up partial staging trees on refusal. A local drop copies the tree directly; a grant-URI source is read through `LocalFs`; a link inside a dropped folder is refused rather than followed. Android's share hand-off records the desktop's pending manifest and the page queues it through the same path. What the drop still lacks is end-to-end evidence on a real window: the jsdom suite drives the request shape and the service test drives the filesystem, but neither can produce a WebKit drop event, and the share intent filter is registered by the generated Kotlin project rather than by this tree.",
+      "notes": "Native Tauri drops register a numeric transformCallback ID and carry physical pointer coordinates for CSS-pixel pane hit-testing; jsdom exercises that event contract and right-pane routing; missing coordinates fall back to the focused pane. The backend treats source_paths as authoritative instead of duplicating source_path, and rejects top-level names with surrounding whitespace rather than silently renaming them. Native filesystem upload drops, including a single file, stream to private bounded per-drop staging; errors remove the whole batch. Local file copies and SAF-URI drops can still read a whole file into memory. Android sharing instead stages content URIs and publishes one shell-upload manifest per file. Pending paths survive a failed manifest write and process restart, and concurrent manifest consumers claim by rename. Shared items are queued through /api/shell/consume, not the native-drop conflict dialog; refusals are reported and consumed refusals are not retried automatically. The packaged emulator test uses an explicit SEND of a granted external-storage document, forces publication failure, restarts the process, and verifies the recovered manifest and bytes; it also checks partial staging cleanup after an invalid second URI. This is not an exactly-once guarantee; see docs/native-android-integration.md. Windows final-review run 46124619141 passed an isolated Explorer action smoke; it did not exercise a real OS drag.",
       "source": [
         "crates/linscp-tauri/src/lib.rs",
         "crates/linscp-service/src/lib.rs",
         "ui/src/platform/drops.ts",
-        "source/gui/web/index.html"
+        "source/gui/web/index.html",
+        "tools/prepare_android_project.py",
+        "docs/native-android-integration.md"
       ],
       "checks": {
         "gui": [
-          "desktop file bytes are queued for remote upload"
+          "desktop file bytes are queued for remote upload",
+          "native event listener registers a Tauri callback ID",
+          "native event routes physical coordinates to the pane in CSS pixels"
         ],
         "ui-transport": [
           "an operating-system drop names paths once and the queue answers once"
@@ -3730,12 +3743,15 @@
         "service": [
           "a_native_window_drop_names_paths_and_the_backend_reads_them",
           "drop_staging_bounds_search_filters_custom_prompts_and_bookmark_reorder"
+        ],
+        "android-emulator": [
+          "verifyAndroidGrantedSafEditing"
         ]
       },
-      "gap": "The path a native window drops is streamed into bounded private staging and queued, but no automated test drives a real WebKit drop event or the Android share filter.",
+      "gap": "Real desktop OS drag delivery, Android share-sheet resolution and SEND_MULTIPLE, upload conflict behavior, files larger than memory and physical devices remain unverified. The share hand-off is not transactional or exactly once; local and SAF drop copies may buffer complete files.",
       "acceptance": [
         "Drive a real WebKit/GTK drop onto the native window and show the queued task names the dropped paths (the shell's `dragDropEnabled` handler cannot be exercised by jsdom).",
-        "Register the Android share intent filter in the generated Kotlin project and prove a shared file reaches the same drop path, including the conflict question and the queue entry.",
+        "Exercise the existing generated Android SEND/SEND_MULTIPLE filters end to end with a shared file, including the conflict question and queue entry.",
         "Prove a dropped folder larger than memory is staged without holding it in the page, and that a partial staging tree is removed when the queue refuses the drop."
       ],
       "verified_on": {
@@ -3743,6 +3759,12 @@
           "gui",
           "ui-transport",
           "service"
+        ],
+        "windows": [
+          "service"
+        ],
+        "android": [
+          "android-emulator"
         ]
       }
     },
@@ -4106,10 +4128,14 @@
       "id": "automation.xml-action-log",
       "area": "Automation",
       "status": "partial",
-      "notes": "The XML action log (-xmllog=) writes the upstream session format (http://winscp.net/schema/session/1.0): '<group>' per command and structured '<upload>', '<download>', '<rm>', '<mkdir>', '<mv>', '<cp>', '<chmod>', '<touch>', '<call>', '<ls>', '<stat>', '<checksum>' and '<cwd>' elements with '<result success>' children and secrets masked. Schema and consumer equivalence are automation.upstream-xml-compatibility.",
+      "notes": "The optional GUI XML action log uses the upstream session namespace and operation-shaped elements. Queue and direct GUI records serialize with one in-process lock per complete record; a transfer does not hold the lock across network awaits. Incomplete existing logs lacking the expected closing tag are preserved rather than overwritten; preview reads a bounded tail. Tests validate interleaved GUI and queue records against the project-authored pinned schema on Linux. The standalone -xmllog CLI is not shipped. See docs/remaining-parity-priorities.md for supported scope and failure boundaries. Focused Linux/Windows Rust tests and Linux GUI plus live WebDAV schema checks passed in branch run 46123944392. Full Linux final-review checks including loopback WebDAV and schema validation passed in run 46124619208. Windows full workspace tests passed in final-review run 46124619141.",
       "source": [
         "crates/linscp-platform/src/terminal.rs",
-        "crates/linscp-engine/src/script.rs"
+        "crates/linscp-engine/src/script.rs",
+        "crates/linscp-engine/src/xml_log.rs",
+        "crates/linscp-service/src/queue.rs",
+        "crates/linscp-service/src/lib.rs",
+        "docs/remaining-parity-priorities.md"
       ],
       "checks": {
         "engine-script": [
@@ -4118,42 +4144,35 @@
           "test_xml_log_matches_the_upstream_schema",
           "test_xml_log_fixtures_match_the_upstream_schema"
         ],
-        "live-sftp": [
-          "test_remote_edit_and_xml_action_log"
-        ],
-        "unit": [
-          "TestNewScriptCommands"
-        ],
         "engine-xml": [
           "text_and_xml_logs_redact_multiple_urls_in_failures",
           "text_and_xml_failures_redact_recognized_secret_switches",
-          "multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting"
+          "multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting",
+          "xml_log_rejects_incomplete_existing_file_without_truncating_it",
+          "xml_log_filters_invalid_xml_characters_in_names_and_errors",
+          "xml_log_shared_writers_preserve_concurrent_records"
+        ],
+        "service": [
+          "queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log",
+          "xml_log_preview_reads_only_bounded_tail"
         ]
       },
       "verified_on": {
         "linux": [
           "engine-script",
-          "unit",
-          "live-sftp",
-          "engine-xml"
+          "engine-xml",
+          "service"
         ],
         "windows": [
           "engine-script",
-          "unit",
-          "live-sftp",
-          "engine-xml"
-        ],
-        "android": [
-          "engine-script",
-          "unit",
-          "live-sftp"
+          "engine-xml",
+          "service"
         ]
       },
-      "gap": "The operation elements of a real session (upload, download, ls, ...) are still unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Runnable residue: engine-script, which checks the group and failure structure, the masking of the secrets and the shipped fixtures. Host-side logger tests exercise masking multiple credential-bearing URL authorities and recognized secret switches, including multiline quoted values, in failure messages; this is not proof that every possible secret or malformed URL is redacted. Sensitive text logging explicitly opts out.",
+      "gap": "The schema is derived locally from the pinned upstream emitter, not independent proof of full upstream or consumer compatibility. Linux live WebDAV upload/download and GUI service samples are schema-checked; other real-server operations and Android schema behavior remain unverified. Logging is best-effort and errors can be silent; concurrent external writers, crashes and I/O failure can still cause loss or malformed logs. Secret redaction is not exhaustive.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+        "Validate additional supported GUI operations and failures against real protocol fixtures and independent consumers.",
+        "Improve logging error visibility and crash/interprocess handling before treating it as a reliable audit trail; test Android where applicable."
       ]
     },
     {
@@ -4184,7 +4203,7 @@
       "id": "desktop.scheme-handlers",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output. Split URL arguments cannot invoke one-shot actions. Windows users can opt in to per-user URL registration without changing existing defaults; Windows Settings selects the handler. Registry tests use isolated keys, and Windows CI drives install and uninstall through the built binary. Linux and Windows platform tests cover authenticated delivery, bad-token refusal and queue limits; jsdom covers modal deferral and review.",
+      "notes": "The GUI can parse a manually pasted session URL through /api/session/url, including FTPS variants and escaped paths. Invalid URL diagnostics do not echo input, because URLs may contain credentials. The Debian desktop entry advertises selected transfer URI handlers and passes a URL to the native launcher. Cold launches and authenticated running-instance delivery place URLs in a bounded in-memory queue, and the main window offers them for explicit review without connecting automatically. URL text is not stored in the instance endpoint file or printed in argument Debug output. Split URL arguments cannot invoke one-shot actions. Windows users can opt in to per-user URL registration without changing existing defaults; Windows Settings selects the handler. Registry tests use isolated keys, and Windows CI drives install and uninstall through the built binary. Linux and Windows platform tests cover authenticated delivery, bad-token refusal and queue limits; jsdom covers modal deferral and review. A local GIO test selects an isolated XDG default and launches the installed custom-prefix entry with an escaped URI; its executable is a capture stub, not the real GUI. See docs/native-android-integration.md for the remaining boundary.",
       "source": [
         "debian/linscp.desktop",
         "crates/linscp-platform/src/cli_args.rs",
@@ -4296,7 +4315,7 @@
       "id": "desktop.wayland-session",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "A desktop session is recognised as Wayland or as X11 before anything is asked of it, and only a program that can draw on it is started. The console client finds the compositor by its socket in XDG_RUNTIME_DIR - the default 'wayland-0' when WAYLAND_DISPLAY is not exported, so a session started by a launcher or a user service is still found - and refuses a Wayland-only terminal under X11, where it exits before mapping a window, while an X11-only one under Wayland is a reported XWayland fallback rather than a silent choice. The graphical client draws no window itself and asks the desktop's own URI launcher ($BROWSER, xdg-open, gio) for a browser, which needs no X11 and no window manager of the X11 kind; linscp.desktop starts it with that option and does not claim a startup notification it could never complete. Covered by unit, the retired GUI harness and wayland-compatibility; no case runs against a live compositor, so the interaction with one is not certified here.",
+      "notes": "The Linux platform detects Wayland from nonempty WAYLAND_DISPLAY or XDG_SESSION_TYPE=wayland, then X11 from nonempty DISPLAY, otherwise headless. The native Tauri/WebKitGTK GUI is launched directly by the desktop entry. The Wayland compatibility suite checks source shape, not compositor behavior. The old C++ console and browser launcher are not the shipped GUI. The pure environment classification test ran on Linux in branch run 46120074371. An installed Debian package was launched on a real headless Weston compositor with DISPLAY unset and GDK_BACKEND=wayland; the test observed a LinSCP xdg-toplevel title, configuration acknowledgement and surface commit, and checked native listeners (branch run 46121989363). It used the package artifact built in run 46120074436, not a fresh build. The full Linux final-review package job also passed its fresh-build Weston smoke in branch run 46124619208.",
       "source": [
         "crates/linscp-platform/src/linux.rs",
         "crates/linscp-platform/src/lib.rs",
@@ -4305,9 +4324,6 @@
         "tools/check_wayland_compatibility.py"
       ],
       "checks": {
-        "unit": [
-          "TestDesktopSessionDetection"
-        ],
         "wayland-compatibility": [
           "test_the_real_tree_needs_no_x11",
           "test_an_x11_only_display_test_is_found",
@@ -4315,34 +4331,19 @@
           "test_startup_notification_nobody_can_complete_is_found",
           "test_detectors_that_disagree_are_found"
         ],
-        "script": [
-          "test_the_gui_launcher_is_asked_for_a_window_only_when_somebody_reads"
+        "platform-linux": [
+          "session_environment_classification"
         ]
       },
       "verified_on": {
         "linux": [
-          "script",
-          "unit",
-          "wayland-compatibility"
-        ],
-        "windows": [
-          "script",
-          "unit",
-          "wayland-compatibility"
-        ],
-        "android": [
-          "script",
-          "unit",
-          "wayland-compatibility"
+          "wayland-compatibility",
+          "platform-linux"
         ]
       },
-      "gap": "The source-shape checks in wayland-compatibility run on every platform, but the C++ session detector and the console launcher it describes are exercised by UnitTest.cpp and ScriptTest.py, which have no build target and need a `linscp` binary this repo does not build - so they are not evidence. No case runs against a live compositor either, so what a real Wayland session does with this build is not certified here.",
+      "gap": "A basic headless Weston launch is tested, but full desktop environments, user interaction, clipboard, drag-and-drop, DPI, XWayland interoperability and other compositors are not verified. Protocol logging does not validate rendered pixels.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests.",
-        "Write a suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "wayland-compatibility cannot run on Windows or Android (it is a Linux display-server guard); record platform-scoped evidence for the Linux-only behavior, or cite additional runnable suites there."
+        "Exercise native GUI and terminal selection on full supported Wayland compositors and X11, including mixed XWayland sessions, scaling, rendering and native desktop interactions."
       ]
     },
     {
@@ -4407,8 +4408,8 @@
       "id": "locale.translations",
       "area": "Localization/accessibility",
       "status": "partial",
-      "notes": "English, Spanish, German and French catalogs cover the browser interface (menus, dialogs, help, ARIA/tooltips, dynamic status/queue/sync/editor/search messages) and the whole command-line client, including the external-editor prompts. The translation compiler rejects a message that reaches the user without a catalog entry. A catalog walker reports interface strings still answered in English so a new string cannot slip through untranslated, and the translation tests keep switches, values, command names and protocol words literal in every catalog. The language selector and the backend's locale selection are filled from the shipped catalogs, and a confirmation accepts the yes letter its translated hint shows. Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages.",
-      "gap": "Only English, Spanish, German and French catalogs are shipped; upstream ships catalogs for many more languages, and the upstream .NET interface has strings that this client does not have at all. No full upstream language-catalog coverage is claimed. A walker already reports catalog messages still answered in English.",
+      "notes": "English, Spanish, German and French catalogs are embedded for the native GUI and internal engine. Automated catalog, placeholder and GUI tests cover selected messages and locale behavior; they do not prove human translation quality or cover every dynamic diagnostic. Server/OS diagnostics and protocol data can remain untranslated. The standalone CLI is not shipped. Additional languages should be prioritized with community demand and human review; adding one requires registering it in Rust and assessing plural rules, RTL and input behavior.",
+      "gap": "Only four catalogs ship. Other upstream languages are not supported; the current singular/other API cannot express every CLDR plural category. User-facing dynamic errors and real-device/assistive-technology behavior require further review.",
       "source": [
         "crates/linscp-i18n/src/lib.rs",
         "crates/linscp-platform/src/terminal.rs",
@@ -4421,23 +4422,10 @@
         "locales/de.json",
         "locales/fr.json",
         "ui/src/index.ts",
-        "crates/linscp-service/src/lib.rs"
+        "crates/linscp-service/src/lib.rs",
+        "docs/remaining-parity-priorities.md"
       ],
       "checks": {
-        "unit": [
-          "TestLocalization"
-        ],
-        "script": [
-          "test_translation_locale_selection_and_literal_placeholders",
-          "test_translation_locale_environment_precedence",
-          "test_translated_help_and_option_errors_preserve_command_syntax",
-          "test_translated_command_help_lists_every_command",
-          "test_translated_engine_workflows_keep_the_data_literal",
-          "test_translated_synchronization_session_and_transfer_workflows"
-        ],
-        "live-sftp": [
-          "test_spanish_transfer_and_host_key_refusal"
-        ],
         "gui-localization": [
           "Spanish selected",
           "French selected",
@@ -4458,15 +4446,13 @@
       },
       "verified_on": {
         "linux": [
-          "unit",
-          "script",
-          "live-sftp",
           "gui-localization",
           "translation-tests"
         ]
       },
       "acceptance": [
-        "Ship a catalog for every language the project claims to support and translate the whole interface into it, starting with the languages the upstream project already ships."
+        "Choose additional languages based on user demand and maintained human review; register and test any new catalogs and expand plural/RTL support when needed.",
+        "Validate supported GUI strings and accessibility in real platform workflows; do not imply untranslated protocol data or server diagnostics are localized."
       ]
     },
     {
@@ -4554,7 +4540,7 @@
       "id": "platform.debian-package",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged.",
+      "notes": "debian/rules and debian/control build a native GUI-only package with its desktop entry, icons and documentation. Linux CI builds the actual package, checks its contents, installs it and launches a window under Xvfb. A branch run passed these checks; an earlier run built and installed successfully but failed the GUI smoke without enough diagnostic output, so launch reliability is not established. The retired CLI and its man page are not packaged. CI also defines a synthetic same-payload older-version upgrade, removal and purge test; this is not a migration test from a historical release. Shell integration is per-user and is not removed by dpkg. The package job in branch run 46120074436 passed the synthetic upgrade, removal, purge and custom-prefix GIO/Xvfb smokes on Ubuntu 24.04. The separate general-check job failed on temporary workflow trigger policy; it is not evidence. The full final-review package job passed again in branch run 46124619208.",
       "source": [
         "debian/rules",
         "debian/control",
@@ -4570,7 +4556,7 @@
           "gui-distribution"
         ]
       },
-      "gap": "The Linux CI package smoke passed on one branch run after an earlier unexplained GUI-launch failure. Desktop menu integration, upgrades/removal and other Debian versions are not validated; the upstream CLI is deliberately omitted.",
+      "gap": "A same-payload synthetic version upgrade and removal passed on Ubuntu 24.04; migration from a historical release, real desktop menus/default selection and other Debian environments remain unverified. An earlier GUI-launch smoke failed without enough diagnostics; one later run does not establish reliability. The upstream CLI is deliberately omitted.",
       "acceptance": [
         "Investigate the intermittent launch-smoke failure and exercise package upgrade/removal and desktop integration on supported Debian environments.",
         "Do not claim the retired console client is shipped."
@@ -4816,7 +4802,7 @@
       "id": "platform.android-saf-editing",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks file properties and the edited bytes outside the app, and reopens the granted folder after a process restart. Structured SAF editor URIs must name an immediate child of the active pane; host tests cover both panes and the emulator tests a sibling read/write refusal. The Android bridge resolves document IDs against each parent listing rather than querying arbitrary descendant IDs directly, and retains structured parent paths across staged writes. A packaged emulator checks that a direct child ID works and a flattened descendant ID is refused, as well as nested files named document. This relies on the provider reporting truthful child listings.",
+      "notes": "Opening, saving and reading properties in a granted Android folder go through LocalFs to the SAF bridge instead of the refusal: the editor reads the document bytes, saves create-or-replace the document, and properties rows carry the bridge's stat, on the main pane and on a granted other pane alike. The stale-save guard compares at the bridge's seconds precision, the same granularity remote saves use. A save whose stat fails proceeds to the bridge write, because a missing document and an unreadable one are indistinguishable there and the write creates what is missing; a genuinely broken write still surfaces its own error. The page offers the editor for granted folders again; chmod and other unsupported operations retain named refusals (see platform.android-saf-refusals); transfers, copy/move and polling are tracked separately. Android whole-document and chunked reads resolve documents inside the I/O error handler, so provider resolution errors are reported through the bridge rather than escaping the worker setup. A packaged Android emulator test obtains a real shared-storage folder grant through DocumentsUI, lists and reads an existing file, refuses a stale editor save, edits and creates files, checks file properties and the edited bytes outside the app, and reopens the granted folder after a process restart. Structured SAF editor URIs must name an immediate child of the active pane; host tests cover both panes and the emulator tests a sibling read/write refusal. The Android bridge resolves document IDs against each parent listing rather than querying arbitrary descendant IDs directly, and retains structured parent paths across staged writes. A packaged emulator checks that a direct child ID works and a flattened descendant ID is refused, as well as nested files named document. This relies on the provider reporting truthful child listings. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/ops.rs",
@@ -4864,7 +4850,7 @@
       "id": "platform.android-saf-local-copy-move",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies walk nested files through the bridge. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) avoids whole-file Base64/JSON heap spikes. A packaged Android emulator exercises a real external-storage provider for a nested copy from a granted folder into app storage, a move from app storage into a grant, and an existing-destination move refusal that preserves both files. The emulator also refuses a provider file one byte above the 64 MiB cap when copying it into app storage, preserving the source and leaving no destination.",
+      "notes": "Local copies and moves with a granted end run on LocalFs in the queue worker: bytes cross the bridge between plain and granted panes and between two granted trees, with the same conflict policies as plain pairs. Every granted move is a copy that deletes its source (queue jobs always carry the same leaf on both sides, so a provider-side rename could only retarget a name onto itself); same-directory renames stay on the rename endpoint, which renames directly. Files over the 64 MiB document cap refuse at enqueue time and in the worker naming the file; symbolic links refuse by name; a plain target keeps the source's seconds while a granted target gets fresh stamps, and directory copies walk nested files through the bridge. The page offers transfers and moves on local tabs and still gates session transfers and moves on remote tabs. Chunked 1 MiB SAF streaming (readUriChunk/beginWriteUri/appendUriChunk and LocalFs::copy_streamed) avoids whole-file Base64/JSON heap spikes. A packaged Android emulator exercises a real external-storage provider for a nested copy from a granted folder into app storage, a move from app storage into a grant, and an existing-destination move refusal that preserves both files. The emulator also refuses a provider file one byte above the 64 MiB cap when copying it into app storage, preserving the source and leaving no destination. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-service/src/lib.rs",
         "crates/linscp-service/src/queue.rs",
@@ -4904,14 +4890,14 @@
       },
       "gap": "The emulator covers the external-storage DocumentsProvider in one granted tree, including nested copy, over-cap copy refusal and a move conflict. Two separate granted trees, other providers, large-document memory pressure, concurrent-creator races and physical devices remain unverified.",
       "acceptance": [
-        "Copy and move files between a granted folder and app storage and between two granted trees on an Android device or emulator, covering the document-cap refusal and a move onto an existing name."
+        "Exercise copy and move between two separately granted trees, including name conflicts, document-cap refusals and concurrent-creator races; repeat representative cases with other providers and physical devices."
       ]
     },
     {
       "id": "platform.android-saf-session-transfers",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file. A packaged Android emulator test uses a DocumentsUI grant and a WebDAV fixture to upload, download, move, protect an existing destination, refuse verified resume, and transfer nested trees in both directions after explicit WebDAV directory-copy risk confirmation. The emulator refuses upload of a provider file one byte above the cap and preserves it. It also refuses download and move of an over-cap WebDAV file before queueing, leaving no provider document and preserving the remote source. A WebDAV-to-provider tree merge requires confirmation, adds a new file, and refuses an overlapping merge without replacing the existing provider file. The emulator also exercises provider-to-WebDAV merge confirmation, addition and refusal to overwrite an existing remote file.",
+      "notes": "Session transfers with a granted local side stage through private temporary files in the queue worker: uploads stage the granted source (keeping its seconds, so the remote keeps its stamps) and run the guarded upload unchanged from the stage; downloads land in a stage and publish across the bridge file by file. Trees stage and publish whole in both directions; merges add to an existing granted tree without replacing any file and fail instead of replacing. Files over the 64 MiB document cap refuse at enqueue time naming the file; verified resume refuses for granted folders, since the bridge has no appends or partial files; WebDAV moves delete the remote source by ETag after the staged download publishes. The page offers transfers and moves for granted folders on both tab kinds. Staging and publication stream in 1 MiB chunks via LocalFs::stage_to_file and LocalFs::publish_from_file. A packaged Android emulator test uses a DocumentsUI grant and a WebDAV fixture to upload, download, move, protect an existing destination, refuse verified resume, and transfer nested trees in both directions after explicit WebDAV directory-copy risk confirmation. The emulator refuses upload of a provider file one byte above the cap and preserves it. It also refuses download and move of an over-cap WebDAV file before queueing, leaving no provider document and preserving the remote source. A WebDAV-to-provider tree merge requires confirmation, adds a new file, and refuses an overlapping merge without replacing the existing provider file. The emulator also exercises provider-to-WebDAV merge confirmation, addition and refusal to overwrite an existing remote file. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-engine/src/transfer.rs",
         "crates/linscp-service/src/lib.rs",
@@ -4956,7 +4942,7 @@
       },
       "gap": "Single-file transfers, move, nested tree upload/download, tree merges in both directions and over-cap upload, download and move refusals are exercised on an Android emulator with the external-storage DocumentsProvider and a WebDAV fixture; other providers, large-document memory pressure, concurrent writers and physical devices remain unverified.",
       "acceptance": [
-        "Validate tree transfers and document-cap refusal between a granted folder and a server on an Android device or emulator, including other providers and physical devices."
+        "Extend the existing emulator transfer and cap-refusal coverage to other document providers, large-document memory pressure, concurrent writers and physical devices; keep granted-folder resume refused until safely supported."
       ]
     },
     {
@@ -5068,55 +5054,71 @@
       "id": "editing.non-utf8-encodings",
       "area": "Editing/search",
       "status": "partial",
-      "notes": "CLI editing supports explicit legacy-encoding selection ('edit -encoding=ENC'): the file is converted between its encoding and UTF-8, the round trip is byte exact with the BOM preserved, and invalid sequences or unrepresentable output are refused without a silent replacement. Browser editor/search remain UTF-8-only and reject binary files.",
+      "notes": "CLI and browser editor support explicit legacy encodings with strict decoding and encoding, line-ending and BOM controls. When opening undecodable text the browser offers an encoding retry; content search accepts an encoding and skips binary or undecodable files. Remote editor and search downloads are bounded by streamed bytes, not just server-reported sizes.",
       "source": [
         "crates/linscp-engine/src/editor.rs",
         "crates/linscp-service/src/lib.rs"
       ],
       "checks": {
-        "unit": [
-          "TestEncodingHelpers",
-          "TestEditorHelpers"
-        ],
         "service-commands": [
           "the_editor_refuses_what_it_cannot_represent"
         ],
         "engine-editor": [
           "edit_normalizes_the_line_endings_before_the_upload"
+        ],
+        "service": [
+          "live_webdav_sync_encoding_and_interrupted_delete",
+          "search_and_sync_refuse_unsafe_server_entries_and_bound_remote_reads",
+          "remote_search_charges_failed_oversized_reads_to_total_budget",
+          "saf_search_and_sync_reject_provider_path_components",
+          "saf_search_charges_underreported_oversized_documents"
+        ],
+        "gui": [
+          "undecodable file offers encoding retry without opening the editor",
+          "retry opens with selected lowercase backend encoding",
+          "cancelling another file retry preserves the open editor format",
+          "new empty file saves selected encoding",
+          "content search forwards selected text encoding"
+        ],
+        "android-emulator": [
+          "verifyAndroidRemoteEditingAndInterruptedDelete"
         ]
       },
       "verified_on": {
         "linux": [
-          "unit",
+          "service",
+          "service-commands",
           "engine-editor",
-          "service-commands"
+          "gui"
         ],
         "windows": [
-          "unit",
+          "service",
           "service-commands"
         ],
         "android": [
-          "unit",
-          "engine-editor",
-          "service-commands"
+          "android-emulator"
         ]
       },
-      "gap": "The live half is still unevidenced: unit has no build target and cannot be compiled. Runnable residue: service-commands, which refuses a binary file, an invalid byte sequence and an unknown encoding, and round-trips a legacy encoding byte exactly with its byte-order mark; and engine-editor, which edits a file in a legacy encoding and uploads it in that encoding (the editor double is a shell command, so that case runs on the Unix hosts).",
+      "gap": "Linux loopback WebDAV and a packaged Android emulator cover Windows-1252 editing and content search; Linux additionally exercises UTF-16LE with a BOM; GUI encoding retry is exercised with a stub service. Binary detection is heuristic, remote editor mtime checks are not atomic, and production servers and physical devices remain unverified.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Cover the search path as well as the editor path: the browser search rejects binary files too."
+        "Exercise additional encodings and negative cases against other servers, Android providers and physical devices.",
+        "Retain strict refusal of unrepresentable output and document binary detection limits."
       ]
     },
     {
       "id": "automation.upstream-xml-compatibility",
       "area": "Automation",
       "status": "partial",
-      "notes": "The XML action log (-xmllog=) now writes the upstream session format instead of a look-alike: root '<session xmlns=\"http://winscp.net/schema/session/1.0\" name=\"user@host\"|site|nosession start=\"...Z\">', one '<group>' per script command named by its masked line (grouping is always on, so a continuous reader knows a command finished when its group closes), one element per physical operation - upload, download (both with '<size>'), rm (including rmdir and S3 exact-version removal), mkdir, mv, cp, chmod ('<permissions>' as 'rwxr-xr-x' letters), touch ('<modification>'), call ('<output>'/'<erroroutput>' streams and '<exitcode>' from a captured run), ls ('<files>' of '<file>' with the upper-case type character), stat (one '<file>' with no '<filename>'), checksum ('<algorithm>'/'<checksum>') and cwd - each ending in '<result success=\"true|false\">' with '<message>' on failure, and a '<failure>' with the command's masked errors closing a failed group. Attribute and text escaping follow upstream's XmlAttributeEscape/XmlEscape pair (newline as '&#10;' in attributes, CR and unrepresentable controls dropped), timestamps are the one UTC '....NNNZ' spelling. The format is pinned in the repository as docs/linscp-session-1.0.xsd, written from upstream's emitter (source/core/SessionInfo.cpp) and its XML Logging documentation. The engine-script suite reads the shipped fixtures (fixtures/xml/) and a freshly produced log back the way an upstream-style consumer does - the namespace, the groups, the failure and the masked-password failure - and holds the log to the operation elements the fixtures show; the live SFTP suite validates a full real session log the same way and checks every action element's parameters against the bytes it moved. Boundaries kept: console output is not recorded (as upstream), operations with no upstream element (symlink creation) are absent (as upstream), 'difference' elements for a bare synchronization comparison are schema-defined but only emitted through the transfer/mkdir/rm elements a synchronization actually performs, and a run that never connects keeps the upstream fallback session name 'nosession'.",
+      "notes": "The optional GUI XML action log uses the upstream session namespace and operation-shaped elements. Queue and direct GUI records serialize with one in-process lock per complete record; a transfer does not hold the lock across network awaits. Incomplete existing logs lacking the expected closing tag are preserved rather than overwritten; preview reads a bounded tail. Tests validate interleaved GUI and queue records against the project-authored pinned schema on Linux. The standalone -xmllog CLI is not shipped. See docs/remaining-parity-priorities.md for supported scope and failure boundaries. Focused Linux/Windows Rust tests and Linux GUI plus live WebDAV schema checks passed in branch run 46123944392. Full Linux final-review checks including loopback WebDAV and schema validation passed in run 46124619208. Windows full workspace tests passed in final-review run 46124619141.",
       "source": [
         "crates/linscp-platform/src/terminal.rs",
         "crates/linscp-engine/src/script.rs",
         "crates/linscp-engine/src/session_store.rs",
-        "docs/linscp-session-1.0.xsd"
+        "docs/linscp-session-1.0.xsd",
+        "crates/linscp-engine/src/xml_log.rs",
+        "crates/linscp-service/src/queue.rs",
+        "crates/linscp-service/src/lib.rs",
+        "docs/remaining-parity-priorities.md"
       ],
       "checks": {
         "engine-script": [
@@ -5125,42 +5127,35 @@
           "test_xml_log_matches_the_upstream_schema",
           "test_xml_log_fixtures_match_the_upstream_schema"
         ],
-        "live-sftp": [
-          "test_remote_edit_and_xml_action_log"
-        ],
-        "unit": [
-          "TestServerReplyHardening"
-        ],
         "engine-xml": [
           "text_and_xml_logs_redact_multiple_urls_in_failures",
           "text_and_xml_failures_redact_recognized_secret_switches",
-          "multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting"
+          "multiline_quoted_diagnostic_secrets_are_redacted_before_xml_line_splitting",
+          "xml_log_rejects_incomplete_existing_file_without_truncating_it",
+          "xml_log_filters_invalid_xml_characters_in_names_and_errors",
+          "xml_log_shared_writers_preserve_concurrent_records"
+        ],
+        "service": [
+          "queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log",
+          "xml_log_preview_reads_only_bounded_tail"
         ]
       },
       "verified_on": {
         "linux": [
           "engine-script",
-          "live-sftp",
-          "unit",
-          "engine-xml"
+          "engine-xml",
+          "service"
         ],
         "windows": [
           "engine-script",
-          "live-sftp",
-          "unit",
-          "engine-xml"
-        ],
-        "android": [
-          "engine-script",
-          "live-sftp",
-          "unit"
+          "engine-xml",
+          "service"
         ]
       },
-      "gap": "Linux CI independently validates both shipped XML fixtures, an actual failed-open logger output, and a real loopback WebDAV session log with successful upload and download against the pinned XSD; it also checks that an invalid boolean is rejected. Other real-session operation elements and schema validation on Windows and Android remain unevidenced: live-sftp needs a `linscp` binary this repo does not build, and unit has no build target and cannot be compiled. Engine-script also reads the fixtures and produced log as an upstream-style consumer. Host-side logger tests exercise masking multiple credential-bearing URL authorities and recognized secret switches, including multiline quoted values, in failure messages; this is not proof that every possible secret or malformed URL is redacted. Sensitive text logging explicitly opts out.",
+      "gap": "The schema is derived locally from the pinned upstream emitter, not independent proof of full upstream or consumer compatibility. Linux live WebDAV upload/download and GUI service samples are schema-checked; other real-server operations and Android schema behavior remain unverified. Logging is best-effort and errors can be silent; concurrent external writers, crashes and I/O failure can still cause loss or malformed logs. Secret redaction is not exhaustive.",
       "acceptance": [
-        "A suite that executes in CI on Linux, Windows and Android covering the stated behavior, with its cases named in checks and cited per platform in verified_on.",
-        "Drive the protocol cases from a binary this repo builds, or port them to Rust tests over the existing mock fixtures.",
-        "Give UnitTest.cpp a build target, or port its cases to Rust tests."
+        "Validate additional supported GUI operations and failures against real protocol fixtures and independent consumers.",
+        "Improve logging error visibility and crash/interprocess handling before treating it as a reliable audit trail; test Android where applicable."
       ]
     },
     {
@@ -5538,13 +5533,16 @@
         ],
         "service": [
           "live_webdav_gui_upload_download",
-          "remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names"
+          "remote_delete_reports_partial_failures_and_rejects_unsafe_listing_names",
+          "live_webdav_sync_encoding_and_interrupted_delete"
+        ],
+        "android-emulator": [
+          "verifyAndroidRemoteEditingAndInterruptedDelete"
         ]
       },
-      "gap": "Recursive remote deletion is not transactional and may leave a partially deleted tree after an error. Linux and Windows mock-session tests inject a child deletion failure and verify the partial result is reported; the GUI test verifies the message reaches the error log. Live-server interruption and Android-device behavior remain unverified.",
+      "gap": "Recursive remote deletion is not transactional and can leave a partially deleted tree. Linux loopback WebDAV and a packaged Android emulator deliberately drop TCP during a child delete and verify the partial result; Windows uses a mock failure. Physical devices and production-server interruption remain unverified.",
       "acceptance": [
-        "Exercise actual connection interruption and resulting partial deletion against a live server.",
-        "Exercise the partial-failure report on Android and retain the non-transactional warning."
+        "Exercise interruption against other production-like servers and physical devices; retain the non-transactional warning."
       ],
       "verified_on": {
         "linux": [
@@ -5553,6 +5551,9 @@
         ],
         "windows": [
           "service"
+        ],
+        "android": [
+          "android-emulator"
         ]
       }
     },
@@ -5560,7 +5561,7 @@
       "id": "backup.full-export-import",
       "area": "Sessions/configuration",
       "status": "partial",
-      "notes": "Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs. A packaged Android debug APK emulator test exports an encrypted backup, checks refusal of unconfirmed, wrong-password and corrupted imports and active-session restore, then restores over a changed site list. It verifies the existing Keystore-wrapped key stays unchanged, no restore journal remains, and restored credentials reconnect after process restart. A second emulator test exports from one vault, clears the disposable app data, creates a fresh vault with a different password, imports the backup without replacing its destination key, and reconnects with restored credentials before and after process restart. The cross-vault Android test also restores an encrypted SSH-key fixture and its saved-site reference and label. Import deduplication decrypts the destination key and compares the original fixture both before and after restart; the destination ciphertext differs from the source. A disposable Ed25519 key authorized by a Paramiko SFTP fixture authenticates and lists the server after restoration into the fresh vault and again after an app restart; the test does not involve a physical device or a different operating system. A damaged-journal Android emulator test verifies the startup recovery gate rejects session access and unlock, preserves the journal, saved sites and vault key byte-for-byte, and allows reconnection after the test removes the damaged fixture.",
+      "notes": "Full exports refuse external SSH/TLS material, CA directories and file-based public-key pins; use supported key/session export or migrate material first. Key/session merges refuse conflicting shared presets and host keys, but are not a crash-transactional multi-file restore. Linux and Windows backup and interchange regression checks passed at b46fdca (GitHub Actions run 46104449707); see docs/backup-portability.md for limitations. Encrypted portable full application backup (`LSCPBAK1`, independent password, Argon2id + AES-256-GCM, LF-normalized, CRLF-tolerant, no absolute config_dir) and transactional undo-journaled restore (`restore_journal.rs` + `ConfigDirectoryLock` + Linux/Android/Windows directory sync barriers). Covers sessions.ini, vault SSH keys + metadata rewrapped under the destination's unlocked vault key, workspaces.json, bookmarks.json, preferences.json, accounts.ini, sshhostkeys, explorer-commands.json, custom-commands.json, monitor.json, and transfer-presets.ini, and clears device-local auto-reconnect.json. `backup_is_distribution_compatible_between_linux_windows_and_android` tests simulated Linux→Windows→Android format round-trip on CI hosts with vault SSH key rewrapping, encrypted stores, fail-closed validation, and CRLF file tolerance. Implemented in crates/linscp-engine/src/{backup.rs,restore_journal.rs}, `backup export|import <file>` in script.rs, and `POST /api/backup/{export,import}` in crates/linscp-service/src/lib.rs. A packaged Android debug APK emulator test exports an encrypted backup, checks refusal of unconfirmed, wrong-password and corrupted imports and active-session restore, then restores over a changed site list. It verifies the existing Keystore-wrapped key stays unchanged, no restore journal remains, and restored credentials reconnect after process restart. A second emulator test exports from one vault, clears the disposable app data, creates a fresh vault with a different password, imports the backup without replacing its destination key, and reconnects with restored credentials before and after process restart. The cross-vault Android test also restores an encrypted SSH-key fixture and its saved-site reference and label. Import deduplication decrypts the destination key and compares the original fixture both before and after restart; the destination ciphertext differs from the source. A disposable Ed25519 key authorized by a Paramiko SFTP fixture authenticates and lists the server after restoration into the fresh vault and again after an app restart; the test does not involve a physical device or a different operating system. A damaged-journal Android emulator test verifies the startup recovery gate rejects session access and unlock, preserves the journal, saved sites and vault key byte-for-byte, and allows reconnection after the test removes the damaged fixture. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-engine/src/backup.rs",
         "crates/linscp-engine/src/script.rs",
@@ -5611,7 +5612,7 @@
       "id": "desktop.remote",
       "area": "Desktop integration",
       "status": "partial",
-      "notes": "RDP/VNC/SPICE support direct TCP (3389/5900), SSH jump SOCKS5h relays, and on-demand loopback SSH port forwarders (/api/desktop/launch tunnel_via_ssh + /api/desktop/tunnel-close), including Android external viewer launch with foreground keepalive. The built-in experimental X2Go KDrive viewer supports session listing, resume, suspend, termination, server cursors, live window resize, and opt-in clipboard sync (/api/x2go/{sessions,open,poll,input,clipboard,suspend,terminate,close}). Android viewer launch is restricted in both the frontend and native bridge to allowed schemes and no userinfo; RDP/VNC/SPICE viewer URIs additionally refuse paths, queries and fragments. The debug APK emulator smoke invokes the native bridge directly to test unsafe URI refusals.",
+      "notes": "RDP/VNC/SPICE can use direct viewers or an on-demand loopback SSH port forwarder; requested tunnels fail closed if no usable forward exists, and downloadable tickets cannot establish a tunnel. A separate SPICE TLS port is not supported through the single-port forward. RDP saved passwords are not passed in process arguments; viewers must prompt or use their own credential facilities. X11/Waypipe binary and argv must match. The built-in X2Go KDrive viewer remains experimental. Android external URI validation rejects unsupported or unsafe targets. Focused ticket, launcher and fail-closed tests passed on Linux and Windows in branch run 46120074371.",
       "source": [
         "crates/linscp-platform/src/desktop.rs",
         "crates/linscp-proto/src/remote_desktop.rs",
@@ -5632,7 +5633,8 @@
           "TestDesktopSessionDetection"
         ],
         "service": [
-          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state"
+          "s3_dav_x2go_and_desktop_tunnel_routes_validate_and_track_state",
+          "desktop_requested_tunnels_do_not_fall_back_to_direct_connections"
         ],
         "ui-transport": [
           "Android desktop viewer URIs allow direct RDP/VNC/SPICE targets and reject unsupported or unsafe targets",
@@ -5670,19 +5672,19 @@
           "android-emulator"
         ]
       },
-      "gap": "The Android emulator tests specific native URI refusals, not external viewer interoperability or every possible malformed URI. Live desktop server validation (xrdp, TigerVNC, SPICE, and live X2Go KDrive server) and gateway security review remain open.",
+      "gap": "The experimental KDrive viewer and native viewer launching have unit/GUI coverage, but live X2Go, RDP, VNC, SPICE and X11/Waypipe interoperability, credential handling and lifecycle behavior remain unverified on target desktops. Android emulator coverage is limited to specific unsafe native URI refusals. The desktop help no longer advertises an unimplemented embedded RDP fallback; gateway responses are hints rather than a bundled viewer.",
       "acceptance": [
-        "Live RDP launch with xfreerdp/mstsc against a throwaway RDP stub verifies argv, port 3389, TLS/NLA option, and jump-host SOCKS5h relay without exposing credentials (live-desktop).",
-        "Live VNC (5900) and SPICE (5900/.vv) launches verify viewer resolution (tigervnc/remote-viewer), TLS port, and headless .vv/.rdp ticket generation (live-desktop).",
-        "Implement and test a built-in X2Go KDrive viewer on Linux, Windows and macOS, including graphics, input, SSH forwarding, and safe session lifecycle. Separately test X11/Waypipe launches and jump-host policy (live-desktop).",
-        "Obtain independent review that ironrdp WASM / Guacamole gateway fallback correctly isolates credentials and that XDMCP (UDP 177) remains refusing/not recommended."
+        "Test RDP launches against a disposable server, including viewer resolution, TLS/NLA options, jump-host relay and credential handling.",
+        "Test VNC and SPICE viewer launches against disposable servers, including TLS options and generated viewer tickets where supported.",
+        "Validate and complete the existing experimental X2Go KDrive viewer against real servers on intended platforms, including rendering, input, SSH forwarding and lifecycle; test X11/Waypipe and jump-host policy separately.",
+        "Independently review any credential-bearing gateway actually shipped; keep XDMCP risk explicit."
       ]
     },
     {
       "id": "platform.android-saf-synchronization",
       "area": "Packaging/platforms",
       "status": "partial",
-      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and nested synchronization in both directions. A two-pass keep-up-to-date run uploads a file created after the first pass started, exercising interval polling with the external-storage provider. A checksum preview against WebDAV refuses a real provider file one byte over the cap and preserves both files. A separate long-interval polling task is cancelled after its first upload; cancellation finishes promptly and a subsequently created file remains local.",
+      "notes": "Synchronization with a granted local side plans and applies through LocalFs: the planner walks the tree through the bridge, checksum criteria stat each document fresh and refuse an over-cap file naming it before its bytes are read, downloads land in a private stage and publish across the bridge replacing like the plain path, and uploads stage the granted source and run the guarded upload unchanged from the stage. Granted-side deletions stay lenient; keep-up-to-date cannot watch a content:// tree, so it polls it on the interval instead. The page offers both dialogues for granted folders. A packaged Android emulator exercises a real DocumentsUI grant with WebDAV: preview, upload, download, checksum comparison, local obsolete-file deletion and nested synchronization in both directions. A two-pass keep-up-to-date run uploads a file created after the first pass started, exercising interval polling with the external-storage provider. A checksum preview against WebDAV refuses a real provider file one byte over the cap and preserves both files. A separate long-interval polling task is cancelled after its first upload; cancellation finishes promptly and a subsequently created file remains local. The packaged API 35 x86_64 Android emulator scenarios were rerun successfully with later code in branch run 46124619130; coverage is limited to the specific scripted provider and operations.",
       "source": [
         "crates/linscp-engine/src/sync_planner.rs",
         "crates/linscp-engine/src/keepuptodate.rs",
@@ -5728,22 +5730,23 @@
       },
       "gap": "The emulator exercises nested synchronization, repeated polling, cancellation and checksum preview over-cap refusal with the external-storage DocumentsProvider and a WebDAV fixture. Other over-cap paths, other providers and physical devices remain unverified; mtime fidelity and concurrent provider behavior also need validation.",
       "acceptance": [
-        "Validate nested-tree synchronization, document-cap refusal, timed repeated polling and cancellation with real providers and physical devices."
+        "Extend the existing nested-sync, polling, cancellation and checksum cap tests to other providers, physical devices, other over-cap paths, timestamp fidelity and concurrent provider changes."
       ]
     }
   ],
   "scope": {
     "definition": "Inventory of the pinned upstream script registrations, Linux additions, reviewed feature areas and known implementation/compatibility gaps. Completeness of this ledger is not full upstream feature parity or an exhaustive behavioral/security certification.",
-    "reviewed_on": "2026-11-06",
+    "reviewed_on": "2026-11-20",
     "limitations": [
-      "Verified means the stated scoped behavior has named automated evidence, not every upstream variant.",
-      "Source/test citations record where evidence is defined, not a claim that every suite ran in this workspace.",
-      "Mock-server/browser fixtures do not certify every real server, browser, file manager or architecture.",
-      "Missing capabilities are retained and must not be deleted to pass the full-parity gate.",
-      "The Wayland and X11 behavior is established from the sources, from fixtures that say which display server this is, and from a check that refuses the X11-only shapes; no case in this ledger runs against a live compositor, so a real Wayland session is not certified by it.",
-      "Suites flagged not runnable under a platform execute no case there; a verified row cites only suites that run on the platforms it names, with only cases its checks list."
+      "Verified means scoped behavior has named automated evidence, not every upstream variant or platform behavior.",
+      "Source and test citations show where evidence is defined, not necessarily that every suite ran on that platform.",
+      "Mock-server and browser fixtures do not certify third-party servers, desktop environments, file managers, physical devices or all architectures.",
+      "Missing capabilities remain in the comparison; the full-parity gate is not a product release certification.",
+      "A headless Weston launch was exercised on Linux; source-shape checks and a committed toplevel do not establish full compositor behavior, rendering or interaction.",
+      "Host tests used in an Android build are not Android-runtime tests; only explicitly described emulator/device scenarios establish runtime behavior.",
+      "Final branch review results and known limitations are summarized in docs/final-parity-review.md; passing runs do not remove individual capability gaps."
     ],
-    "conversion": "LinSCP ships on Linux alone. The Windows port was removed in 1.0-2 and this audit looked for what it left behind: the script command splitter still read a backslash as an escape inside double quotes, so a path carried over from a Windows client lost its separators; the error messages still carried the Windows wording of an operation phrase, so the template said a preposition twice; the tree still held a public C ABI header with no library behind it and a half-translated file-manager extension that could not run; and the three installers disagreed about what an installation contains. All four are fixed, and tools/check_platform_conversion.py now keeps them fixed.",
-    "wayland": "A Linux desktop runs on Wayland or on X11, and the way an application gets that wrong is silent: it asks for $DISPLAY, finds nothing on a session that exports $WAYLAND_DISPLAY and no X server at all, and reports that the user has no desktop. LinSCP draws no window of its own, so this is about the three times it asks the desktop for something - the terminal window 'terminal' opens, the browser window the graphical client asks the desktop to show, and the desktop entry that starts it. tools/check_wayland_compatibility.py keeps them session-aware, and refuses X11-only and Wayland-only helper programs outright, so that neither display server is a privileged case here."
+    "conversion": "The product is a native GUI on Linux, Windows and Android. The historical Linux-only conversion checker remains a scoped source-shape guard; it does not certify the whole repository or replace platform builds and tests. The retired standalone CLI, .NET assembly and PowerShell module are not shipped.",
+    "wayland": "The native Tauri/WebKitGTK GUI launches directly. Linux CI exercises the installed package under Xvfb and headless Weston with the GTK Wayland backend forced. That smoke checks a configured Wayland toplevel and a surface commit, not rendering quality, full desktops, user interaction, XWayland, scaling or every compositor."
   }
 }

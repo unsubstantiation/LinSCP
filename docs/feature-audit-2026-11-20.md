@@ -1,5 +1,9 @@
 # Feature and release-readiness audit — 2026-11-20
 
+**Historical audit:** Findings and test status below describe the audit at the
+time. For subsequent fixes and scoped CI evidence, see the
+[final parity review](final-parity-review.md).
+
 **Baseline:** `4987880ca4adea91a8d3a8e056217620d39859ed` (includes PR #125). This is a focused static audit of the current native GUI, service routes, known limitations and CI, not an exhaustive security review or a claim that unmentioned features are complete. Prior reports and the generated parity ledger include historical CLI and removed-host material; their counts are not a count of broken GUI features.
 
 > **Follow-up status on `arena/7562cb1f-linscp` (after PR #128):** portable

@@ -42,13 +42,14 @@ jobs:
           sudo apt-get update -qq
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
             cmake pkg-config libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            python3-paramiko python3-pyftpdlib python3-openssl
+            python3-paramiko python3-pyftpdlib python3-openssl krb5-kdc krb5-admin-server krb5-user openssh-server
 
       - name: Check GUI distribution, workflow triggers, and X2Go
         run: |
           set -euo pipefail
           python3 -m unittest discover -s tools/tests -p test_gui_distribution.py
           python3 -m unittest discover -s tools/tests -p test_native_listeners.py
+          python3 -m unittest discover -s tools/tests -p test_native_ipc_policy.py
           python3 -m unittest discover -s tools/tests -p test_workflow_triggers.py
           python3 -m unittest discover -s tools/tests -p test_x2go_installer.py
           python3 -m unittest discover -s tools/tests -p test_mosh_installer.py
@@ -83,6 +84,9 @@ jobs:
           python3 tools/run_cargo_ci.py cargo test -p linscp-platform -p linscp-types -p linscp-i18n -p linscp-crypto -p linscp-proto -p linscp-engine -p linscp-terminal -p linscp-tauri -- --nocapture
           python3 tools/run_cargo_ci.py cargo test -p linscp-service -- --nocapture --test-threads=1 --skip live_
 
+      - name: Exercise isolated Kerberos and SSH delegation
+        run: python3 tools/run_cargo_ci.py bash tools/live_kerberos_ci.sh
+
       - name: Validate XML action log against the pinned schema
         run: |
           set -euo pipefail
@@ -90,6 +94,8 @@ jobs:
           /tmp/linscp-xmlschema/bin/pip install 'xmlschema>=3,<5'
           export LINSCP_XML_SCHEMA_TEST_OUTPUT="$RUNNER_TEMP/linscp-schema-test.xml"
           python3 tools/run_cargo_ci.py cargo test -p linscp-engine --test script_engine_cases test_xml_log_matches_the_upstream_schema -- --nocapture
+          export LINSCP_XML_SERVICE_OUTPUT="$RUNNER_TEMP/linscp-gui-schema-test.xml"
+          python3 tools/run_cargo_ci.py cargo test -p linscp-service queue_and_gui_xml_records_share_a_lock_and_preserve_existing_log -- --nocapture
           /tmp/linscp-xmlschema/bin/python -m unittest discover -s tools/tests -p test_xml_schema.py
 
       - name: Exercise live protocol integration tests
@@ -137,7 +143,7 @@ jobs:
           sudo DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a apt-get install -y -qq --no-install-recommends \
             build-essential cmake dpkg-dev debhelper pkg-config \
             libwebkit2gtk-4.1-dev libgtk-3-dev libayatana-appindicator3-dev librsvg2-dev \
-            xvfb xdotool xauth openbox x11-utils
+            xvfb xdotool xauth openbox x11-utils weston
 
       - name: Build the frontend bundle
         run: |
@@ -215,6 +221,51 @@ jobs:
             cat native-smoke.log
             exit 1
           fi
+
+      - name: Smoke test the native window on headless Weston
+        run: |
+          set -euo pipefail
+          runtime=$(mktemp -d)
+          config=$(mktemp -d)
+          chmod 700 "$runtime"
+          export XDG_RUNTIME_DIR="$runtime" LINSCP_CONFIG_DIR="$config"
+          export WAYLAND_DISPLAY=linscp-wayland-smoke XDG_SESSION_TYPE=wayland
+          export GDK_BACKEND=wayland LIBGL_ALWAYS_SOFTWARE=1
+          export WEBKIT_DISABLE_COMPOSITING_MODE=1 WEBKIT_DISABLE_DMABUF_RENDERER=1
+          unset DISPLAY
+          app= compositor=
+          cleanup() {
+            if [ -n "$app" ]; then kill "$app" 2>/dev/null || true; wait "$app" 2>/dev/null || true; fi
+            if [ -n "$compositor" ]; then kill "$compositor" 2>/dev/null || true; wait "$compositor" 2>/dev/null || true; fi
+            rm -rf "$runtime" "$config"
+          }
+          trap cleanup EXIT
+          weston --backend=headless-backend.so --use-pixman --socket="$WAYLAND_DISPLAY" --idle-time=0 --log=weston-smoke.log &
+          compositor=$!
+          for i in $(seq 1 30); do
+            test -S "$runtime/$WAYLAND_DISPLAY" && break
+            if ! kill -0 "$compositor" 2>/dev/null; then cat weston-smoke.log; exit 1; fi
+            sleep 1
+          done
+          if ! test -S "$runtime/$WAYLAND_DISPLAY"; then cat weston-smoke.log; exit 1; fi
+          WAYLAND_DEBUG=client linscp-gui >wayland-smoke.log 2>&1 &
+          app=$!
+          for i in $(seq 1 120); do
+            if ! kill -0 "$app" 2>/dev/null; then cat weston-smoke.log wayland-smoke.log; exit 1; fi
+            # Force the native Wayland backend and observe a configured, committed
+            # GTK toplevel instead of treating process liveness as a window.
+            if grep -qE 'xdg_toplevel@[0-9]+\.set_title\("LinSCP' wayland-smoke.log &&
+               grep -qE 'xdg_surface@[0-9]+\.ack_configure' wayland-smoke.log &&
+               grep -qE 'wl_surface@[0-9]+\.commit' wayland-smoke.log; then
+              python3 tools/check_native_listeners.py "$app" "$LINSCP_CONFIG_DIR"
+              echo "Native LinSCP Wayland toplevel configured and committed under headless Weston"
+              exit 0
+            fi
+            sleep 1
+          done
+          cat weston-smoke.log wayland-smoke.log
+          echo "Wayland toplevel did not configure and commit within 120 seconds" >&2
+          exit 1
 
       - name: Build and smoke test a custom-prefix Make install
         run: |
@@ -306,6 +357,35 @@ jobs:
             *--shell-upload*) ;;
             *) echo "::error::--help did not document --shell-upload"; exit 1 ;;
           esac
+
+      - name: Exercise Debian upgrade and removal
+        run: |
+          set -euo pipefail
+          deb=$(find .. -maxdepth 1 -name 'linscp_*_*.deb' -print -quit)
+          test -n "$deb"
+          work=$(mktemp -d)
+          trap 'rm -rf "$work"' EXIT
+          dpkg-deb -R "$deb" "$work/old"
+          # Same payload with an older synthetic version tests dpkg lifecycle,
+          # not migration from a historically released package.
+          sed -i 's/^Version:.*/Version: 0.0.0~chunk8/' "$work/old/DEBIAN/control"
+          dpkg-deb -b "$work/old" "$work/old.deb"
+          sudo dpkg -i --force-downgrade "$work/old.deb"
+          test "$(dpkg-query -W -f='${Version}' linscp)" = '0.0.0~chunk8'
+          export LINSCP_CONFIG_DIR="$work/config" XDG_DATA_HOME="$work/data"
+          mkdir -p "$LINSCP_CONFIG_DIR"
+          echo preserve-user-data > "$LINSCP_CONFIG_DIR/sentinel"
+          linscp-gui --install-shell-integration
+          sudo dpkg -i "$deb"
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
+          test -x /usr/bin/linscp-gui
+          sudo dpkg --remove linscp
+          test ! -e /usr/bin/linscp-gui
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
+          # Integration is per-user and is not a dpkg-managed file.
+          test -f "$XDG_DATA_HOME/kio/servicemenus/linscp-upload.desktop"
+          sudo dpkg --purge linscp
+          test "$(cat "$LINSCP_CONFIG_DIR/sentinel")" = preserve-user-data
 
       - name: Upload the Debian package
         uses: actions/upload-artifact@v7

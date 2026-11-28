@@ -8,7 +8,7 @@
 //!
 //! * **RDP** – Microsoft Remote Desktop Protocol. Linux: `xfreerdp`/ `xfreerdp3` / `sdl-freerdp`,
 //!   Windows: `mstsc.exe`, macOS: `open rdp://`, Android: `aFreeRDP`/`aRDP` via intent.
-//!   Options: `/d:DOMAIN /u:USER /p:PASS /v:HOST:PORT /w:WxH /bpp:DEPTH /sec:tls|nla|rdp`.
+//!   Options: `/d:DOMAIN /u:USER /v:HOST:PORT /w:WxH /bpp:DEPTH /sec:tls|nla|rdp`. Passwords are entered in the viewer, not placed in argv.
 //! * **VNC** – RFB. Linux: `vncviewer`/`tigervnc-viewer`/`remmina`, Windows: `vncviewer.exe`,
 //!   Android: `androidVNC`. Options: `-SharedViewOnly -PreferredEncoding -via`.
 //! * **SPICE** – QEMU/KVM. Linux: `remote-viewer`/`spicy`/`virt-viewer`, Windows: `remote-viewer.exe`.
@@ -514,11 +514,8 @@ fn build_rdp_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, end
                 argv.push(format!("/u:{u}"));
             }
         }
-        if let Some(ref p) = sess.config.password {
-            if !p.is_empty() {
-                argv.push(format!("/p:{}", p.as_str()));
-            }
-        }
+        // Command-line arguments are visible to other local processes and
+        // are also returned to the frontend. Let the viewer prompt instead.
         if let Some(ref d) = opts.domain {
             argv.push(format!("/d:{d}"));
         }
@@ -569,10 +566,9 @@ fn build_vnc_argv(viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, end
     if !opts.compression {
         argv.push("-CompressLevel=0".to_string());
     }
-    if tunneled {
-        argv.push("-via".to_string());
-        argv.push(sess.config.host.clone());
-    }
+    // A tunneled endpoint is already a local TCP forward. TigerVNC's -via
+    // would open a second SSH connection and bypass the selected tunnel.
+    let _ = tunneled;
     argv
 }
 
@@ -582,10 +578,12 @@ fn build_spice_argv(_viewer: &str, sess: &RemoteDesktopSession, tunneled: bool, 
     let tls_port = opts.spice_tls_port.map(|p| p.to_string()).unwrap_or_default();
     let insecure = if opts.spice_insecure { "1" } else { "0" };
     // remote-viewer expects spice://host:port?tls-port=... ; we also support .vv file.
-    let uri = if !tls_port.is_empty() {
-        format!("spice://{host_port}?tls-port={tls_port}&insecure={insecure}")
-    } else if tunneled {
+    let uri = if tunneled {
+        // Only the primary endpoint is forwarded. The service refuses an
+        // additional TLS port, which would otherwise bypass the forward.
         format!("spice://{endpoint}")
+    } else if !tls_port.is_empty() {
+        format!("spice://{host_port}?tls-port={tls_port}&insecure={insecure}")
     } else {
         format!("spice://{host_port}")
     };
@@ -625,8 +623,10 @@ fn spice_vv_file_body(sess: &RemoteDesktopSession, tunneled: bool, endpoint: &st
     };
     let safe_host = sanitize_rdp_field(raw_host);
     let mut out = format!("[virt-viewer]\ntype=spice\nhost={safe_host}\nport={raw_port}\n");
-    if let Some(tls_port) = opts.spice_tls_port {
-        out.push_str(&format!("tls-port={tls_port}\n"));
+    if !tunneled {
+        if let Some(tls_port) = opts.spice_tls_port {
+            out.push_str(&format!("tls-port={tls_port}\n"));
+        }
     }
     if opts.fullscreen {
         out.push_str("fullscreen=1\n");
@@ -1085,6 +1085,27 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_desktop_tickets_do_not_request_a_second_direct_connection() {
+        let mut options = DesktopOptions::default();
+        options.spice_tls_port = Some(5999);
+        let cfg = RemoteDesktopConnectConfig {
+            scheme: ProtocolScheme::Spice, kind: RemoteDesktopKind::Spice,
+            host: "private.example".into(), port: 5900, username: None, password: None,
+            domain: None, desktop_opts: options, tls: crate::tls::TlsSettings::default(),
+            proxy: None, timeout: std::time::Duration::from_secs(5),
+        };
+        let local = "127.0.0.1:43123";
+        let spice = ticket_from_config(&cfg, RemoteDesktopKind::Spice, "private.example:5900", true, Some(local.into()));
+        assert_eq!(spice.argv[1], format!("spice://{local}"));
+        let vv = spice.file_content.unwrap();
+        assert!(vv.contains("host=127.0.0.1\nport=43123\n"));
+        assert!(!vv.contains("tls-port="));
+        let vnc = ticket_from_config(&cfg, RemoteDesktopKind::Vnc, "private.example:5900", true, Some(local.into()));
+        assert_eq!(vnc.argv[1], local);
+        assert!(!vnc.argv.iter().any(|arg| arg == "-via" || arg == "private.example"));
+    }
+
+    #[test]
     fn desktop_tickets_handle_ipv6_sanitization_vnc_and_x11_flags() {
         let mut opts = DesktopOptions::default();
         opts.domain = Some("CORP\r\nalternate shell:s:cmd.exe".to_string());
@@ -1105,6 +1126,7 @@ mod tests {
         };
         assert_eq!(rdp_cfg.target(), "[2001:db8::10]:3389");
         let rdp_ticket = ticket_from_config(&rdp_cfg, RemoteDesktopKind::Rdp, &rdp_cfg.target(), false, None);
+        assert!(!rdp_ticket.argv.iter().any(|arg| arg.contains("secret") || arg.starts_with("/p:")), "password leaked in argv: {:?}", rdp_ticket.argv);
         let body = rdp_ticket.file_content.expect(".rdp content");
         assert!(body.contains("full address:s:[2001:db8::10]:3389\r\n"), "{body}");
         assert!(!body.contains("\r\nalternate shell:"), "CRLF injection must be stripped: {body}");

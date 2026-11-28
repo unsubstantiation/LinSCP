@@ -279,6 +279,8 @@ function vaultBackupBody(path, options) {
 }
 
 const calls = [];
+const nativeCallbacks = new Map();
+const nativeListeners = [];
 const errors = [];
 const confirmMessages = [];
 let confirmResult = true;
@@ -339,7 +341,17 @@ const dom = new JSDOM(html, {
      * cannot create one, so a stub keeps the download path testable. */
     window.URL.createObjectURL = () => 'blob:key-session-export';
     window.URL.revokeObjectURL = () => {};
-    window.__TAURI_INTERNALS__ = { invoke: async (_cmd, args) => invoke(args.envelope) };
+    window.__TAURI_INTERNALS__ = {
+      transformCallback(callback) { const id = nativeCallbacks.size + 1; nativeCallbacks.set(id, callback); return id; },
+      invoke: async (cmd, args) => {
+        if (cmd === 'plugin:event|listen') {
+          if (typeof args.handler !== 'number' || !nativeCallbacks.has(args.handler)) throw new Error('invalid Tauri callback ID');
+          nativeListeners.push(args);
+          return 1;
+        }
+        return invoke(args.envelope);
+      }
+    };
     const invoke = envelope => {
       const method = String(envelope.method || 'GET').toUpperCase();
       const options = { method: method };
@@ -2297,6 +2309,12 @@ function options(id) {
     text('customCommandsResult'));
   window.closeModal('customCommandsModal');
 
+  responses['/api/shell/pending'] = { success: false, error: 'share manifest disk full' };
+  await window.checkShellPending();
+  check('pending share publication errors reach the user log', lastLogLine().includes('share manifest disk full'), lastLogLine());
+  responses['/api/shell/pending'] = { success: true, pending: [] };
+  await window.checkShellPending();
+
   /* A file-manager selection is offered in a dialog; only confirming
    * it queues anything, and names are shown as text, never markup. */
   responses['/api/shell/pending'] = { success: true, pending: [{
@@ -2721,7 +2739,7 @@ function options(id) {
   await window.openPreferences();
   check('the preferences dialog opens with the stored values',
     doc.getElementById('preferencesModal').classList.contains('open') &&
-      value('prefTransfer') === 'binary' && value('prefFilemask') === '*.txt',
+      value('prefTransfer') === '' && value('prefFilemask') === '*.txt',
     value('prefTransfer') + ' / ' + value('prefFilemask'));
   doc.getElementById('prefConfirmOverwrite').checked = false;
   doc.getElementById('prefSpeed').value = '128';
@@ -3328,8 +3346,8 @@ function options(id) {
   if (agentStubInstalled) window.LinSCPCore.hostDifferenceReason = undefined;
 
   // ---- Kerberos limits --------------------------------------------------
-  // The Kerberos section names its Linux-only limit, and key exchange — the
-  // one setting no build honors — is noted where the Linux-only note is not.
+  // The Kerberos section explains its runtime requirement, and key exchange —
+  // which no build honors — is noted where a runtime is available.
   let gssapiStubInstalled = false;
   if (!window.LinSCPCore || typeof window.LinSCPCore.hostDifferenceReason !== 'function') {
     window.LinSCPCore = window.LinSCPCore || {};
@@ -3337,8 +3355,8 @@ function options(id) {
     gssapiStubInstalled = true;
   }
   const kerberosReason = window.gssapiGap({ gssapi: false });
-  check('the Kerberos gap names Linux-only builds',
-    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux')) &&
+  check('the Kerberos gap names Linux and Windows runtime options',
+    (gssapiStubInstalled ? kerberosReason === 'stub no gssapi' : kerberosReason.includes('Linux') && kerberosReason.includes('Windows')) &&
       window.gssapiGap({ gssapi: true }) === null,
     String(kerberosReason));
   const kexReason = window.gssapiKexGap({ gssapi: true });
@@ -3349,9 +3367,8 @@ function options(id) {
   window.updateGssapiHint();
   const gssapiHintHidden = doc.getElementById('siteGssapiHint').hidden;
   // Which note this host shows depends on the host: where Kerberos is
-  // unavailable the note is the Linux-only limit, and where it is available
-  // the note is the unwired key exchange. Asserting one sentence made this
-  // pass on Linux and fail on Windows, where the other is correct.
+  // unavailable the note names supported runtimes, and where it is available
+  // the note is the unwired key exchange.
   const gssapiHostMissing = !gssapiStubInstalled &&
     window.LinSCPCore.hostCapabilities({ host: window }).gssapi === false;
   check('the Kerberos hint shows the gap reason',
@@ -4737,8 +4754,56 @@ function options(id) {
     check('closing external editor session posts id to /api/editor/external/close',
       !!extCloseCall && JSON.parse(extCloseCall.options.body).id === 'ext-42');
     window.closeEditor();
+    responses['/api/status'] = Object.assign({}, prevStatus, {
+      supported_encodings: ['utf-8', 'utf-16le', 'windows-1252']
+    });
+    await window.refreshStatus();
+    responses['/api/remote/edit'] = { success: false, error: 'File is not valid UTF-8 binary/encoded text.' };
+    await window.openEditor('/tmp/slowremote/legacy.txt', 'remote', false);
+    check('undecodable file offers encoding retry without opening the editor',
+      doc.getElementById('editorEncodingRetryModal').classList.contains('open') &&
+      !doc.getElementById('editorModal').classList.contains('open') &&
+      doc.getElementById('editorRetryEncoding').value === 'utf-8');
+    doc.getElementById('editorRetryEncoding').value = 'windows-1252';
+    responses['/api/remote/edit'] = { success: true, content: 'café',
+      info: { encoding: 'windows-1252', eol: 'lf', bom: false, mtime: 123 } };
+    await window.retryEditorEncoding();
+    const retryCall = calls.filter(c => c.path === '/api/remote/edit').pop();
+    check('retry opens with selected lowercase backend encoding',
+      new URL(retryCall.url, 'http://localhost').searchParams.get('encoding') === 'windows-1252' &&
+      doc.getElementById('editorEncoding').value === 'windows-1252' &&
+      !doc.getElementById('editorEncodingRetryModal').classList.contains('open'));
+    window.markDirty();
+    check('unchanged lowercase encoding is not dirty', doc.getElementById('editorStatus').textContent === 'No changes');
+    doc.getElementById('editorEncoding').value = 'utf-16le';
+    window.markDirty();
+    responses['/api/remote/edit'] = { success: false, error: 'File is not valid UTF-8 binary/encoded text.' };
+    await window.openEditor('/tmp/slowremote/other.txt', 'remote', false);
+    window.cancelEditorEncodingRetry();
+    check('cancelling another file retry preserves the open editor format',
+      doc.getElementById('editorEncoding').value === 'utf-16le' &&
+      doc.getElementById('editorStatus').textContent === 'Modified - not saved');
+    doc.getElementById('editorEncoding').value = 'windows-1252';
+    window.markDirty();
+    window.closeEditor();
+    await window.openNewFileInEditor('/tmp/slowremote/new-encoding.txt', 'remote');
+    window.markDirty();
+    const editCount = calls.filter(c => c.path === '/api/remote/edit').length;
+    doc.getElementById('editorEncoding').value = 'windows-1252';
+    await window.changeEditorEncoding();
+    check('changing a new empty file encoding never tries to reload a nonexistent file',
+      calls.filter(c => c.path === '/api/remote/edit').length === editCount &&
+      doc.getElementById('editorEncoding').value === 'windows-1252');
+    await window.saveEditorFile();
+    const newEncodingSave = JSON.parse(calls.filter(c => c.path === '/api/remote/save').pop().options.body);
+    check('new empty file saves selected encoding', newEncodingSave.create_only === true && newEncodingSave.encoding === 'windows-1252');
+    window.closeEditor();
+    window.openSearch();
+    check('search defaults to backend lowercase utf-8', doc.getElementById('searchEncoding').value === 'utf-8');
+    window.closeModal('searchModal');
     responses['/api/remote/edit'] = prevRemoteEdit;
     responses['/api/status'] = prevStatus;
+    await window.refreshStatus();
     delete responses['/api/editor/external'];
     delete responses['/api/editor/external/close'];
 
@@ -4746,11 +4811,11 @@ function options(id) {
     doc.getElementById('searchContents').checked = true;
     window.toggleSearchContents();
     doc.getElementById('searchText').value = 'latin';
-    doc.getElementById('searchEncoding').value = 'Windows-1252';
+    doc.getElementById('searchEncoding').value = 'windows-1252';
     await window.runSearch();
     const encSearchCall = calls.filter(c => c.path === '/api/remote/search').pop();
     check('content search forwards selected text encoding',
-      !!encSearchCall && JSON.parse(encSearchCall.options.body).encoding === 'Windows-1252');
+      !!encSearchCall && JSON.parse(encSearchCall.options.body).encoding === 'windows-1252');
     window.closeModal('searchModal');
 
     // 4. Preferences XML log settings & XML log viewer/clear.
@@ -4964,6 +5029,19 @@ function options(id) {
     responses['/api/remote/list'] = { path: '/tmp/otherlocal', entries: [] };
     await window.refreshStatus();
     await window.loadRemote('/tmp/otherlocal');
+    const listener = nativeListeners.find(item => item.event === 'native:file-drop');
+    check('native event listener registers a Tauri callback ID', !!listener && nativeCallbacks.has(listener.handler));
+    const originalHitTest = window.document.elementFromPoint;
+    const originalRatio = Object.getOwnPropertyDescriptor(window, 'devicePixelRatio');
+    Object.defineProperty(window, 'devicePixelRatio', { configurable: true, value: 2 });
+    let hitPoint;
+    window.document.elementFromPoint = (x, y) => { hitPoint = [x, y]; return window.document.getElementById('remotePane'); };
+    nativeCallbacks.get(listener.handler)({ payload: { paths: ['/tmp/desktop-note.txt'], position: { x: 40, y: 60 } } });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    check('native event routes physical coordinates to the pane in CSS pixels',
+      hitPoint && hitPoint[0] === 20 && hitPoint[1] === 30 && capturedDropTarget && capturedDropTarget.directory === '/tmp/otherlocal');
+    window.document.elementFromPoint = originalHitTest;
+    if (originalRatio) Object.defineProperty(window, 'devicePixelRatio', originalRatio);
     await window.handleNativeDrop({ paths: ['/tmp/desktop-note.txt'], side: 'remote' });
     check('dual-local native drop onto right pane uses target=local and right-pane directory',
       capturedDropTarget &&
@@ -7109,6 +7187,44 @@ function options(id) {
       window.prompt = savedPromptCli;
     }
 
+    // Untouched GUI defaults must not override automatically matched presets.
+    {
+      const defaults = window.preferencesToSettings({transfer: 'binary', speed: 0, preserve_time: true, newer_only: false, no_permissions: false});
+      window.eval('transferSettings = ' + JSON.stringify(defaults));
+      let opts = window.transferOptions();
+      check('automatic preset inherits untouched GUI defaults',
+        !('transfer' in opts) && !('speed' in opts) && !('preserve_time' in opts) &&
+        !('newer_only' in opts) && !('no_permissions' in opts));
+      const explicit = window.preferencesToSettings({transfer: 'binary', speed: 0, preserve_time: true, newer_only: false, no_permissions: false,
+        preset_overrides: ['transfer', 'speed', 'preserve_time', 'newer_only', 'no_permissions']});
+      window.eval('transferSettings = ' + JSON.stringify(explicit));
+      opts = window.transferOptions();
+      check('explicit default-valued overrides are sent and survive preferences',
+        opts.transfer === 'binary' && opts.speed === 0 && opts.preserve_time === true &&
+        opts.newer_only === false && opts.no_permissions === false &&
+        window.settingsToPreferences(explicit).preset_overrides.length === 5);
+      window.eval('transferSettings = ' + JSON.stringify(defaults));
+      window.openTransferSettings();
+      const preserve = doc.getElementById('transferPreserveTime');
+      preserve.checked = false;
+      preserve.dispatchEvent(new window.Event('change', {bubbles: true}));
+      preserve.checked = true;
+      preserve.dispatchEvent(new window.Event('change', {bubbles: true}));
+      await window.saveTransferSettings();
+      check('an explicitly toggled default-valued override is persisted',
+        window.transferOptions().preserve_time === true &&
+        JSON.parse(calls.filter(c => c.path === '/api/preferences').pop().options.body).preferences.preset_overrides.includes('preserve_time'));
+      window.eval('transferSettings = ' + JSON.stringify(explicit));
+      window.openTransferSettings();
+      const mode = doc.getElementById('transferMode');
+      mode.value = '';
+      mode.dispatchEvent(new window.Event('change', {bubbles: true}));
+      await window.saveTransferSettings();
+      check('choosing default mode clears the explicit transfer override', !('transfer' in window.transferOptions()));
+      check('preferences support automatic-by-mask transfer mode',
+        Array.from(doc.getElementById('prefTransfer').options).some(option => option.value === 'automatic'));
+    }
+
     // Completed features: string matched preset & rule persistence, CLI lcd local sync & canonical completion,
     // Preferences resume default, and Editor Go-to-line + Search match line jump.
     {
@@ -7152,7 +7268,7 @@ function options(id) {
       check('saving a selected preset forwards octal permissions and preserve_time_dirs in transferOptions()',
         savedPresetOpts.preset === 'StringMatchedPreset' &&
         savedPresetOpts.permissions === '0644' &&
-        savedPresetOpts.preserve_time === true &&
+        savedPresetOpts.preserve_time !== false &&
         savedPresetOpts.preserve_time_dirs === true);
 
       // The transfer settings are kept in the preferences document, so the
